@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import { getSupabaseClient, signOutFromSupabase } from '../../lib/supabase';
 import {
   Lock,
@@ -29,57 +29,119 @@ export const ResetPasswordScreen: React.FC<ResetPasswordProps> = ({ onNavigateTo
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
   const [successMsg, setSuccessMsg] = useState<string | null>(null);
 
+  // Recovery context flag: strictly requires PASSWORD_RECOVERY event or URL recovery evidence
+  const recoveryContextRef = useRef<boolean>(false);
+
   // Check Supabase recovery session on mount
   useEffect(() => {
     let isMounted = true;
+
+    const checkUrlRecoveryEvidence = (): boolean => {
+      if (typeof window === 'undefined') return false;
+      try {
+        const search = window.location.search || '';
+        const hash = window.location.hash ? window.location.hash.substring(1) : '';
+
+        const searchParams = new URLSearchParams(search);
+        const hashParams = new URLSearchParams(hash);
+
+        const typeInHash = hashParams.get('type');
+        const typeInSearch = searchParams.get('type');
+        const isRecoveryType = typeInHash === 'recovery' || typeInSearch === 'recovery';
+
+        const hasCodeInSearch = Boolean(searchParams.get('code'));
+        const hasCodeInHash = Boolean(hashParams.get('code'));
+
+        return isRecoveryType || hasCodeInSearch || hasCodeInHash;
+      } catch {
+        return false;
+      }
+    };
+
+    const getUrlError = (): string | null => {
+      if (typeof window === 'undefined') return null;
+      try {
+        const search = window.location.search || '';
+        const hash = window.location.hash ? window.location.hash.substring(1) : '';
+        const searchParams = new URLSearchParams(search);
+        const hashParams = new URLSearchParams(hash);
+
+        const errorDesc = hashParams.get('error_description') || searchParams.get('error_description');
+        const errorCode = hashParams.get('error_code') || searchParams.get('error_code');
+
+        if (errorDesc || errorCode) {
+          return errorDesc
+            ? decodeURIComponent(errorDesc.replace(/\+/g, ' '))
+            : 'رابط استعادة كلمة المرور غير صالح أو منتهي الصلاحية. يرجى طلب رابط جديد.';
+        }
+      } catch {
+        // Ignore parsing errors
+      }
+      return null;
+    };
+
     const checkRecoverySession = async () => {
       try {
+        // 1. Check for error parameters in URL / hash
+        const urlError = getUrlError();
+        if (urlError) {
+          if (isMounted) {
+            setErrorMsg(urlError);
+            setHasValidSession(false);
+            setIsCheckingSession(false);
+          }
+          return;
+        }
+
+        // 2. Determine if the initial URL contains recovery evidence
+        const hasUrlEvidence = checkUrlRecoveryEvidence();
+        if (hasUrlEvidence) {
+          recoveryContextRef.current = true;
+        }
+
         const client = getSupabaseClient();
 
-        // 1. Check URL hash for error parameters returned by Supabase
+        // 3. Handle code exchange if PKCE recovery code parameter exists
         if (typeof window !== 'undefined') {
-          const hash = window.location.hash.substring(1);
           const searchParams = new URLSearchParams(window.location.search);
-          const hashParams = new URLSearchParams(hash);
-
-          const errorDesc = hashParams.get('error_description') || searchParams.get('error_description');
-          const errorCode = hashParams.get('error_code') || searchParams.get('error_code');
-
-          if (errorDesc || errorCode) {
-            if (isMounted) {
-              setErrorMsg(
-                errorDesc
-                  ? decodeURIComponent(errorDesc.replace(/\+/g, ' '))
-                  : 'رابط استعادة كلمة المرور غير صالح أو منتهي الصلاحية. يرجى طلب رابط جديد.'
-              );
-              setHasValidSession(false);
-              setIsCheckingSession(false);
+          const hashParams = new URLSearchParams(window.location.hash.substring(1));
+          const code = searchParams.get('code') || hashParams.get('code');
+          if (code) {
+            try {
+              await client.auth.exchangeCodeForSession(code);
+            } catch {
+              // Handled by detectSessionInUrl or getSession below
             }
-            return;
           }
         }
 
-        // 2. Check if a valid session exists in Supabase client
-        const { data, error } = await client.auth.getSession();
-        if (error || !data?.session) {
-          // Give Supabase detectSessionInUrl a small moment to exchange tokens if parsing hash
+        // 4. Check if a valid Supabase session exists
+        let { data, error } = await client.auth.getSession();
+        let session = data?.session;
+
+        if (error || !session) {
+          // Give detectSessionInUrl a small moment to exchange tokens if parsing hash
           await new Promise((resolve) => setTimeout(resolve, 600));
           const secondCheck = await client.auth.getSession();
-          if (secondCheck.error || !secondCheck.data?.session) {
-            if (isMounted) {
-              setHasValidSession(false);
-              setErrorMsg('رابط استعادة كلمة المرور غير صالح أو منتهي الصلاحية. يرجى طلب رابط استعادة جديد من شاشة تسجيل الدخول.');
-              setIsCheckingSession(false);
-            }
-            return;
-          }
+          session = secondCheck.data?.session;
         }
 
-        if (isMounted) {
+        if (!isMounted) return;
+
+        // 5. Strictly require recovery context AND an active session.
+        // A normal authenticated session without recovery evidence is NOT treated as recovery.
+        if (recoveryContextRef.current && session) {
           setHasValidSession(true);
+          setErrorMsg(null);
+          setIsCheckingSession(false);
+        } else {
+          setHasValidSession(false);
+          setErrorMsg(
+            'رابط استعادة كلمة المرور غير صالح أو منتهي الصلاحية. يرجى طلب رابط استعادة جديد من شاشة تسجيل الدخول.'
+          );
           setIsCheckingSession(false);
         }
-      } catch (err) {
+      } catch {
         if (isMounted) {
           setHasValidSession(false);
           setErrorMsg('تعذر التحقق من جلسة استعادة كلمة المرور. يرجى طلب رابط جديد.');
@@ -90,10 +152,17 @@ export const ResetPasswordScreen: React.FC<ResetPasswordProps> = ({ onNavigateTo
 
     checkRecoverySession();
 
-    // Listen to auth state changes (e.g. PASSWORD_RECOVERY event)
+    // Listen to auth state changes (specifically PASSWORD_RECOVERY event)
     const client = getSupabaseClient();
     const { data: authListener } = client.auth.onAuthStateChange((event, session) => {
-      if (event === 'PASSWORD_RECOVERY' || (session && isMounted)) {
+      if (event === 'PASSWORD_RECOVERY') {
+        recoveryContextRef.current = true;
+        if (session && isMounted) {
+          setHasValidSession(true);
+          setErrorMsg(null);
+          setIsCheckingSession(false);
+        }
+      } else if (session && recoveryContextRef.current && isMounted) {
         setHasValidSession(true);
         setErrorMsg(null);
         setIsCheckingSession(false);
@@ -123,17 +192,19 @@ export const ResetPasswordScreen: React.FC<ResetPasswordProps> = ({ onNavigateTo
     setErrorMsg(null);
     setSuccessMsg(null);
 
-    const cleanPass = newPassword.trim();
-    const cleanConfirm = confirmPassword.trim();
-
-    // Validation
-    if (cleanPass.length < 8) {
+    // Validation using EXACT values without trimming
+    if (newPassword.length < 8) {
       setErrorMsg('كلمة المرور يجب أن لا تقل عن 8 أحرف لضمان حماية حساب الإدارة.');
       return;
     }
 
-    if (cleanPass !== cleanConfirm) {
+    if (newPassword !== confirmPassword) {
       setErrorMsg('كلمتا المرور غير متطابقتين. يرجى إعادة التأكد من كتابتها.');
+      return;
+    }
+
+    if (!hasValidSession || !recoveryContextRef.current) {
+      setErrorMsg('انتهت صلاحية جلسة استعادة كلمة المرور أو الرابط غير صالح.');
       return;
     }
 
@@ -141,8 +212,9 @@ export const ResetPasswordScreen: React.FC<ResetPasswordProps> = ({ onNavigateTo
 
     try {
       const client = getSupabaseClient();
+      // Pass the exact newPassword value without trimming
       const { error } = await client.auth.updateUser({
-        password: cleanPass,
+        password: newPassword,
       });
 
       if (error) {
