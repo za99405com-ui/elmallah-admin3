@@ -401,6 +401,18 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
 
   // 8. Session Initialization
   useEffect(() => {
+    const isRecoveryMode =
+      typeof window !== 'undefined' &&
+      (window.location.pathname.startsWith('/reset-password') ||
+        window.location.hash.includes('type=recovery') ||
+        window.location.hash.includes('access_token='));
+
+    // If user is resetting their password via email link, do not authenticate them into the dashboard yet
+    if (isRecoveryMode) {
+      setIsLoadingAuth(false);
+      return;
+    }
+
     const initAuth = async () => {
       try {
         // 1. Check Supabase session first
@@ -457,6 +469,16 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
     // Supabase auth state listener
     const sbClient = getSupabaseClient();
     const { data: authListener } = sbClient.auth.onAuthStateChange(async (event, session) => {
+      const currentPathIsRecovery =
+        typeof window !== 'undefined' &&
+        (window.location.pathname.startsWith('/reset-password') ||
+          window.location.hash.includes('type=recovery'));
+
+      if (event === 'PASSWORD_RECOVERY' || currentPathIsRecovery) {
+        // Password recovery event - handled by ResetPasswordScreen
+        return;
+      }
+
       if (event === 'SIGNED_OUT') {
         setIsAuthenticated(false);
         removeStoredToken();

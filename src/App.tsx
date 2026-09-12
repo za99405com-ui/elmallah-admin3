@@ -1,4 +1,4 @@
-import React from 'react';
+import React, { useState, useEffect } from 'react';
 import { AppProvider, useApp } from './context/AppContext';
 import { TopNavbar } from './components/layout/TopNavbar';
 import { OverviewTab } from './components/dashboard/OverviewTab';
@@ -10,10 +10,55 @@ import { CategoriesTab } from './components/categories/CategoriesTab';
 import { OrderDemandTab } from './components/demand/OrderDemandTab';
 import { SettingsTab } from './components/settings/SettingsTab';
 import { LoginScreen } from './components/auth/LoginScreen';
+import { ResetPasswordScreen } from './components/auth/ResetPasswordScreen';
 import { ToastContainer } from './components/common/ToastContainer';
 
 const MainDashboardContent: React.FC = () => {
   const { activeTab, isAuthenticated, darkMode } = useApp();
+
+  // Client-side route detection for /reset-password
+  const [isResetPasswordRoute, setIsResetPasswordRoute] = useState<boolean>(() => {
+    if (typeof window !== 'undefined') {
+      return (
+        window.location.pathname.startsWith('/reset-password') ||
+        window.location.hash.includes('type=recovery') ||
+        window.location.hash.includes('access_token=')
+      );
+    }
+    return false;
+  });
+
+  useEffect(() => {
+    const handlePopState = () => {
+      const isRecovery =
+        window.location.pathname.startsWith('/reset-password') ||
+        window.location.hash.includes('type=recovery') ||
+        window.location.hash.includes('access_token=');
+      setIsResetPasswordRoute(isRecovery);
+    };
+
+    window.addEventListener('popstate', handlePopState);
+    return () => window.removeEventListener('popstate', handlePopState);
+  }, []);
+
+  // If user navigated to /reset-password route or clicked recovery email link
+  if (isResetPasswordRoute) {
+    return (
+      <div
+        className={`relative min-h-screen font-sans selection:bg-cyan-500 selection:text-slate-950 ${
+          darkMode ? 'dark bg-[#070b14] text-slate-100' : 'bg-slate-100 text-slate-900'
+        }`}
+      >
+        <ResetPasswordScreen
+          onNavigateToLogin={() => {
+            window.history.replaceState(null, '', '/');
+            setIsResetPasswordRoute(false);
+          }}
+        />
+        <ToastContainer />
+      </div>
+    );
+  }
 
   // If not authenticated, protect the dashboard with email & password screen
   if (!isAuthenticated) {
