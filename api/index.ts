@@ -3,6 +3,26 @@ import { router as apiRouter } from '../server/api.js';
 
 const app = express();
 
+/*
+ * Vercel sends every nested /api/* request to this single function.
+ * Restore the original API pathname before Express routing.
+ */
+app.use((req, _res, next) => {
+  const url = new URL(req.url, 'http://localhost');
+  const rewrittenPath = url.searchParams.get('__vercel_path');
+
+  if (rewrittenPath) {
+    url.searchParams.delete('__vercel_path');
+    const query = url.searchParams.toString();
+
+    req.url =
+      `/api/${rewrittenPath}` +
+      (query ? `?${query}` : '');
+  }
+
+  next();
+});
+
 app.set('trust proxy', 1);
 
 const configuredOrigins = (process.env.ALLOWED_ORIGINS || '')
