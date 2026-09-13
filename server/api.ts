@@ -2556,6 +2556,7 @@ router.get('/settings', (_req: Request, res: Response) => {
     depositPercentage: s.deposit_percentage,
     minDepositAmount: s.min_deposit_amount,
     workingHours: s.working_hours,
+    cutoffHour: Number(s.cutoff_hour ?? 3),
     currency: s.currency,
   });
 });
