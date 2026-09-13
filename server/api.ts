@@ -1972,6 +1972,21 @@ router.post('/orders', (req: Request, res: Response) => {
 
   db.exec('BEGIN TRANSACTION;');
   try {
+    // 1. Read store settings and verify store availability
+    const settings = db.prepare('SELECT * FROM store_settings WHERE id = 1').get() as Record<string, unknown> | undefined;
+    if (!settings) {
+      db.exec('ROLLBACK;');
+      return res.status(500).json({ error: 'إعدادات المتجر غير متوفرة حالياً، يرجى المحاولة لاحقاً' });
+    }
+
+    if (!settings.is_open) {
+      db.exec('ROLLBACK;');
+      const reason = settings.closed_reason ? String(settings.closed_reason).trim() : '';
+      return res.status(400).json({
+        error: reason ? `المتجر مغلق حالياً: ${reason}` : 'المتجر مغلق حالياً ولا يستقبل طلبات جديدة في الوقت الحالي',
+      });
+    }
+
     let subtotal = 0;
     const verifiedItems: {
       productId: string;
@@ -2074,6 +2089,15 @@ router.post('/orders', (req: Request, res: Response) => {
       });
     }
 
+    // Enforce store-wide minimum order amount on server-calculated subtotal
+    const minOrderAmount = Number(settings.min_order_amount || 0);
+    if (minOrderAmount > 0 && subtotal < minOrderAmount) {
+      db.exec('ROLLBACK;');
+      return res.status(400).json({
+        error: `الحد الأدنى للطلب في المتجر هو ${minOrderAmount} ج.م (إجمالي الأصناف الحالي: ${subtotal} ج.م)`,
+      });
+    }
+
     // Validate Coupon if provided
     let discountAmount = 0;
     if (couponCode) {
@@ -2115,22 +2139,32 @@ router.post('/orders', (req: Request, res: Response) => {
       db.prepare('UPDATE coupons SET used_count = used_count + 1 WHERE id = ?').run(String(coupon.id));
     }
 
-    // Delivery fee calculation with regions
-    const settings = db.prepare('SELECT * FROM store_settings WHERE id = 1').get() as Record<string, unknown>;
+    // Delivery fee calculation with regions (reusing store_settings)
     let fee = Number(settings.default_delivery_fee || 15);
 
     if (deliveryRegionId) {
       const reg = db.prepare('SELECT * FROM delivery_regions WHERE id = ? AND is_active = 1').get(deliveryRegionId) as Record<string, unknown> | undefined;
+      if (!reg) {
+        db.exec('ROLLBACK;');
+        return res.status(400).json({ error: 'منطقة التوصيل المحددة غير صالحة أو غير مفعّلة حالياً' });
+      }
+      fee = Number(reg.delivery_fee);
+      const regMinOrder = Number(reg.min_order_amount || 0);
+      if (regMinOrder > 0 && subtotal < regMinOrder) {
+        db.exec('ROLLBACK;');
+        return res.status(400).json({ error: `الحد الأدنى للطلب لمنطقة ${reg.name} هو ${regMinOrder} ج.م` });
+      }
+    } else if (district && typeof district === 'string' && district.trim()) {
+      const cleanDistrict = district.trim();
+      const reg = db.prepare('SELECT * FROM delivery_regions WHERE is_active = 1 AND name LIKE ?').get(`%${cleanDistrict}%`) as Record<string, unknown> | undefined;
       if (reg) {
         fee = Number(reg.delivery_fee);
-        if (reg.min_order_amount && subtotal < Number(reg.min_order_amount)) {
+        const regMinOrder = Number(reg.min_order_amount || 0);
+        if (regMinOrder > 0 && subtotal < regMinOrder) {
           db.exec('ROLLBACK;');
-          return res.status(400).json({ error: `الحد الأدنى للطلب لمنطقة ${reg.name} هو ${reg.min_order_amount} ج.م` });
+          return res.status(400).json({ error: `الحد الأدنى للطلب لمنطقة ${reg.name} هو ${regMinOrder} ج.م` });
         }
       }
-    } else if (district) {
-      const reg = db.prepare('SELECT * FROM delivery_regions WHERE is_active = 1 AND (name LIKE ? OR district LIKE ?)').get(`%${district.trim()}%`, `%${district.trim()}%`) as Record<string, unknown> | undefined;
-      if (reg) fee = Number(reg.delivery_fee);
     }
 
     const freeThreshold = Number(settings.free_delivery_threshold || 400);
