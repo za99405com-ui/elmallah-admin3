@@ -773,19 +773,35 @@ router.delete('/admin/products/:id/variants/:variantId', requireAuth, requireRol
 // ==========================================
 // 5. CATEGORIES
 // ==========================================
-router.get('/admin/categories', requireAuth, (_req: AuthenticatedRequest, res: Response) => {
-  const rows = db
-    .prepare(`
-      SELECT c.*, COUNT(p.id) as item_count
-      FROM categories c
-      LEFT JOIN products p ON c.id = p.category_id
-      GROUP BY c.id
-      ORDER BY c.sort_order ASC, c.created_at ASC
-    `)
-    .all() as Record<string, unknown>[];
+router.get('/admin/categories', requireAuth, async (_req: AuthenticatedRequest, res: Response) => {
+  const { data: rows, error } = await supabaseServer
+    .from('categories')
+    .select('*')
+    .order('sort_order', { ascending: true })
+    .order('created_at', { ascending: true });
+
+  if (error) {
+    console.error('Supabase categories read failed:', error.message);
+    return res.status(503).json({ error: 'تعذر تحميل التصنيفات' });
+  }
+
+  const { data: products, error: productsError } = await supabaseServer
+    .from('products')
+    .select('category_id');
+
+  if (productsError) {
+    console.error('Supabase category counts read failed:', productsError.message);
+    return res.status(503).json({ error: 'تعذر تحميل التصنيفات' });
+  }
+
+  const counts = new Map<string, number>();
+  for (const product of products || []) {
+    const categoryId = String(product.category_id || '');
+    if (categoryId) counts.set(categoryId, (counts.get(categoryId) || 0) + 1);
+  }
 
   return res.json(
-    rows.map((r) => ({
+    (rows || []).map((r) => ({
       id: r.id,
       name: r.name,
       slug: r.slug,
@@ -794,7 +810,7 @@ router.get('/admin/categories', requireAuth, (_req: AuthenticatedRequest, res: R
       imageUrl: r.image_url,
       isActive: Boolean(r.is_active),
       sortOrder: r.sort_order,
-      itemCount: Number(r.item_count || 0),
+      itemCount: counts.get(String(r.id)) || 0,
     }))
   );
 });
@@ -1815,10 +1831,21 @@ router.delete('/admin/coupons/:id', requireAuth, requireRole(['super_admin', 'ma
 // ==========================================
 // 8.5. DELIVERY REGIONS
 // ==========================================
-router.get('/delivery-regions', (_req: Request, res: Response) => {
-  const regions = db.prepare('SELECT * FROM delivery_regions WHERE is_active = 1 ORDER BY sort_order ASC, name ASC').all() as Record<string, unknown>[];
+router.get('/delivery-regions', async (_req: Request, res: Response) => {
+  const { data: regions, error } = await supabaseServer
+    .from('delivery_regions')
+    .select('*')
+    .eq('is_active', true)
+    .order('sort_order', { ascending: true })
+    .order('name', { ascending: true });
+
+  if (error) {
+    console.error('Supabase delivery regions read failed:', error.message);
+    return res.status(503).json({ error: 'تعذر تحميل مناطق التوصيل' });
+  }
+
   return res.json(
-    regions.map((r) => ({
+    (regions || []).map((r) => ({
       id: r.id,
       name: r.name,
       city: r.city,
@@ -1831,10 +1858,20 @@ router.get('/delivery-regions', (_req: Request, res: Response) => {
   );
 });
 
-router.get('/admin/delivery-regions', requireAuth, (_req: AuthenticatedRequest, res: Response) => {
-  const regions = db.prepare('SELECT * FROM delivery_regions ORDER BY sort_order ASC, name ASC').all() as Record<string, unknown>[];
+router.get('/admin/delivery-regions', requireAuth, async (_req: AuthenticatedRequest, res: Response) => {
+  const { data: regions, error } = await supabaseServer
+    .from('delivery_regions')
+    .select('*')
+    .order('sort_order', { ascending: true })
+    .order('name', { ascending: true });
+
+  if (error) {
+    console.error('Supabase admin delivery regions read failed:', error.message);
+    return res.status(503).json({ error: 'تعذر تحميل مناطق التوصيل' });
+  }
+
   return res.json(
-    regions.map((r) => ({
+    (regions || []).map((r) => ({
       id: r.id,
       name: r.name,
       city: r.city,
@@ -2006,8 +2043,17 @@ router.delete('/admin/delivery-regions/:id', requireAuth, requireRole(['super_ad
 // ==========================================
 // 9. STORE SETTINGS
 // ==========================================
-router.get('/admin/settings', requireAuth, (_req: AuthenticatedRequest, res: Response) => {
-  const s = db.prepare('SELECT * FROM store_settings WHERE id = 1').get() as Record<string, unknown> | undefined;
+router.get('/admin/settings', requireAuth, async (_req: AuthenticatedRequest, res: Response) => {
+  const { data: s, error } = await supabaseServer
+    .from('store_settings')
+    .select('*')
+    .eq('id', 1)
+    .maybeSingle();
+
+  if (error) {
+    console.error('Supabase admin settings read failed:', error.message);
+    return res.status(503).json({ error: 'تعذر تحميل الإعدادات' });
+  }
   if (!s) return res.status(404).json({ error: 'الإعدادات غير موجودة' });
 
   return res.json({
@@ -2531,14 +2577,35 @@ router.get('/products', (_req: Request, res: Response) => {
 });
 
 // GET /api/categories (Customer Store)
-router.get('/categories', (_req: Request, res: Response) => {
-  const rows = db.prepare('SELECT * FROM categories WHERE is_active = 1 ORDER BY sort_order ASC').all();
-  return res.json(rows);
+router.get('/categories', async (_req: Request, res: Response) => {
+  const { data: rows, error } = await supabaseServer
+    .from('categories')
+    .select('*')
+    .eq('is_active', true)
+    .order('sort_order', { ascending: true });
+
+  if (error) {
+    console.error('Supabase public categories read failed:', error.message);
+    return res.status(503).json({ error: 'تعذر تحميل التصنيفات' });
+  }
+
+  return res.json(rows || []);
 });
 
 // GET /api/settings (Customer Store)
-router.get('/settings', (_req: Request, res: Response) => {
-  const s = db.prepare('SELECT * FROM store_settings WHERE id = 1').get() as Record<string, unknown>;
+router.get('/settings', async (_req: Request, res: Response) => {
+  const { data: s, error } = await supabaseServer
+    .from('store_settings')
+    .select('*')
+    .eq('id', 1)
+    .maybeSingle();
+
+  if (error) {
+    console.error('Supabase public settings read failed:', error.message);
+    return res.status(503).json({ error: 'تعذر تحميل إعدادات المتجر' });
+  }
+  if (!s) return res.status(404).json({ error: 'الإعدادات غير موجودة' });
+
   return res.json({
     storeName: s.store_name,
     tagline: s.tagline,
