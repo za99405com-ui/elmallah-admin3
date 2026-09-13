@@ -89,30 +89,20 @@ export async function signInWithSupabase(
   password: string
 ): Promise<{ session: Session | null; user: User | null; error: Error | null }> {
   const client = getSupabaseClient();
-  const cleanEmail = email.trim().toLowerCase();
-  const cleanPassword = password.trim();
+  const cleanEmail = typeof email === 'string' ? email.trim().toLowerCase() : '';
 
-  let { data, error } = await client.auth.signInWithPassword({
-    email: cleanEmail,
-    password: cleanPassword,
-  });
-
-  // If failed with invalid login credentials, try adding/removing the trailing '#' if applicable
-  if (error && error.message.toLowerCase().includes('invalid login credentials')) {
-    const candidateAltPassword = cleanPassword.endsWith('#')
-      ? cleanPassword.slice(0, -1)
-      : `${cleanPassword}#`;
-
-    const altAttempt = await client.auth.signInWithPassword({
-      email: cleanEmail,
-      password: candidateAltPassword,
-    });
-
-    if (!altAttempt.error && altAttempt.data?.session) {
-      data = altAttempt.data;
-      error = null;
-    }
+  if (typeof password !== 'string' || password.length === 0 || !cleanEmail) {
+    return {
+      session: null,
+      user: null,
+      error: new Error('يرجى إدخال البريد الإلكتروني وكلمة المرور'),
+    };
   }
+
+  const { data, error } = await client.auth.signInWithPassword({
+    email: cleanEmail,
+    password: password,
+  });
 
   return {
     session: data?.session || null,

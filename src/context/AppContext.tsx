@@ -769,25 +769,26 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
       const { session, user, error: sbError } = await signInWithSupabase(email, pass);
       if (session?.access_token && user) {
         setStoredToken(session.access_token);
-        const admin: AdminUser = {
-          id: user.id,
-          name: user.user_metadata?.name || user.email?.split('@')[0] || 'زياد الملاح',
-          email: user.email || email,
-          role: (user.user_metadata?.role as 'super_admin' | 'manager' | 'operator') || 'super_admin',
-          avatarUrl:
-            user.user_metadata?.avatar_url ||
-            'https://images.unsplash.com/photo-1534528741775-53994a69daeb?w=100&auto=format&fit=crop&q=80',
-        };
-        setAdminUser(admin);
-        setAuthCredentials({ email: admin.email });
-        setIsAuthenticated(true);
-        addToast({
-          type: 'success',
-          title: `مرحباً بك يا ${admin.name}!`,
-          description: 'تم تسجيل الدخول بنجاح عبر حساب Supabase السحابي',
-        });
-        await refreshData();
-        return true;
+        try {
+          // Fetch trusted admin record from backend database
+          const meRes = await api.getMe();
+          if (meRes?.admin) {
+            setAdminUser(meRes.admin);
+            setAuthCredentials({ email: meRes.admin.email });
+            setIsAuthenticated(true);
+            addToast({
+              type: 'success',
+              title: `مرحباً بك يا ${meRes.admin.name}!`,
+              description: 'تم تسجيل الدخول بنجاح عبر حساب Supabase السحابي',
+            });
+            await refreshData();
+            return true;
+          }
+        } catch (backendAuthErr) {
+          removeStoredToken();
+          await signOutFromSupabase();
+          throw backendAuthErr;
+        }
       }
 
       // 2. Fallback to API login endpoint

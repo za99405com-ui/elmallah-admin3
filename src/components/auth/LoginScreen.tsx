@@ -36,8 +36,12 @@ export const LoginScreen: React.FC = () => {
 
     try {
       const cleanEmail = email.trim();
-      const cleanPass = password.trim();
-      const success = await login(cleanEmail, cleanPass);
+      if (typeof password !== 'string' || password.length === 0) {
+        setErrorMsg('يرجى إدخال كلمة المرور');
+        setIsLoading(false);
+        return;
+      }
+      const success = await login(cleanEmail, password);
       if (!success) {
         setErrorMsg('بيانات الدخول غير صحيحة. يرجى التأكد من البريد الإلكتروني وكلمة المرور.');
       }

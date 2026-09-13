@@ -25,12 +25,11 @@ router.post('/admin/auth/login', async (req: Request, res: Response) => {
   const { email, password } = req.body;
   const clientIp = req.ip || req.headers['x-forwarded-for'] || 'unknown';
 
-  if (!email || !password) {
+  if (typeof email !== 'string' || typeof password !== 'string' || !email.trim() || password.length === 0) {
     return res.status(400).json({ error: 'يرجى إدخال البريد الإلكتروني وكلمة المرور' });
   }
 
   const normalizedEmail = email.toLowerCase().trim();
-  const cleanPassword = (password || '').trim();
 
   // Rate Limiting check
   const rateLimitCheck = checkRateLimit(`login:${normalizedEmail}`);
@@ -40,46 +39,52 @@ router.post('/admin/auth/login', async (req: Request, res: Response) => {
     });
   }
 
-  // Authenticate strictly with Supabase Auth
+  // Authenticate strictly with Supabase Auth exactly once using exact password
   try {
-    let sbDataResult = await supabaseAuthClient.auth.signInWithPassword({
+    const sbDataResult = await supabaseAuthClient.auth.signInWithPassword({
       email: normalizedEmail,
-      password: cleanPassword,
+      password: password,
     });
-
-    // Flexible fallback: if password has/lacks trailing '#'
-    if (sbDataResult.error && sbDataResult.error.message.toLowerCase().includes('invalid login credentials')) {
-      const altPassword = cleanPassword.endsWith('#') ? cleanPassword.slice(0, -1) : `${cleanPassword}#`;
-      const altAttempt = await supabaseAuthClient.auth.signInWithPassword({
-        email: normalizedEmail,
-        password: altPassword,
-      });
-
-      if (!altAttempt.error && altAttempt.data?.session) {
-        sbDataResult = altAttempt;
-      }
-    }
 
     if (!sbDataResult.error && sbDataResult.data?.user && sbDataResult.data?.session) {
       clearRateLimit(`login:${normalizedEmail}`);
       const user = sbDataResult.data.user;
 
-      const localAdmin = db.prepare('SELECT name, role, avatar_url FROM admins WHERE email = ?').get(normalizedEmail) as
-        | { name: string; role: string; avatar_url?: string }
+      // 1. Look up the authenticated user's normalized email in the local admins table
+      const localAdmin = db.prepare('SELECT id, name, email, role, avatar_url FROM admins WHERE email = ?').get(normalizedEmail) as
+        | { id: string; name: string; email: string; role: string; avatar_url?: string }
         | undefined;
 
+      // 2. If there is NO matching local admin record, reject dashboard login with HTTP 403
+      if (!localAdmin) {
+        return res.status(403).json({
+          error: 'غير مصرح: هذا الحساب ليس لديه صلاحيات وصول مسجلة في لوحة الإدارة.',
+        });
+      }
+
+      // 3. The role must come ONLY from the trusted local admins database record.
+      // NEVER use user.user_metadata.role and NEVER default a missing or invalid role to super_admin.
+      const validRoles = ['super_admin', 'manager', 'operator'] as const;
+      type AdminRole = (typeof validRoles)[number];
+
+      if (!localAdmin.role || !validRoles.includes(localAdmin.role as AdminRole)) {
+        return res.status(403).json({
+          error: 'غير مصرح: دور الحساب غير صالح أو غير معتمد في لوحة الإدارة.',
+        });
+      }
+
+      const role: AdminRole = localAdmin.role as AdminRole;
+
       const payload = {
-        id: user.id,
+        id: localAdmin.id || user.id,
         name:
-          localAdmin?.name ||
-          user.user_metadata?.name ||
+          localAdmin.name ||
           normalizedEmail.split('@')[0] ||
           'كابتن زياد الملاح (المدير العام)',
-        email: user.email || normalizedEmail,
-        role: ((localAdmin?.role || user.user_metadata?.role) as 'super_admin' | 'manager' | 'operator') || 'super_admin',
+        email: localAdmin.email || user.email || normalizedEmail,
+        role,
         avatarUrl:
-          localAdmin?.avatar_url ||
-          user.user_metadata?.avatar_url ||
+          localAdmin.avatar_url ||
           'https://images.unsplash.com/photo-1534528741775-53994a69daeb?w=100&auto=format&fit=crop&q=80',
       };
 
@@ -87,7 +92,7 @@ router.post('/admin/auth/login', async (req: Request, res: Response) => {
         db.prepare('UPDATE admins SET last_login = ? WHERE email = ?').run(new Date().toISOString(), normalizedEmail);
       } catch {}
 
-      logAuditAction(payload, 'login_supabase', 'admin', user.id, null, { email: user.email }, String(clientIp));
+      logAuditAction(payload, 'login_supabase', 'admin', user.id, null, { email: user.email, role }, String(clientIp));
 
       return res.json({
         token: sbDataResult.data.session.access_token,

@@ -96,11 +96,17 @@ export async function requireAuth(req: AuthenticatedRequest, res: Response, next
       });
     }
 
-    // Role MUST come strictly from the trusted database, NEVER from user_metadata
-    const validatedRole: 'super_admin' | 'manager' | 'operator' =
-      localAdmin.role === 'super_admin' || localAdmin.role === 'manager' || localAdmin.role === 'operator'
-        ? (localAdmin.role as 'super_admin' | 'manager' | 'operator')
-        : 'operator';
+    // Role MUST come strictly from the trusted database, NEVER from user_metadata and NEVER default
+    const validRoles = ['super_admin', 'manager', 'operator'] as const;
+    type AdminRole = (typeof validRoles)[number];
+
+    if (!localAdmin.role || !validRoles.includes(localAdmin.role as AdminRole)) {
+      return res.status(403).json({
+        error: 'غير مصرح: دور الحساب غير صالح أو غير معتمد في لوحة الإدارة.',
+      });
+    }
+
+    const validatedRole: AdminRole = localAdmin.role as AdminRole;
 
     const payload: AdminPayload = {
       id: localAdmin.id || sbUser.id,
