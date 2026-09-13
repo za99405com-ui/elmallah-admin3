@@ -529,7 +529,7 @@ router.post('/admin/products', requireAuth, requireRole(['super_admin', 'manager
         id, name, description, category_id, pricing_unit, base_price,
         image_url, min_order_quantity, max_order_quantity,
         sort_order, badge, is_active, created_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?)
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?)
     `).run(
       productId,
       name.trim(),
