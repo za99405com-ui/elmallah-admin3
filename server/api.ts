@@ -2499,7 +2499,9 @@ router.get('/products', (_req: Request, res: Response) => {
       weightKg: v.weight_kg,
       pieceCount: v.piece_count,
       approxPieceWeightG: v.approx_piece_weight_g,
-      price: v.price,
+      price: Number(v.price),
+      stockQuantity: Number(v.stock_quantity || 0),
+      sortOrder: Number(v.sort_order || 0),
       isActive: Boolean(v.is_active),
     });
   }
@@ -2512,7 +2514,14 @@ router.get('/products', (_req: Request, res: Response) => {
       categoryId: p.category_id,
       categoryName: p.category_name || '',
       pricingUnit: p.pricing_unit,
-      price: p.base_price,
+      price: Number(p.base_price),
+      stockQuantity: Number(p.stock_quantity || 0),
+      inStock: Boolean(p.in_stock),
+      minOrderQuantity:
+        p.min_order_quantity != null ? Number(p.min_order_quantity) : undefined,
+      maxOrderQuantity:
+        p.max_order_quantity != null ? Number(p.max_order_quantity) : undefined,
+      sortOrder: Number(p.sort_order || 0),
       imageUrl: p.image_url,
       badge: p.badge,
       isActive: Boolean(p.is_active),
