@@ -247,31 +247,17 @@ router.delete('/admin/auth/admins/:id', requireAuth, requireRole(['super_admin']
 });
 
 // ==========================================
-// 2. REALTIME SSE STREAM (SECURED VIA SUPABASE SESSION)
+// 2. REALTIME SSE STREAM (SECURED VIA SUPABASE SESSION & LOCAL ADMIN)
 // ==========================================
-router.get('/admin/realtime', async (req: Request, res: Response) => {
-  const token = req.query.token as string;
-  if (!token) {
-    return res.status(401).json({ error: 'مطلوب رمز المصادقة للبث اللحظي' });
-  }
+router.get('/admin/realtime', requireAuth, (req: AuthenticatedRequest, res: Response) => {
+  res.setHeader('Content-Type', 'text/event-stream');
+  res.setHeader('Cache-Control', 'no-cache');
+  res.setHeader('Connection', 'keep-alive');
+  res.setHeader('X-Accel-Buffering', 'no');
+  res.flushHeaders();
 
-  try {
-    const { data, error } = await supabaseServer.auth.getUser(token);
-    if (error || !data?.user) {
-      return res.status(401).json({ error: 'انتهت صلاحية جلسة Supabase للبث اللحظي' });
-    }
-
-    res.setHeader('Content-Type', 'text/event-stream');
-    res.setHeader('Cache-Control', 'no-cache');
-    res.setHeader('Connection', 'keep-alive');
-    res.setHeader('X-Accel-Buffering', 'no');
-    res.flushHeaders();
-
-    const clientId = `client-${Date.now()}-${Math.random().toString(36).substring(2, 7)}`;
-    addRealtimeClient(clientId, res, data.user.id);
-  } catch {
-    return res.status(401).json({ error: 'خطأ في التحقق من جلسة Supabase' });
-  }
+  const clientId = `client-${Date.now()}-${Math.random().toString(36).substring(2, 7)}`;
+  addRealtimeClient(clientId, res, req.admin!.id);
 });
 
 // ==========================================

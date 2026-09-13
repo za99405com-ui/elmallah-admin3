@@ -518,7 +518,7 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
     return () => window.removeEventListener('almallah:unauthorized', handleUnauthorized);
   }, [addToast]);
 
-  // 9. Real-Time SSE Stream Listener
+  // 9. Real-Time SSE Stream Listener (Authenticated via Authorization: Bearer header)
   useEffect(() => {
     const token = getStoredToken();
     if (!isAuthenticated || !token) {
@@ -526,19 +526,18 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
       return;
     }
 
-    let eventSource: EventSource | null = null;
+    const abortController = new AbortController();
+    let retryTimeoutId: ReturnType<typeof setTimeout> | null = null;
 
-    try {
-      eventSource = new EventSource(`/api/admin/realtime?token=${encodeURIComponent(token)}`);
-
-      eventSource.addEventListener('connected', () => {
+    const dispatchRealtimeEvent = (eventType: string, dataStr: string) => {
+      if (eventType === 'connected') {
         setRealtimeConnected(true);
-      });
+        return;
+      }
 
-      // Handle new incoming orders in real-time
-      eventSource.addEventListener('new_order', (e: MessageEvent) => {
+      if (eventType === 'new_order') {
         try {
-          const newOrder = JSON.parse(e.data) as Order;
+          const newOrder = JSON.parse(dataStr) as Order;
           setOrders((prev) => [newOrder, ...prev.filter((o) => o.id !== newOrder.id)]);
 
           sendPhoneNotification(
@@ -558,22 +557,22 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
         } catch (err) {
           console.error('Failed to parse new_order event:', err);
         }
-      });
+        return;
+      }
 
-      // Handle order status updates
-      eventSource.addEventListener('order_status_updated', (e: MessageEvent) => {
+      if (eventType === 'order_status_updated') {
         try {
-          const updated = JSON.parse(e.data) as Order;
+          const updated = JSON.parse(dataStr) as Order;
           setOrders((prev) => prev.map((o) => (o.id === updated.id ? updated : o)));
         } catch (err) {
           console.error('Failed to parse order_status_updated event:', err);
         }
-      });
+        return;
+      }
 
-      // Handle deposit updates
-      eventSource.addEventListener('deposit_updated', (e: MessageEvent) => {
+      if (eventType === 'deposit_updated') {
         try {
-          const updated = JSON.parse(e.data) as Order;
+          const updated = JSON.parse(dataStr) as Order;
           setOrders((prev) => prev.map((o) => (o.id === updated.id ? updated : o)));
           addToast({
             type: updated.depositStatus === 'confirmed' ? 'success' : 'warning',
@@ -583,179 +582,278 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
         } catch (err) {
           console.error('Failed to parse deposit_updated event:', err);
         }
-      });
+        return;
+      }
 
-      // Handle product updates
-      eventSource.addEventListener('product_created', (e: MessageEvent) => {
+      if (eventType === 'product_created') {
         try {
-          const prod = JSON.parse(e.data) as Product;
+          const prod = JSON.parse(dataStr) as Product;
           setProducts((prev) => [prod, ...prev.filter((p) => p.id !== prod.id)]);
         } catch (err) {
           console.error('Failed to parse product_created event:', err);
         }
-      });
+        return;
+      }
 
-      eventSource.addEventListener('product_updated', (e: MessageEvent) => {
+      if (eventType === 'product_updated') {
         try {
-          const prod = JSON.parse(e.data) as Product;
+          const prod = JSON.parse(dataStr) as Product;
           setProducts((prev) => prev.map((p) => (p.id === prod.id ? prod : p)));
         } catch (err) {
           console.error('Failed to parse product_updated event:', err);
         }
-      });
+        return;
+      }
 
-      eventSource.addEventListener('product_deleted', (e: MessageEvent) => {
+      if (eventType === 'product_deleted') {
         try {
-          const { id } = JSON.parse(e.data) as { id: string };
+          const { id } = JSON.parse(dataStr) as { id: string };
           setProducts((prev) => prev.filter((p) => p.id !== id));
         } catch (err) {
           console.error('Failed to parse product_deleted event:', err);
         }
-      });
+        return;
+      }
 
-      // Handle order deletion
-      eventSource.addEventListener('order_deleted', (e: MessageEvent) => {
+      if (eventType === 'order_deleted') {
         try {
-          const { id } = JSON.parse(e.data) as { id: string };
+          const { id } = JSON.parse(dataStr) as { id: string };
           setOrders((prev) => prev.filter((o) => o.id !== id));
         } catch (err) {
           console.error('Failed to parse order_deleted event:', err);
         }
-      });
+        return;
+      }
 
-      // Handle customer updates
-      eventSource.addEventListener('customer_created', (e: MessageEvent) => {
+      if (eventType === 'customer_created') {
         try {
-          const cust = JSON.parse(e.data) as Customer;
+          const cust = JSON.parse(dataStr) as Customer;
           setCustomers((prev) => [cust, ...prev.filter((c) => c.id !== cust.id)]);
         } catch (err) {
           console.error('Failed to parse customer_created event:', err);
         }
-      });
+        return;
+      }
 
-      eventSource.addEventListener('customer_updated', (e: MessageEvent) => {
+      if (eventType === 'customer_updated') {
         try {
-          const cust = JSON.parse(e.data) as Customer;
+          const cust = JSON.parse(dataStr) as Customer;
           setCustomers((prev) => prev.map((c) => (c.id === cust.id ? cust : c)));
         } catch (err) {
           console.error('Failed to parse customer_updated event:', err);
         }
-      });
+        return;
+      }
 
-      eventSource.addEventListener('customer_deleted', (e: MessageEvent) => {
+      if (eventType === 'customer_deleted') {
         try {
-          const { id } = JSON.parse(e.data) as { id: string };
+          const { id } = JSON.parse(dataStr) as { id: string };
           setCustomers((prev) => prev.filter((c) => c.id !== id));
         } catch (err) {
           console.error('Failed to parse customer_deleted event:', err);
         }
-      });
+        return;
+      }
 
-      // Handle category updates
-      eventSource.addEventListener('category_created', (e: MessageEvent) => {
+      if (eventType === 'category_created') {
         try {
-          const cat = JSON.parse(e.data) as Category;
+          const cat = JSON.parse(dataStr) as Category;
           setCategories((prev) => [cat, ...prev.filter((c) => c.id !== cat.id)]);
         } catch (err) {
           console.error('Failed to parse category_created event:', err);
         }
-      });
+        return;
+      }
 
-      eventSource.addEventListener('category_updated', (e: MessageEvent) => {
+      if (eventType === 'category_updated') {
         try {
-          const cat = JSON.parse(e.data) as Category;
+          const cat = JSON.parse(dataStr) as Category;
           setCategories((prev) => prev.map((c) => (c.id === cat.id ? cat : c)));
         } catch (err) {
           console.error('Failed to parse category_updated event:', err);
         }
-      });
+        return;
+      }
 
-      eventSource.addEventListener('category_deleted', (e: MessageEvent) => {
+      if (eventType === 'category_deleted') {
         try {
-          const { id } = JSON.parse(e.data) as { id: string };
+          const { id } = JSON.parse(dataStr) as { id: string };
           setCategories((prev) => prev.filter((c) => c.id !== id));
         } catch (err) {
           console.error('Failed to parse category_deleted event:', err);
         }
-      });
+        return;
+      }
 
-      // Handle coupon updates
-      eventSource.addEventListener('coupon_created', (e: MessageEvent) => {
+      if (eventType === 'coupon_created') {
         try {
-          const coup = JSON.parse(e.data) as Coupon;
+          const coup = JSON.parse(dataStr) as Coupon;
           setCoupons((prev) => [coup, ...prev.filter((c) => c.id !== coup.id)]);
         } catch (err) {
           console.error('Failed to parse coupon_created event:', err);
         }
-      });
+        return;
+      }
 
-      eventSource.addEventListener('coupon_updated', (e: MessageEvent) => {
+      if (eventType === 'coupon_updated') {
         try {
-          const coup = JSON.parse(e.data) as Coupon;
+          const coup = JSON.parse(dataStr) as Coupon;
           setCoupons((prev) => prev.map((c) => (c.id === coup.id ? coup : c)));
         } catch (err) {
           console.error('Failed to parse coupon_updated event:', err);
         }
-      });
+        return;
+      }
 
-      eventSource.addEventListener('coupon_deleted', (e: MessageEvent) => {
+      if (eventType === 'coupon_deleted') {
         try {
-          const { id } = JSON.parse(e.data) as { id: string };
+          const { id } = JSON.parse(dataStr) as { id: string };
           setCoupons((prev) => prev.filter((c) => c.id !== id));
         } catch (err) {
           console.error('Failed to parse coupon_deleted event:', err);
         }
-      });
+        return;
+      }
 
-      // Handle delivery region updates
-      eventSource.addEventListener('delivery_region_created', (e: MessageEvent) => {
+      if (eventType === 'delivery_region_created') {
         try {
-          const reg = JSON.parse(e.data) as DeliveryRegion;
+          const reg = JSON.parse(dataStr) as DeliveryRegion;
           setDeliveryRegions((prev) => [reg, ...prev.filter((r) => r.id !== reg.id)]);
         } catch (err) {
           console.error('Failed to parse delivery_region_created event:', err);
         }
-      });
+        return;
+      }
 
-      eventSource.addEventListener('delivery_region_updated', (e: MessageEvent) => {
+      if (eventType === 'delivery_region_updated') {
         try {
-          const reg = JSON.parse(e.data) as DeliveryRegion;
+          const reg = JSON.parse(dataStr) as DeliveryRegion;
           setDeliveryRegions((prev) => prev.map((r) => (r.id === reg.id ? reg : r)));
         } catch (err) {
           console.error('Failed to parse delivery_region_updated event:', err);
         }
-      });
+        return;
+      }
 
-      eventSource.addEventListener('delivery_region_deleted', (e: MessageEvent) => {
+      if (eventType === 'delivery_region_deleted') {
         try {
-          const { id } = JSON.parse(e.data) as { id: string };
+          const { id } = JSON.parse(dataStr) as { id: string };
           setDeliveryRegions((prev) => prev.filter((r) => r.id !== id));
         } catch (err) {
           console.error('Failed to parse delivery_region_deleted event:', err);
         }
-      });
+        return;
+      }
 
-      // Handle store settings updates
-      eventSource.addEventListener('store_settings_updated', (e: MessageEvent) => {
+      if (eventType === 'store_settings_updated') {
         try {
-          const updatedSettings = JSON.parse(e.data) as StoreSettings;
+          const updatedSettings = JSON.parse(dataStr) as StoreSettings;
           setSettings(updatedSettings);
         } catch (err) {
           console.error('Failed to parse store_settings_updated event:', err);
         }
-      });
+        return;
+      }
+    };
 
-      eventSource.onerror = () => {
+    const connectSSE = async () => {
+      if (abortController.signal.aborted) return;
+
+      let shouldReconnect = true;
+
+      try {
+        const response = await fetch('/api/admin/realtime', {
+          method: 'GET',
+          headers: {
+            Authorization: `Bearer ${token}`,
+            Accept: 'text/event-stream',
+          },
+          signal: abortController.signal,
+        });
+
+        if (response.status === 401 || response.status === 403) {
+          shouldReconnect = false;
+          setRealtimeConnected(false);
+          return;
+        }
+
+        if (!response.ok || !response.body) {
+          setRealtimeConnected(false);
+          return;
+        }
+
+        const reader = response.body.getReader();
+        const decoder = new TextDecoder('utf-8');
+        let buffer = '';
+
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+
+          buffer += decoder.decode(value, { stream: true });
+
+          while (true) {
+            let boundaryIndex = -1;
+            let delimiterLength = 2;
+
+            const idxDoubleNewline = buffer.indexOf('\n\n');
+            const idxCRLFDouble = buffer.indexOf('\r\n\r\n');
+
+            if (idxDoubleNewline !== -1 && (idxCRLFDouble === -1 || idxDoubleNewline <= idxCRLFDouble)) {
+              boundaryIndex = idxDoubleNewline;
+              delimiterLength = 2;
+            } else if (idxCRLFDouble !== -1) {
+              boundaryIndex = idxCRLFDouble;
+              delimiterLength = 4;
+            }
+
+            if (boundaryIndex === -1) break;
+
+            const rawMessage = buffer.slice(0, boundaryIndex);
+            buffer = buffer.slice(boundaryIndex + delimiterLength);
+
+            if (!rawMessage.trim()) continue;
+
+            const lines = rawMessage.split(/\r?\n/);
+            let eventType = 'message';
+            const dataParts: string[] = [];
+
+            for (const line of lines) {
+              if (line.startsWith(':')) {
+                // Heartbeat ping or comment
+                continue;
+              }
+              if (line.startsWith('event:')) {
+                eventType = line.slice(6).trim();
+              } else if (line.startsWith('data:')) {
+                dataParts.push(line.slice(5).trimStart());
+              }
+            }
+
+            const eventData = dataParts.join('\n');
+            dispatchRealtimeEvent(eventType, eventData);
+          }
+        }
+      } catch (err: unknown) {
+        if ((err as Error)?.name === 'AbortError' || abortController.signal.aborted) {
+          shouldReconnect = false;
+          return;
+        }
+        console.error('Realtime SSE stream error:', err);
+      } finally {
         setRealtimeConnected(false);
-      };
-    } catch (err) {
-      console.error('EventSource connection error:', err);
-      setRealtimeConnected(false);
-    }
+        if (shouldReconnect && !abortController.signal.aborted) {
+          retryTimeoutId = setTimeout(connectSSE, 3000);
+        }
+      }
+    };
+
+    connectSSE();
 
     return () => {
-      if (eventSource) {
-        eventSource.close();
+      abortController.abort();
+      if (retryTimeoutId) {
+        clearTimeout(retryTimeoutId);
       }
       setRealtimeConnected(false);
     };
