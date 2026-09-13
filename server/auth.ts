@@ -53,6 +53,76 @@ export function clearRateLimit(key: string): void {
   rateLimits.delete(key);
 }
 
+export function checkLoginRateLimit(email: string, clientIp?: string): { allowed: boolean; waitSeconds?: number } {
+  const emailCheck = checkRateLimit(`login:email:${email}`);
+  if (!emailCheck.allowed) {
+    return emailCheck;
+  }
+
+  if (clientIp && clientIp !== 'unknown') {
+    const ipCheck = checkRateLimit(`login:ip:${clientIp}`);
+    if (!ipCheck.allowed) {
+      return ipCheck;
+    }
+  }
+
+  return { allowed: true };
+}
+
+export function recordFailedLogin(email: string, clientIp?: string): void {
+  recordFailedAttempt(`login:email:${email}`);
+  if (clientIp && clientIp !== 'unknown') {
+    recordFailedAttempt(`login:ip:${clientIp}`);
+  }
+}
+
+export function clearLoginRateLimit(email: string, clientIp?: string): void {
+  clearRateLimit(`login:email:${email}`);
+  if (clientIp && clientIp !== 'unknown') {
+    clearRateLimit(`login:ip:${clientIp}`);
+  }
+}
+
+// Dedicated Rate Limiting for Public Order Creation (max 5 orders per 10 minutes)
+interface OrderRateLimitRecord {
+  timestamps: number[];
+}
+const orderRateLimits = new Map<string, OrderRateLimitRecord>();
+
+export function checkOrderRateLimit(keys: string[]): boolean {
+  const now = Date.now();
+  const windowMs = 10 * 60 * 1000; // 10 minutes
+  const maxAttempts = 5;
+
+  for (const key of keys) {
+    if (!key) continue;
+    const record = orderRateLimits.get(key);
+    if (record) {
+      record.timestamps = record.timestamps.filter((ts) => now - ts < windowMs);
+      if (record.timestamps.length >= maxAttempts) {
+        return false;
+      }
+    }
+  }
+  return true;
+}
+
+export function recordOrderAttempt(keys: string[]): void {
+  const now = Date.now();
+  const windowMs = 10 * 60 * 1000;
+
+  for (const key of keys) {
+    if (!key) continue;
+    let record = orderRateLimits.get(key);
+    if (!record) {
+      record = { timestamps: [] };
+      orderRateLimits.set(key, record);
+    }
+    record.timestamps = record.timestamps.filter((ts) => now - ts < windowMs);
+    record.timestamps.push(now);
+  }
+}
+
 /**
  * Authentication Middleware:
  * Strictly verifies the client session token against Supabase Auth.

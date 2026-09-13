@@ -22,7 +22,7 @@ export function initDatabase() {
       id TEXT PRIMARY KEY,
       name TEXT NOT NULL,
       email TEXT NOT NULL UNIQUE,
-      role TEXT NOT NULL DEFAULT 'super_admin',
+      role TEXT NOT NULL,
       avatar_url TEXT,
       created_at TEXT NOT NULL,
       last_login TEXT
@@ -39,7 +39,7 @@ export function initDatabase() {
           id TEXT PRIMARY KEY,
           name TEXT NOT NULL,
           email TEXT NOT NULL UNIQUE,
-          role TEXT NOT NULL DEFAULT 'super_admin',
+          role TEXT NOT NULL,
           avatar_url TEXT,
           created_at TEXT NOT NULL,
           last_login TEXT

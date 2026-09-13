@@ -8,6 +8,11 @@ import {
   checkRateLimit,
   recordFailedAttempt,
   clearRateLimit,
+  checkLoginRateLimit,
+  recordFailedLogin,
+  clearLoginRateLimit,
+  checkOrderRateLimit,
+  recordOrderAttempt,
   logAuditAction,
 } from './auth';
 import { addRealtimeClient, broadcastRealtimeEvent } from './realtime';
@@ -16,6 +21,54 @@ export const router = Router();
 
 import { supabaseAuthClient, supabaseServer } from './supabase';
 
+// Safe numeric validation helper
+function parseAndValidateNumber(
+  value: unknown,
+  fieldName: string,
+  options: {
+    min?: number;
+    max?: number;
+    integerOnly?: boolean;
+    allowNull?: boolean;
+  } = {}
+): { valid: boolean; value?: number; error?: string } {
+  if (value === undefined || (options.allowNull && value === null)) {
+    return { valid: true };
+  }
+  if (typeof value === 'boolean') {
+    return { valid: false, error: `الحقل ${fieldName} يجب أن يكون رقماً صالحاً` };
+  }
+  if (typeof value === 'string' && value.trim() === '') {
+    return { valid: false, error: `الحقل ${fieldName} غير صالح` };
+  }
+  const num = Number(value);
+  if (isNaN(num) || !isFinite(num)) {
+    return { valid: false, error: `الحقل ${fieldName} يجب أن يكون رقماً صالحاً` };
+  }
+  if (options.min !== undefined && num < options.min) {
+    return { valid: false, error: `الحقل ${fieldName} لا يمكن أن يقل عن ${options.min}` };
+  }
+  if (options.max !== undefined && num > options.max) {
+    return { valid: false, error: `الحقل ${fieldName} لا يمكن أن يزيد عن ${options.max}` };
+  }
+  if (options.integerOnly && !Number.isInteger(num)) {
+    return { valid: false, error: `الحقل ${fieldName} يجب أن يكون رقماً صحيحاً` };
+  }
+  return { valid: true, value: num };
+}
+
+// Collision-safe unique order number generator with bounded retries
+function generateUniqueOrderNumber(database: typeof db, maxRetries = 10): string | null {
+  for (let i = 0; i < maxRetries; i++) {
+    const candidate = `#ALM-${Math.floor(10000 + Math.random() * 90000)}`;
+    const row = database.prepare('SELECT id FROM orders WHERE order_number = ?').get(candidate);
+    if (!row) {
+      return candidate;
+    }
+  }
+  return null;
+}
+
 // ==========================================
 // 1. ADMIN AUTHENTICATION (PURE SUPABASE AUTH)
 // ==========================================
@@ -23,7 +76,7 @@ import { supabaseAuthClient, supabaseServer } from './supabase';
 // POST /api/admin/auth/login
 router.post('/admin/auth/login', async (req: Request, res: Response) => {
   const { email, password } = req.body;
-  const clientIp = req.ip || req.headers['x-forwarded-for'] || 'unknown';
+  const clientIp = req.ip || 'unknown';
 
   if (typeof email !== 'string' || typeof password !== 'string' || !email.trim() || password.length === 0) {
     return res.status(400).json({ error: 'يرجى إدخال البريد الإلكتروني وكلمة المرور' });
@@ -31,8 +84,8 @@ router.post('/admin/auth/login', async (req: Request, res: Response) => {
 
   const normalizedEmail = email.toLowerCase().trim();
 
-  // Rate Limiting check
-  const rateLimitCheck = checkRateLimit(`login:${normalizedEmail}`);
+  // Rate Limiting check on both Email and Client IP
+  const rateLimitCheck = checkLoginRateLimit(normalizedEmail, clientIp);
   if (!rateLimitCheck.allowed) {
     return res.status(429).json({
       error: `تم تجاوز محاولات الدخول. يرجى الانتظار ${rateLimitCheck.waitSeconds} ثانية قبل المحاولة مجدداً`,
@@ -47,7 +100,7 @@ router.post('/admin/auth/login', async (req: Request, res: Response) => {
     });
 
     if (!sbDataResult.error && sbDataResult.data?.user && sbDataResult.data?.session) {
-      clearRateLimit(`login:${normalizedEmail}`);
+      clearLoginRateLimit(normalizedEmail, clientIp);
       const user = sbDataResult.data.user;
 
       // 1. Look up the authenticated user's normalized email in the local admins table
@@ -104,7 +157,7 @@ router.post('/admin/auth/login', async (req: Request, res: Response) => {
     // Network transient error
   }
 
-  recordFailedAttempt(`login:${normalizedEmail}`);
+  recordFailedLogin(normalizedEmail, clientIp);
   return res.status(401).json({
     error: 'بيانات الدخول غير صحيحة. يرجى التأكد من البريد الإلكتروني وكلمة المرور المسجلة في Supabase.',
   });
@@ -976,7 +1029,10 @@ router.post('/admin/orders', requireAuth, (req: AuthenticatedRequest, res: Respo
   }
 
   const orderId = `order-${Date.now()}-${crypto.randomBytes(3).toString('hex')}`;
-  const orderNumber = `#ALM-${Math.floor(10000 + Math.random() * 90000)}`;
+  const orderNumber = generateUniqueOrderNumber(db);
+  if (!orderNumber) {
+    return res.status(500).json({ error: 'تعذر إنشاء رقم فريد للطلب بعد عدة محاولات، يرجى إعادة المحاولة' });
+  }
   const now = new Date().toISOString();
 
   db.exec('BEGIN TRANSACTION;');
@@ -1255,17 +1311,42 @@ router.put('/admin/orders/:id/status', requireAuth, (req: AuthenticatedRequest, 
 });
 
 // PUT /api/admin/orders/:id/deposit
-router.put('/admin/orders/:id/deposit', requireAuth, (req: AuthenticatedRequest, res: Response) => {
+router.put('/admin/orders/:id/deposit', requireAuth, requireRole(['super_admin', 'manager']), (req: AuthenticatedRequest, res: Response) => {
   const orderId = req.params.id;
   const { depositStatus, depositAmount, depositMethod, depositReference, depositNotes } = req.body;
 
   const existing = getOrderWithItems(orderId);
   if (!existing) return res.status(404).json({ error: 'الطلب غير موجود' });
 
+  // Strict validation of depositStatus against supported statuses
+  const allowedDepositStatuses = ['confirmed', 'pending', 'not_required', 'rejected'] as const;
+  if (depositStatus !== undefined) {
+    if (typeof depositStatus !== 'string' || !allowedDepositStatuses.includes(depositStatus as any)) {
+      return res.status(400).json({
+        error: 'حالة العربون غير صالحة. الحالات المسموحة: مؤكد (confirmed)، قيد التحصيل (pending)، غير مطلوب (not_required)، مرفوض (rejected)',
+      });
+    }
+  }
+
+  // Strict validation of depositAmount
+  let newDepositAmount = existing.depositAmount;
+  if (depositAmount !== undefined) {
+    const val = parseAndValidateNumber(depositAmount, 'قيمة العربون', { min: 0 });
+    if (!val.valid) {
+      return res.status(400).json({ error: val.error });
+    }
+    const parsedAmount = Math.round(val.value! * 100) / 100;
+    if (parsedAmount > existing.totalAmount) {
+      return res.status(400).json({
+        error: `قيمة العربون (${parsedAmount} ج.م) لا يمكن أن تتجاوز إجمالي الطلب (${existing.totalAmount} ج.م)`,
+      });
+    }
+    newDepositAmount = parsedAmount;
+  }
+
   const now = new Date().toISOString();
-  const newDepositAmount = depositAmount !== undefined ? Number(depositAmount) : existing.depositAmount;
-  const newRemaining = Math.max(0, existing.totalAmount - newDepositAmount);
-  const isConfirmed = depositStatus === 'confirmed';
+  const newRemaining = Math.max(0, Math.round((existing.totalAmount - newDepositAmount) * 100) / 100);
+  const effectiveDepositStatus = depositStatus !== undefined ? depositStatus : existing.depositStatus;
 
   db.prepare(`
     UPDATE orders SET
@@ -1280,22 +1361,30 @@ router.put('/admin/orders/:id/deposit', requireAuth, (req: AuthenticatedRequest,
       updated_at = ?
     WHERE id = ?
   `).run(
-    depositStatus || null,
+    depositStatus !== undefined ? depositStatus : null,
     newDepositAmount,
     newRemaining,
-    depositMethod || null,
-    depositReference || null,
-    depositNotes || null,
-    depositStatus || '',
+    depositMethod !== undefined ? depositMethod : null,
+    depositReference !== undefined ? depositReference : null,
+    depositNotes !== undefined ? depositNotes : null,
+    effectiveDepositStatus,
     now,
-    depositStatus || '',
+    effectiveDepositStatus,
     req.admin!.name,
     now,
     orderId
   );
 
   const updated = getOrderWithItems(orderId);
-  logAuditAction(req.admin, 'update_order_deposit', 'order', orderId, { oldDeposit: existing.depositStatus }, { newDeposit: depositStatus, amount: newDepositAmount }, req.ip);
+  logAuditAction(
+    req.admin,
+    'update_order_deposit',
+    'order',
+    orderId,
+    { oldDeposit: existing.depositStatus, oldAmount: existing.depositAmount },
+    { newDeposit: effectiveDepositStatus, amount: newDepositAmount },
+    req.ip
+  );
   broadcastRealtimeEvent('deposit_updated', updated);
 
   return res.json(updated);
@@ -1486,8 +1575,42 @@ router.post('/admin/coupons', requireAuth, requireRole(['super_admin', 'manager'
     return res.status(400).json({ error: 'كود الكوبون، نوع الخصم، القيمة وتاريخ الانتهاء مطلوبة' });
   }
 
+  if (discountType !== 'percentage' && discountType !== 'fixed') {
+    return res.status(400).json({ error: 'نوع الخصم يجب أن يكون إما نسبة مئوية (percentage) أو قيمة ثابتة (fixed)' });
+  }
+
+  const dValCheck = parseAndValidateNumber(discountValue, 'قيمة الخصم', {
+    min: 0,
+    max: discountType === 'percentage' ? 100 : undefined,
+  });
+  if (!dValCheck.valid) {
+    return res.status(400).json({ error: dValCheck.error });
+  }
+
+  const minOrderCheck = parseAndValidateNumber(minOrderValue !== undefined ? minOrderValue : 0, 'الحد الأدنى للطلب', { min: 0 });
+  if (!minOrderCheck.valid) {
+    return res.status(400).json({ error: minOrderCheck.error });
+  }
+
+  let parsedMaxDiscount: number | null = null;
+  if (maxDiscountValue !== undefined && maxDiscountValue !== null && maxDiscountValue !== '') {
+    const maxDiscCheck = parseAndValidateNumber(maxDiscountValue, 'الحد الأقصى للخصم', { min: 0 });
+    if (!maxDiscCheck.valid) {
+      return res.status(400).json({ error: maxDiscCheck.error });
+    }
+    parsedMaxDiscount = maxDiscCheck.value!;
+  }
+
+  const usageLimitCheck = parseAndValidateNumber(usageLimit !== undefined ? usageLimit : 100, 'حد الاستخدام', {
+    min: 1,
+    integerOnly: true,
+  });
+  if (!usageLimitCheck.valid) {
+    return res.status(400).json({ error: usageLimitCheck.error });
+  }
+
   const id = `cpn-${Date.now()}-${crypto.randomBytes(2).toString('hex')}`;
-  const cleanCode = code.toUpperCase().trim();
+  const cleanCode = String(code).toUpperCase().trim();
 
   db.prepare(`
     INSERT INTO coupons (id, code, discount_type, discount_value, min_order_value, max_discount_value, usage_limit, used_count, expiry_date, is_active, created_at)
@@ -1496,15 +1619,26 @@ router.post('/admin/coupons', requireAuth, requireRole(['super_admin', 'manager'
     id,
     cleanCode,
     discountType,
-    Number(discountValue),
-    Number(minOrderValue || 0),
-    maxDiscountValue ? Number(maxDiscountValue) : null,
-    Number(usageLimit || 100),
+    dValCheck.value!,
+    minOrderCheck.value!,
+    parsedMaxDiscount,
+    usageLimitCheck.value!,
     expiryDate,
     new Date().toISOString()
   );
 
-  const created = { id, code: cleanCode, discountType, discountValue, minOrderValue, maxDiscountValue, usageLimit, usedCount: 0, expiryDate, isActive: true };
+  const created = {
+    id,
+    code: cleanCode,
+    discountType,
+    discountValue: dValCheck.value!,
+    minOrderValue: minOrderCheck.value!,
+    maxDiscountValue: parsedMaxDiscount,
+    usageLimit: usageLimitCheck.value!,
+    usedCount: 0,
+    expiryDate,
+    isActive: true,
+  };
   logAuditAction(req.admin, 'create_coupon', 'coupon', id, null, created, req.ip);
   broadcastRealtimeEvent('coupon_created', created);
 
@@ -1518,7 +1652,56 @@ router.put('/admin/coupons/:id', requireAuth, requireRole(['super_admin', 'manag
   const existing = db.prepare('SELECT * FROM coupons WHERE id = ?').get(id) as Record<string, unknown> | undefined;
   if (!existing) return res.status(404).json({ error: 'الكوبون غير موجود' });
 
-  const cleanCode = code ? code.toString().toUpperCase().trim() : existing.code;
+  if (discountType !== undefined && discountType !== 'percentage' && discountType !== 'fixed') {
+    return res.status(400).json({ error: 'نوع الخصم يجب أن يكون إما نسبة مئوية (percentage) أو قيمة ثابتة (fixed)' });
+  }
+
+  const effectiveType = discountType !== undefined ? discountType : String(existing.discount_type);
+
+  let parsedDiscountValue: number | null = null;
+  if (discountValue !== undefined) {
+    const dValCheck = parseAndValidateNumber(discountValue, 'قيمة الخصم', {
+      min: 0,
+      max: effectiveType === 'percentage' ? 100 : undefined,
+    });
+    if (!dValCheck.valid) {
+      return res.status(400).json({ error: dValCheck.error });
+    }
+    parsedDiscountValue = dValCheck.value!;
+  }
+
+  let parsedMinOrderValue: number | null = null;
+  if (minOrderValue !== undefined) {
+    const minOrderCheck = parseAndValidateNumber(minOrderValue, 'الحد الأدنى للطلب', { min: 0 });
+    if (!minOrderCheck.valid) {
+      return res.status(400).json({ error: minOrderCheck.error });
+    }
+    parsedMinOrderValue = minOrderCheck.value!;
+  }
+
+  let parsedMaxDiscountValue: number | null | undefined = undefined;
+  if (maxDiscountValue !== undefined) {
+    if (maxDiscountValue === null || maxDiscountValue === '') {
+      parsedMaxDiscountValue = null;
+    } else {
+      const maxDiscCheck = parseAndValidateNumber(maxDiscountValue, 'الحد الأقصى للخصم', { min: 0 });
+      if (!maxDiscCheck.valid) {
+        return res.status(400).json({ error: maxDiscCheck.error });
+      }
+      parsedMaxDiscountValue = maxDiscCheck.value!;
+    }
+  }
+
+  let parsedUsageLimit: number | null = null;
+  if (usageLimit !== undefined) {
+    const usageCheck = parseAndValidateNumber(usageLimit, 'حد الاستخدام', { min: 1, integerOnly: true });
+    if (!usageCheck.valid) {
+      return res.status(400).json({ error: usageCheck.error });
+    }
+    parsedUsageLimit = usageCheck.value!;
+  }
+
+  const cleanCode = code ? String(code).toUpperCase().trim() : String(existing.code);
 
   db.prepare(`
     UPDATE coupons SET
@@ -1526,7 +1709,7 @@ router.put('/admin/coupons/:id', requireAuth, requireRole(['super_admin', 'manag
       discount_type = COALESCE(?, discount_type),
       discount_value = COALESCE(?, discount_value),
       min_order_value = COALESCE(?, min_order_value),
-      max_discount_value = COALESCE(?, max_discount_value),
+      max_discount_value = CASE WHEN ? = 1 THEN ? ELSE max_discount_value END,
       usage_limit = COALESCE(?, usage_limit),
       expiry_date = COALESCE(?, expiry_date),
       is_active = COALESCE(?, is_active)
@@ -1534,10 +1717,11 @@ router.put('/admin/coupons/:id', requireAuth, requireRole(['super_admin', 'manag
   `).run(
     cleanCode,
     discountType ?? null,
-    discountValue !== undefined ? Number(discountValue) : null,
-    minOrderValue !== undefined ? Number(minOrderValue) : null,
-    maxDiscountValue !== undefined ? (maxDiscountValue ? Number(maxDiscountValue) : null) : null,
-    usageLimit !== undefined ? Number(usageLimit) : null,
+    parsedDiscountValue,
+    parsedMinOrderValue,
+    parsedMaxDiscountValue !== undefined ? 1 : 0,
+    parsedMaxDiscountValue !== undefined ? parsedMaxDiscountValue : null,
+    parsedUsageLimit,
     expiryDate ?? null,
     isActive !== undefined ? (isActive ? 1 : 0) : null,
     id
@@ -1609,8 +1793,28 @@ router.get('/admin/delivery-regions', requireAuth, (_req: AuthenticatedRequest, 
 
 router.post('/admin/delivery-regions', requireAuth, requireRole(['super_admin', 'manager']), (req: AuthenticatedRequest, res: Response) => {
   const { name, city, deliveryFee, minOrderAmount, estimatedHours, sortOrder, isActive } = req.body;
-  if (!name || deliveryFee === undefined) {
-    return res.status(400).json({ error: 'اسم المنطقة وسعر التوصيل مطلوبان' });
+  if (!name || typeof name !== 'string' || !name.trim()) {
+    return res.status(400).json({ error: 'اسم المنطقة مطلوب' });
+  }
+
+  const feeCheck = parseAndValidateNumber(deliveryFee, 'سعر التوصيل', { min: 0 });
+  if (!feeCheck.valid) {
+    return res.status(400).json({ error: feeCheck.error });
+  }
+
+  const minOrderCheck = parseAndValidateNumber(minOrderAmount !== undefined ? minOrderAmount : 0, 'الحد الأدنى للطلب', { min: 0 });
+  if (!minOrderCheck.valid) {
+    return res.status(400).json({ error: minOrderCheck.error });
+  }
+
+  const hoursCheck = parseAndValidateNumber(estimatedHours !== undefined ? estimatedHours : 3, 'مدة التوصيل التقديرية بالساعات', { min: 0.1 });
+  if (!hoursCheck.valid) {
+    return res.status(400).json({ error: 'مدة التوصيل التقديرية يجب أن تكون أكبر من صفر' });
+  }
+
+  const sortCheck = parseAndValidateNumber(sortOrder !== undefined ? sortOrder : 0, 'ترتيب العرض');
+  if (!sortCheck.valid) {
+    return res.status(400).json({ error: sortCheck.error });
   }
 
   const id = `reg-${Date.now()}-${crypto.randomBytes(2).toString('hex')}`;
@@ -1623,10 +1827,10 @@ router.post('/admin/delivery-regions', requireAuth, requireRole(['super_admin', 
     id,
     name.trim(),
     city ? city.trim() : 'القاهرة',
-    Number(deliveryFee),
-    Number(minOrderAmount || 0),
-    Number(estimatedHours || 3),
-    Number(sortOrder || 0),
+    feeCheck.value!,
+    minOrderCheck.value!,
+    hoursCheck.value!,
+    sortCheck.value!,
     isActive !== false ? 1 : 0,
     now
   );
@@ -1635,10 +1839,10 @@ router.post('/admin/delivery-regions', requireAuth, requireRole(['super_admin', 
     id,
     name: name.trim(),
     city: city ? city.trim() : 'القاهرة',
-    deliveryFee: Number(deliveryFee),
-    minOrderAmount: Number(minOrderAmount || 0),
-    estimatedHours: Number(estimatedHours || 3),
-    sortOrder: Number(sortOrder || 0),
+    deliveryFee: feeCheck.value!,
+    minOrderAmount: minOrderCheck.value!,
+    estimatedHours: hoursCheck.value!,
+    sortOrder: sortCheck.value!,
     isActive: isActive !== false,
     createdAt: now,
   };
@@ -1655,6 +1859,46 @@ router.put('/admin/delivery-regions/:id', requireAuth, requireRole(['super_admin
   const existing = db.prepare('SELECT * FROM delivery_regions WHERE id = ?').get(id) as Record<string, unknown> | undefined;
   if (!existing) return res.status(404).json({ error: 'منطقة التوصيل غير موجودة' });
 
+  if (name !== undefined && (typeof name !== 'string' || !name.trim())) {
+    return res.status(400).json({ error: 'اسم المنطقة غير صالح' });
+  }
+
+  let parsedDeliveryFee: number | null = null;
+  if (deliveryFee !== undefined) {
+    const feeCheck = parseAndValidateNumber(deliveryFee, 'سعر التوصيل', { min: 0 });
+    if (!feeCheck.valid) {
+      return res.status(400).json({ error: feeCheck.error });
+    }
+    parsedDeliveryFee = feeCheck.value!;
+  }
+
+  let parsedMinOrder: number | null = null;
+  if (minOrderAmount !== undefined) {
+    const minCheck = parseAndValidateNumber(minOrderAmount, 'الحد الأدنى للطلب', { min: 0 });
+    if (!minCheck.valid) {
+      return res.status(400).json({ error: minCheck.error });
+    }
+    parsedMinOrder = minCheck.value!;
+  }
+
+  let parsedHours: number | null = null;
+  if (estimatedHours !== undefined) {
+    const hoursCheck = parseAndValidateNumber(estimatedHours, 'مدة التوصيل التقديرية بالساعات', { min: 0.1 });
+    if (!hoursCheck.valid) {
+      return res.status(400).json({ error: 'مدة التوصيل التقديرية يجب أن تكون أكبر من صفر' });
+    }
+    parsedHours = hoursCheck.value!;
+  }
+
+  let parsedSortOrder: number | null = null;
+  if (sortOrder !== undefined) {
+    const sortCheck = parseAndValidateNumber(sortOrder, 'ترتيب العرض');
+    if (!sortCheck.valid) {
+      return res.status(400).json({ error: sortCheck.error });
+    }
+    parsedSortOrder = sortCheck.value!;
+  }
+
   db.prepare(`
     UPDATE delivery_regions SET
       name = COALESCE(?, name),
@@ -1668,10 +1912,10 @@ router.put('/admin/delivery-regions/:id', requireAuth, requireRole(['super_admin
   `).run(
     name ? name.trim() : null,
     city ? city.trim() : null,
-    deliveryFee !== undefined ? Number(deliveryFee) : null,
-    minOrderAmount !== undefined ? Number(minOrderAmount) : null,
-    estimatedHours !== undefined ? Number(estimatedHours) : null,
-    sortOrder !== undefined ? Number(sortOrder) : null,
+    parsedDeliveryFee,
+    parsedMinOrder,
+    parsedHours,
+    parsedSortOrder,
     isActive !== undefined ? (isActive ? 1 : 0) : null,
     id
   );
@@ -1753,6 +1997,48 @@ router.put('/admin/settings', requireAuth, requireRole(['super_admin', 'manager'
     currency,
   } = req.body;
 
+  let parsedDeliveryFee: number | null = null;
+  if (deliveryFee !== undefined) {
+    const v = parseAndValidateNumber(deliveryFee, 'سعر التوصيل الافتراضي', { min: 0 });
+    if (!v.valid) return res.status(400).json({ error: v.error });
+    parsedDeliveryFee = v.value!;
+  }
+
+  let parsedFreeDeliveryThreshold: number | null = null;
+  if (freeDeliveryThreshold !== undefined) {
+    const v = parseAndValidateNumber(freeDeliveryThreshold, 'الحد الأدنى للشحن المجاني', { min: 0 });
+    if (!v.valid) return res.status(400).json({ error: v.error });
+    parsedFreeDeliveryThreshold = v.value!;
+  }
+
+  let parsedMinOrderAmount: number | null = null;
+  if (minOrderAmount !== undefined) {
+    const v = parseAndValidateNumber(minOrderAmount, 'الحد الأدنى للطلب', { min: 0 });
+    if (!v.valid) return res.status(400).json({ error: v.error });
+    parsedMinOrderAmount = v.value!;
+  }
+
+  let parsedDepositPercentage: number | null = null;
+  if (depositPercentage !== undefined) {
+    const v = parseAndValidateNumber(depositPercentage, 'نسبة العربون', { min: 0, max: 100 });
+    if (!v.valid) return res.status(400).json({ error: v.error });
+    parsedDepositPercentage = v.value!;
+  }
+
+  let parsedMinDepositAmount: number | null = null;
+  if (minDepositAmount !== undefined) {
+    const v = parseAndValidateNumber(minDepositAmount, 'الحد الأدنى لقيمة العربون', { min: 0 });
+    if (!v.valid) return res.status(400).json({ error: v.error });
+    parsedMinDepositAmount = v.value!;
+  }
+
+  let parsedCutoffHour: number | null = null;
+  if (cutoffHour !== undefined) {
+    const v = parseAndValidateNumber(cutoffHour, 'ساعة إغلاق الطلبات اليومية', { min: 0, max: 23, integerOnly: true });
+    if (!v.valid) return res.status(400).json({ error: v.error });
+    parsedCutoffHour = v.value!;
+  }
+
   const now = new Date().toISOString();
   db.prepare(`
     UPDATE store_settings SET
@@ -1787,13 +2073,13 @@ router.put('/admin/settings', requireAuth, requireRole(['super_admin', 'manager'
     address !== undefined ? String(address) : null,
     isOpen !== undefined ? (isOpen ? 1 : 0) : null,
     closedReason !== undefined ? String(closedReason) : null,
-    deliveryFee !== undefined ? Number(deliveryFee) : null,
-    freeDeliveryThreshold !== undefined ? Number(freeDeliveryThreshold) : null,
-    minOrderAmount !== undefined ? Number(minOrderAmount) : null,
-    depositPercentage !== undefined ? Number(depositPercentage) : null,
-    minDepositAmount !== undefined ? Number(minDepositAmount) : null,
+    parsedDeliveryFee,
+    parsedFreeDeliveryThreshold,
+    parsedMinOrderAmount,
+    parsedDepositPercentage,
+    parsedMinDepositAmount,
     workingHours !== undefined ? String(workingHours) : null,
-    cutoffHour !== undefined ? Number(cutoffHour) : null,
+    parsedCutoffHour,
     currency !== undefined ? String(currency) : null,
     now
   );
@@ -1984,18 +2270,37 @@ router.post('/orders', (req: Request, res: Response) => {
     notes,
   } = req.body;
 
+  // Rate Limiting for public customer order placement (max 5 orders / 10 mins per IP and phone)
+  const clientIp = req.ip || 'unknown';
+  const cleanPhone = customerPhone ? String(customerPhone).trim().replace(/[^0-9+]/g, '') : '';
+  const rateLimitKeys = [`order:ip:${clientIp}`];
+  if (cleanPhone) {
+    rateLimitKeys.push(`order:phone:${cleanPhone}`);
+  }
+
+  if (!checkOrderRateLimit(rateLimitKeys)) {
+    return res.status(429).json({
+      error: 'تم تجاوز الحد الأقصى المسموح به لإنشاء الطلبات مؤقتاً. يرجى الانتظار بضع دقائق قبل المحاولة مجدداً.',
+    });
+  }
+
   if (!customerName || !customerPhone || !items || !Array.isArray(items) || items.length === 0) {
     return res.status(400).json({ error: 'بيانات العميل والأصناف مطلوبة لإتمام الطلب' });
   }
 
-  const cleanPhone = String(customerPhone).trim();
-  if (cleanPhone.length < 8) {
+  const phoneForOrder = String(customerPhone).trim();
+  if (phoneForOrder.length < 8) {
     return res.status(400).json({ error: 'رقم الهاتف غير صالح (يجب أن يتكون من 8 أرقام على الأقل)' });
   }
 
   const orderId = `order-${Date.now()}-${crypto.randomBytes(3).toString('hex')}`;
-  const orderNumber = `#ALM-${Math.floor(10000 + Math.random() * 90000)}`;
+  const orderNumber = generateUniqueOrderNumber(db);
+  if (!orderNumber) {
+    return res.status(500).json({ error: 'تعذر إنشاء رقم فريد للطلب بعد عدة محاولات، يرجى المحاولة لاحقاً' });
+  }
   const now = new Date().toISOString();
+
+  recordOrderAttempt(rateLimitKeys);
 
   db.exec('BEGIN TRANSACTION;');
   try {

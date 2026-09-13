@@ -7,3 +7,8 @@ coverage/
 .env
 .env*
 !.env.example
+
+# SQLite runtime and journal files must not be committed to version control
+*.db-wal
+*.db-shm
+*.db-journal
