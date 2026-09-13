@@ -151,36 +151,77 @@ router.post('/admin/auth/admins', requireAuth, requireRole(['super_admin']), asy
     return res.status(400).json({ error: 'جميع الحقول مطلوبة' });
   }
 
+  // ISSUE 1: Strict admin role validation
+  const ALLOWED_ADMIN_ROLES = ['super_admin', 'manager', 'operator'] as const;
+  type AllowedAdminRole = (typeof ALLOWED_ADMIN_ROLES)[number];
+
+  if (typeof role !== 'string' || !ALLOWED_ADMIN_ROLES.includes(role as AllowedAdminRole)) {
+    return res.status(400).json({
+      error: 'الدور المحدد غير صالح. الأدوار المسموح بها فقط: super_admin, manager, operator',
+    });
+  }
+
+  const validatedRole: AllowedAdminRole = role as AllowedAdminRole;
+
+  if (typeof email !== 'string') {
+    return res.status(400).json({ error: 'صيغة البريد الإلكتروني غير صحيحة' });
+  }
+
   const normalizedEmail = email.toLowerCase().trim();
+  if (!normalizedEmail) {
+    return res.status(400).json({ error: 'البريد الإلكتروني مطلوب' });
+  }
+
+  // ISSUE 2: Check if email already exists in local admins table before Supabase user creation
+  const existingAdmin = db.prepare('SELECT id FROM admins WHERE email = ?').get(normalizedEmail);
+  if (existingAdmin) {
+    return res.status(409).json({ error: 'البريد الإلكتروني مسجل بالفعل لمسؤول آخر' });
+  }
 
   try {
     const { data, error } = await supabaseServer.auth.admin.createUser({
       email: normalizedEmail,
       password,
       email_confirm: true,
-      user_metadata: { name: name.trim(), role },
+      user_metadata: { name: typeof name === 'string' ? name.trim() : name, role: validatedRole },
     });
 
     if (error) {
       return res.status(400).json({ error: error.message || 'فشل إنشاء المستخدم في Supabase' });
     }
 
+    if (!data?.user?.id) {
+      return res.status(500).json({ error: 'لم يتم استرجاع معرف المستخدم من Supabase' });
+    }
+
     const id = data.user.id;
-    db.prepare(`
-      INSERT OR REPLACE INTO admins (id, name, email, role, avatar_url, created_at)
-      VALUES (?, ?, ?, ?, ?, ?)
-    `).run(
-      id,
-      name.trim(),
-      normalizedEmail,
-      role,
-      'https://images.unsplash.com/photo-1534528741775-53994a69daeb?w=100&auto=format&fit=crop&q=80',
-      new Date().toISOString()
-    );
 
-    logAuditAction(req.admin, 'create_admin_supabase', 'admin', id, null, { email: normalizedEmail, role }, req.ip);
+    // Normal INSERT INTO admins (NOT INSERT OR REPLACE)
+    try {
+      db.prepare(`
+        INSERT INTO admins (id, name, email, role, avatar_url, created_at)
+        VALUES (?, ?, ?, ?, ?, ?)
+      `).run(
+        id,
+        typeof name === 'string' ? name.trim() : name,
+        normalizedEmail,
+        validatedRole,
+        'https://images.unsplash.com/photo-1534528741775-53994a69daeb?w=100&auto=format&fit=crop&q=80',
+        new Date().toISOString()
+      );
+    } catch (dbErr) {
+      // Rollback / cleanup newly created Supabase user if local DB insert fails
+      try {
+        await supabaseServer.auth.admin.deleteUser(id);
+      } catch {
+        // Cleanup attempt completed
+      }
+      return res.status(500).json({ error: 'فشل حفظ بيانات المسؤول محلياً' });
+    }
 
-    return res.status(201).json({ id, name, email: normalizedEmail, role });
+    logAuditAction(req.admin, 'create_admin_supabase', 'admin', id, null, { email: normalizedEmail, role: validatedRole }, req.ip);
+
+    return res.status(201).json({ id, name: typeof name === 'string' ? name.trim() : name, email: normalizedEmail, role: validatedRole });
   } catch (err) {
     return res.status(500).json({ error: 'حدث خطأ أثناء إنشاء المستخدم في Supabase' });
   }
