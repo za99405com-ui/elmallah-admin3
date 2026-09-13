@@ -1978,8 +1978,9 @@ router.get('/admin/delivery-regions', requireAuth, async (_req: AuthenticatedReq
   );
 });
 
-router.post('/admin/delivery-regions', requireAuth, requireRole(['super_admin', 'manager']), (req: AuthenticatedRequest, res: Response) => {
+router.post('/admin/delivery-regions', requireAuth, requireRole(['super_admin', 'manager']), async (req: AuthenticatedRequest, res: Response) => {
   const { name, city, deliveryFee, minOrderAmount, estimatedHours, sortOrder, isActive } = req.body;
+
   if (!name || typeof name !== 'string' || !name.trim()) {
     return res.status(400).json({ error: 'اسم المنطقة مطلوب' });
   }
@@ -1989,17 +1990,28 @@ router.post('/admin/delivery-regions', requireAuth, requireRole(['super_admin', 
     return res.status(400).json({ error: feeCheck.error });
   }
 
-  const minOrderCheck = parseAndValidateNumber(minOrderAmount !== undefined ? minOrderAmount : 0, 'الحد الأدنى للطلب', { min: 0 });
+  const minOrderCheck = parseAndValidateNumber(
+    minOrderAmount !== undefined ? minOrderAmount : 0,
+    'الحد الأدنى للطلب',
+    { min: 0 }
+  );
   if (!minOrderCheck.valid) {
     return res.status(400).json({ error: minOrderCheck.error });
   }
 
-  const hoursCheck = parseAndValidateNumber(estimatedHours !== undefined ? estimatedHours : 3, 'مدة التوصيل التقديرية بالساعات', { min: 0.1 });
+  const hoursCheck = parseAndValidateNumber(
+    estimatedHours !== undefined ? estimatedHours : 3,
+    'مدة التوصيل التقديرية بالساعات',
+    { min: 0.1 }
+  );
   if (!hoursCheck.valid) {
     return res.status(400).json({ error: 'مدة التوصيل التقديرية يجب أن تكون أكبر من صفر' });
   }
 
-  const sortCheck = parseAndValidateNumber(sortOrder !== undefined ? sortOrder : 0, 'ترتيب العرض');
+  const sortCheck = parseAndValidateNumber(
+    sortOrder !== undefined ? sortOrder : 0,
+    'ترتيب العرض'
+  );
   if (!sortCheck.valid) {
     return res.status(400).json({ error: sortCheck.error });
   }
@@ -2007,107 +2019,117 @@ router.post('/admin/delivery-regions', requireAuth, requireRole(['super_admin', 
   const id = `reg-${Date.now()}-${crypto.randomBytes(2).toString('hex')}`;
   const now = new Date().toISOString();
 
-  db.prepare(`
-    INSERT INTO delivery_regions (id, name, city, delivery_fee, min_order_amount, estimated_hours, sort_order, is_active, created_at)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-  `).run(
-    id,
-    name.trim(),
-    city ? city.trim() : 'القاهرة',
-    feeCheck.value!,
-    minOrderCheck.value!,
-    hoursCheck.value!,
-    sortCheck.value!,
-    isActive !== false ? 1 : 0,
-    now
-  );
+  const { data: createdRow, error } = await supabaseServer
+    .from('delivery_regions')
+    .insert({
+      id,
+      name: name.trim(),
+      city: city ? String(city).trim() : 'القاهرة',
+      delivery_fee: feeCheck.value!,
+      min_order_amount: minOrderCheck.value!,
+      estimated_hours: hoursCheck.value!,
+      sort_order: sortCheck.value!,
+      is_active: isActive !== false,
+      created_at: now,
+    })
+    .select('*')
+    .single();
+
+  if (error) {
+    console.error('Supabase delivery region create failed:', error.message);
+    return res.status(503).json({ error: 'تعذر إنشاء منطقة التوصيل' });
+  }
 
   const created = {
-    id,
-    name: name.trim(),
-    city: city ? city.trim() : 'القاهرة',
-    deliveryFee: feeCheck.value!,
-    minOrderAmount: minOrderCheck.value!,
-    estimatedHours: hoursCheck.value!,
-    sortOrder: sortCheck.value!,
-    isActive: isActive !== false,
-    createdAt: now,
+    id: createdRow.id,
+    name: createdRow.name,
+    city: createdRow.city,
+    deliveryFee: Number(createdRow.delivery_fee),
+    minOrderAmount: Number(createdRow.min_order_amount || 0),
+    estimatedHours: Number(createdRow.estimated_hours || 3),
+    sortOrder: Number(createdRow.sort_order || 0),
+    isActive: Boolean(createdRow.is_active),
+    createdAt: createdRow.created_at,
   };
 
   logAuditAction(req.admin, 'create_delivery_region', 'delivery_region', id, null, created, req.ip);
   broadcastRealtimeEvent('delivery_region_created', created);
+
   return res.status(201).json(created);
 });
 
-router.put('/admin/delivery-regions/:id', requireAuth, requireRole(['super_admin', 'manager']), (req: AuthenticatedRequest, res: Response) => {
+router.put('/admin/delivery-regions/:id', requireAuth, requireRole(['super_admin', 'manager']), async (req: AuthenticatedRequest, res: Response) => {
   const id = req.params.id;
   const { name, city, deliveryFee, minOrderAmount, estimatedHours, sortOrder, isActive } = req.body;
 
-  const existing = db.prepare('SELECT * FROM delivery_regions WHERE id = ?').get(id) as Record<string, unknown> | undefined;
-  if (!existing) return res.status(404).json({ error: 'منطقة التوصيل غير موجودة' });
+  const { data: existing, error: lookupError } = await supabaseServer
+    .from('delivery_regions')
+    .select('*')
+    .eq('id', id)
+    .maybeSingle();
+
+  if (lookupError) {
+    console.error('Supabase delivery region lookup failed:', lookupError.message);
+    return res.status(503).json({ error: 'تعذر تحميل منطقة التوصيل' });
+  }
+
+  if (!existing) {
+    return res.status(404).json({ error: 'منطقة التوصيل غير موجودة' });
+  }
 
   if (name !== undefined && (typeof name !== 'string' || !name.trim())) {
     return res.status(400).json({ error: 'اسم المنطقة غير صالح' });
   }
 
-  let parsedDeliveryFee: number | null = null;
+  const updates: Record<string, unknown> = {};
+
+  if (name !== undefined) updates.name = name.trim();
+  if (city !== undefined) updates.city = String(city).trim();
+
   if (deliveryFee !== undefined) {
-    const feeCheck = parseAndValidateNumber(deliveryFee, 'سعر التوصيل', { min: 0 });
-    if (!feeCheck.valid) {
-      return res.status(400).json({ error: feeCheck.error });
-    }
-    parsedDeliveryFee = feeCheck.value!;
+    const v = parseAndValidateNumber(deliveryFee, 'سعر التوصيل', { min: 0 });
+    if (!v.valid) return res.status(400).json({ error: v.error });
+    updates.delivery_fee = v.value!;
   }
 
-  let parsedMinOrder: number | null = null;
   if (minOrderAmount !== undefined) {
-    const minCheck = parseAndValidateNumber(minOrderAmount, 'الحد الأدنى للطلب', { min: 0 });
-    if (!minCheck.valid) {
-      return res.status(400).json({ error: minCheck.error });
-    }
-    parsedMinOrder = minCheck.value!;
+    const v = parseAndValidateNumber(minOrderAmount, 'الحد الأدنى للطلب', { min: 0 });
+    if (!v.valid) return res.status(400).json({ error: v.error });
+    updates.min_order_amount = v.value!;
   }
 
-  let parsedHours: number | null = null;
   if (estimatedHours !== undefined) {
-    const hoursCheck = parseAndValidateNumber(estimatedHours, 'مدة التوصيل التقديرية بالساعات', { min: 0.1 });
-    if (!hoursCheck.valid) {
+    const v = parseAndValidateNumber(
+      estimatedHours,
+      'مدة التوصيل التقديرية بالساعات',
+      { min: 0.1 }
+    );
+    if (!v.valid) {
       return res.status(400).json({ error: 'مدة التوصيل التقديرية يجب أن تكون أكبر من صفر' });
     }
-    parsedHours = hoursCheck.value!;
+    updates.estimated_hours = v.value!;
   }
 
-  let parsedSortOrder: number | null = null;
   if (sortOrder !== undefined) {
-    const sortCheck = parseAndValidateNumber(sortOrder, 'ترتيب العرض');
-    if (!sortCheck.valid) {
-      return res.status(400).json({ error: sortCheck.error });
-    }
-    parsedSortOrder = sortCheck.value!;
+    const v = parseAndValidateNumber(sortOrder, 'ترتيب العرض');
+    if (!v.valid) return res.status(400).json({ error: v.error });
+    updates.sort_order = v.value!;
   }
 
-  db.prepare(`
-    UPDATE delivery_regions SET
-      name = COALESCE(?, name),
-      city = COALESCE(?, city),
-      delivery_fee = COALESCE(?, delivery_fee),
-      min_order_amount = COALESCE(?, min_order_amount),
-      estimated_hours = COALESCE(?, estimated_hours),
-      sort_order = COALESCE(?, sort_order),
-      is_active = COALESCE(?, is_active)
-    WHERE id = ?
-  `).run(
-    name ? name.trim() : null,
-    city ? city.trim() : null,
-    parsedDeliveryFee,
-    parsedMinOrder,
-    parsedHours,
-    parsedSortOrder,
-    isActive !== undefined ? (isActive ? 1 : 0) : null,
-    id
-  );
+  if (isActive !== undefined) updates.is_active = Boolean(isActive);
 
-  const updated = db.prepare('SELECT * FROM delivery_regions WHERE id = ?').get(id) as Record<string, unknown>;
+  const { data: updated, error: updateError } = await supabaseServer
+    .from('delivery_regions')
+    .update(updates)
+    .eq('id', id)
+    .select('*')
+    .single();
+
+  if (updateError) {
+    console.error('Supabase delivery region update failed:', updateError.message);
+    return res.status(503).json({ error: 'تعذر تحديث منطقة التوصيل' });
+  }
+
   const result = {
     id: updated.id,
     name: updated.name,
@@ -2122,14 +2144,41 @@ router.put('/admin/delivery-regions/:id', requireAuth, requireRole(['super_admin
 
   logAuditAction(req.admin, 'update_delivery_region', 'delivery_region', id, existing, result, req.ip);
   broadcastRealtimeEvent('delivery_region_updated', result);
+
   return res.json(result);
 });
 
-router.delete('/admin/delivery-regions/:id', requireAuth, requireRole(['super_admin', 'manager']), (req: AuthenticatedRequest, res: Response) => {
+router.delete('/admin/delivery-regions/:id', requireAuth, requireRole(['super_admin', 'manager']), async (req: AuthenticatedRequest, res: Response) => {
   const id = req.params.id;
-  db.prepare('DELETE FROM delivery_regions WHERE id = ?').run(id);
-  logAuditAction(req.admin, 'delete_delivery_region', 'delivery_region', id, null, null, req.ip);
+
+  const { data: existing, error: lookupError } = await supabaseServer
+    .from('delivery_regions')
+    .select('*')
+    .eq('id', id)
+    .maybeSingle();
+
+  if (lookupError) {
+    console.error('Supabase delivery region delete lookup failed:', lookupError.message);
+    return res.status(503).json({ error: 'تعذر تحميل منطقة التوصيل' });
+  }
+
+  if (!existing) {
+    return res.status(404).json({ error: 'منطقة التوصيل غير موجودة' });
+  }
+
+  const { error: deleteError } = await supabaseServer
+    .from('delivery_regions')
+    .delete()
+    .eq('id', id);
+
+  if (deleteError) {
+    console.error('Supabase delivery region delete failed:', deleteError.message);
+    return res.status(503).json({ error: 'تعذر حذف منطقة التوصيل' });
+  }
+
+  logAuditAction(req.admin, 'delete_delivery_region', 'delivery_region', id, existing, null, req.ip);
   broadcastRealtimeEvent('delivery_region_deleted', { id });
+
   return res.json({ message: 'تم حذف منطقة التوصيل بنجاح' });
 });
 
@@ -2171,7 +2220,7 @@ router.get('/admin/settings', requireAuth, async (_req: AuthenticatedRequest, re
   });
 });
 
-router.put('/admin/settings', requireAuth, requireRole(['super_admin', 'manager']), (req: AuthenticatedRequest, res: Response) => {
+router.put('/admin/settings', requireAuth, requireRole(['super_admin', 'manager']), async (req: AuthenticatedRequest, res: Response) => {
   const {
     storeName,
     tagline,
@@ -2193,95 +2242,111 @@ router.put('/admin/settings', requireAuth, requireRole(['super_admin', 'manager'
     currency,
   } = req.body;
 
-  let parsedDeliveryFee: number | null = null;
+  const { data: existing, error: existingError } = await supabaseServer
+    .from('store_settings')
+    .select('*')
+    .eq('id', 1)
+    .maybeSingle();
+
+  if (existingError) {
+    console.error('Supabase store settings lookup failed:', existingError.message);
+    return res.status(503).json({ error: 'تعذر تحميل إعدادات المتجر' });
+  }
+
+  if (!existing) {
+    return res.status(404).json({ error: 'الإعدادات غير موجودة' });
+  }
+
+  const updates: Record<string, unknown> = {};
+
+  if (storeName !== undefined) updates.store_name = String(storeName);
+  if (tagline !== undefined) updates.tagline = String(tagline);
+  if (phone !== undefined) updates.phone = String(phone);
+  if (whatsapp !== undefined) updates.whatsapp = String(whatsapp);
+  if (instapayHandle !== undefined) updates.instapay_handle = String(instapayHandle);
+  if (instapayNumber !== undefined) updates.instapay_number = String(instapayNumber);
+  if (vodafoneCash !== undefined) updates.vodafone_cash = String(vodafoneCash);
+  if (address !== undefined) updates.address = String(address);
+  if (isOpen !== undefined) updates.is_open = Boolean(isOpen);
+  if (closedReason !== undefined) updates.closed_reason = String(closedReason);
+  if (workingHours !== undefined) updates.working_hours = String(workingHours);
+  if (currency !== undefined) updates.currency = String(currency);
+
   if (deliveryFee !== undefined) {
     const v = parseAndValidateNumber(deliveryFee, 'سعر التوصيل الافتراضي', { min: 0 });
     if (!v.valid) return res.status(400).json({ error: v.error });
-    parsedDeliveryFee = v.value!;
+    updates.default_delivery_fee = v.value!;
   }
 
-  let parsedFreeDeliveryThreshold: number | null = null;
   if (freeDeliveryThreshold !== undefined) {
-    const v = parseAndValidateNumber(freeDeliveryThreshold, 'الحد الأدنى للشحن المجاني', { min: 0 });
+    const v = parseAndValidateNumber(
+      freeDeliveryThreshold,
+      'الحد الأدنى للشحن المجاني',
+      { min: 0 }
+    );
     if (!v.valid) return res.status(400).json({ error: v.error });
-    parsedFreeDeliveryThreshold = v.value!;
+    updates.free_delivery_threshold = v.value!;
   }
 
-  let parsedMinOrderAmount: number | null = null;
   if (minOrderAmount !== undefined) {
     const v = parseAndValidateNumber(minOrderAmount, 'الحد الأدنى للطلب', { min: 0 });
     if (!v.valid) return res.status(400).json({ error: v.error });
-    parsedMinOrderAmount = v.value!;
+    updates.min_order_amount = v.value!;
   }
 
-  let parsedDepositPercentage: number | null = null;
   if (depositPercentage !== undefined) {
-    const v = parseAndValidateNumber(depositPercentage, 'نسبة العربون', { min: 0, max: 100 });
+    const v = parseAndValidateNumber(
+      depositPercentage,
+      'نسبة العربون',
+      { min: 0, max: 100 }
+    );
     if (!v.valid) return res.status(400).json({ error: v.error });
-    parsedDepositPercentage = v.value!;
+    updates.deposit_percentage = v.value!;
   }
 
-  let parsedMinDepositAmount: number | null = null;
   if (minDepositAmount !== undefined) {
-    const v = parseAndValidateNumber(minDepositAmount, 'الحد الأدنى لقيمة العربون', { min: 0 });
+    const v = parseAndValidateNumber(
+      minDepositAmount,
+      'الحد الأدنى لقيمة العربون',
+      { min: 0 }
+    );
     if (!v.valid) return res.status(400).json({ error: v.error });
-    parsedMinDepositAmount = v.value!;
+    updates.min_deposit_amount = v.value!;
   }
 
-  let parsedCutoffHour: number | null = null;
   if (cutoffHour !== undefined) {
-    const v = parseAndValidateNumber(cutoffHour, 'ساعة إغلاق الطلبات اليومية', { min: 0, max: 23, integerOnly: true });
+    const v = parseAndValidateNumber(
+      cutoffHour,
+      'ساعة إغلاق الطلبات اليومية',
+      { min: 0, max: 23, integerOnly: true }
+    );
     if (!v.valid) return res.status(400).json({ error: v.error });
-    parsedCutoffHour = v.value!;
+    updates.cutoff_hour = v.value!;
   }
 
-  const now = new Date().toISOString();
-  db.prepare(`
-    UPDATE store_settings SET
-      store_name = COALESCE(?, store_name),
-      tagline = COALESCE(?, tagline),
-      phone = COALESCE(?, phone),
-      whatsapp = COALESCE(?, whatsapp),
-      instapay_handle = COALESCE(?, instapay_handle),
-      instapay_number = COALESCE(?, instapay_number),
-      vodafone_cash = COALESCE(?, vodafone_cash),
-      address = COALESCE(?, address),
-      is_open = COALESCE(?, is_open),
-      closed_reason = COALESCE(?, closed_reason),
-      default_delivery_fee = COALESCE(?, default_delivery_fee),
-      free_delivery_threshold = COALESCE(?, free_delivery_threshold),
-      min_order_amount = COALESCE(?, min_order_amount),
-      deposit_percentage = COALESCE(?, deposit_percentage),
-      min_deposit_amount = COALESCE(?, min_deposit_amount),
-      working_hours = COALESCE(?, working_hours),
-      cutoff_hour = COALESCE(?, cutoff_hour),
-      currency = COALESCE(?, currency),
-      updated_at = ?
-    WHERE id = 1
-  `).run(
-    storeName !== undefined ? String(storeName) : null,
-    tagline !== undefined ? String(tagline) : null,
-    phone !== undefined ? String(phone) : null,
-    whatsapp !== undefined ? String(whatsapp) : null,
-    instapayHandle !== undefined ? String(instapayHandle) : null,
-    instapayNumber !== undefined ? String(instapayNumber) : null,
-    vodafoneCash !== undefined ? String(vodafoneCash) : null,
-    address !== undefined ? String(address) : null,
-    isOpen !== undefined ? (isOpen ? 1 : 0) : null,
-    closedReason !== undefined ? String(closedReason) : null,
-    parsedDeliveryFee,
-    parsedFreeDeliveryThreshold,
-    parsedMinOrderAmount,
-    parsedDepositPercentage,
-    parsedMinDepositAmount,
-    workingHours !== undefined ? String(workingHours) : null,
-    parsedCutoffHour,
-    currency !== undefined ? String(currency) : null,
-    now
-  );
+  updates.updated_at = new Date().toISOString();
 
-  const updated = db.prepare('SELECT * FROM store_settings WHERE id = 1').get() as Record<string, unknown>;
-  logAuditAction(req.admin, 'update_store_settings', 'store_settings', '1', null, updated, req.ip);
+  const { data: updated, error: updateError } = await supabaseServer
+    .from('store_settings')
+    .update(updates)
+    .eq('id', 1)
+    .select('*')
+    .single();
+
+  if (updateError) {
+    console.error('Supabase store settings update failed:', updateError.message);
+    return res.status(503).json({ error: 'تعذر حفظ إعدادات المتجر' });
+  }
+
+  logAuditAction(
+    req.admin,
+    'update_store_settings',
+    'store_settings',
+    '1',
+    existing,
+    updated,
+    req.ip
+  );
 
   const mappedSettings = {
     storeName: updated.store_name,
@@ -2306,7 +2371,10 @@ router.put('/admin/settings', requireAuth, requireRole(['super_admin', 'manager'
 
   broadcastRealtimeEvent('store_settings_updated', mappedSettings);
 
-  return res.json({ message: 'تم حفظ إعدادات المتجر بنجاح', settings: mappedSettings });
+  return res.json({
+    message: 'تم حفظ إعدادات المتجر بنجاح',
+    settings: mappedSettings,
+  });
 });
 
 // ==========================================
