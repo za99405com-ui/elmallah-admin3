@@ -815,57 +815,125 @@ router.get('/admin/categories', requireAuth, async (_req: AuthenticatedRequest, 
   );
 });
 
-router.post('/admin/categories', requireAuth, requireRole(['super_admin', 'manager']), (req: AuthenticatedRequest, res: Response) => {
+router.post('/admin/categories', requireAuth, requireRole(['super_admin', 'manager']), async (req: AuthenticatedRequest, res: Response) => {
   const { name, slug, description, icon, imageUrl } = req.body;
   if (!name) return res.status(400).json({ error: 'اسم التصنيف مطلوب' });
 
   const catId = `cat-${Date.now()}-${crypto.randomBytes(2).toString('hex')}`;
-  const finalSlug = (slug || name).toLowerCase().replace(/\s+/g, '-').replace(/[^\w\u0621-\u064A-]+/g, '');
+  const finalSlug = (slug || name)
+    .toLowerCase()
+    .replace(/\s+/g, '-')
+    .replace(/[^\w\u0621-\u064A-]+/g, '');
 
-  db.prepare(`
-    INSERT INTO categories (id, name, slug, description, icon, image_url, is_active, sort_order, created_at)
-    VALUES (?, ?, ?, ?, ?, ?, 1, 0, ?)
-  `).run(catId, name.trim(), finalSlug, description || '', icon || 'Fish', imageUrl || null, new Date().toISOString());
+  const { data: createdRow, error } = await supabaseServer
+    .from('categories')
+    .insert({
+      id: catId,
+      name: name.trim(),
+      slug: finalSlug,
+      description: description || '',
+      icon: icon || 'Fish',
+      image_url: imageUrl || null,
+      is_active: true,
+      sort_order: 0,
+      created_at: new Date().toISOString(),
+    })
+    .select('*')
+    .single();
 
-  const created = { id: catId, name, slug: finalSlug, description, icon, imageUrl, isActive: true, itemCount: 0 };
+  if (error) {
+    console.error('Supabase category create failed:', error.message);
+
+    if (error.code === '23505') {
+      return res.status(409).json({ error: 'اسم أو رابط التصنيف مستخدم بالفعل' });
+    }
+
+    return res.status(503).json({ error: 'تعذر إنشاء التصنيف' });
+  }
+
+  const created = {
+    id: createdRow.id,
+    name: createdRow.name,
+    slug: createdRow.slug,
+    description: createdRow.description || '',
+    icon: createdRow.icon,
+    imageUrl: createdRow.image_url,
+    isActive: Boolean(createdRow.is_active),
+    sortOrder: Number(createdRow.sort_order || 0),
+    itemCount: 0,
+  };
+
   logAuditAction(req.admin, 'create_category', 'category', catId, null, created, req.ip);
   broadcastRealtimeEvent('category_created', created);
 
   return res.status(201).json(created);
 });
 
-router.put('/admin/categories/:id', requireAuth, requireRole(['super_admin', 'manager']), (req: AuthenticatedRequest, res: Response) => {
+router.put('/admin/categories/:id', requireAuth, requireRole(['super_admin', 'manager']), async (req: AuthenticatedRequest, res: Response) => {
   const id = req.params.id;
   const { name, slug, description, icon, imageUrl, isActive, sortOrder } = req.body;
 
-  const existing = db.prepare('SELECT * FROM categories WHERE id = ?').get(id) as Record<string, unknown> | undefined;
-  if (!existing) return res.status(404).json({ error: 'التصنيف غير موجود' });
+  const { data: existing, error: existingError } = await supabaseServer
+    .from('categories')
+    .select('*')
+    .eq('id', id)
+    .maybeSingle();
 
-  const finalSlug = slug !== undefined ? (slug || name || existing.name).toString().toLowerCase().replace(/\s+/g, '-').replace(/[^\w\u0621-\u064A-]+/g, '') : existing.slug;
+  if (existingError) {
+    console.error('Supabase category lookup failed:', existingError.message);
+    return res.status(503).json({ error: 'تعذر تحميل التصنيف' });
+  }
 
-  db.prepare(`
-    UPDATE categories SET
-      name = COALESCE(?, name),
-      slug = COALESCE(?, slug),
-      description = COALESCE(?, description),
-      icon = COALESCE(?, icon),
-      image_url = COALESCE(?, image_url),
-      is_active = COALESCE(?, is_active),
-      sort_order = COALESCE(?, sort_order)
-    WHERE id = ?
-  `).run(
-    name ? name.trim() : null,
-    finalSlug,
-    description ?? null,
-    icon ?? null,
-    imageUrl ?? null,
-    isActive !== undefined ? (isActive ? 1 : 0) : null,
-    sortOrder !== undefined ? Number(sortOrder) : null,
-    id
-  );
+  if (!existing) {
+    return res.status(404).json({ error: 'التصنيف غير موجود' });
+  }
 
-  const updated = db.prepare('SELECT * FROM categories WHERE id = ?').get(id) as Record<string, unknown>;
-  const itemCountRow = db.prepare('SELECT COUNT(*) as c FROM products WHERE category_id = ?').get(id) as { c: number };
+  const updates: Record<string, unknown> = {};
+
+  if (name !== undefined) {
+    const cleanName = String(name).trim();
+    if (!cleanName) return res.status(400).json({ error: 'اسم التصنيف مطلوب' });
+    updates.name = cleanName;
+  }
+
+  if (slug !== undefined || name !== undefined) {
+    updates.slug = String(slug || name || existing.name)
+      .toLowerCase()
+      .replace(/\s+/g, '-')
+      .replace(/[^\w\u0621-\u064A-]+/g, '');
+  }
+
+  if (description !== undefined) updates.description = description ?? '';
+  if (icon !== undefined) updates.icon = icon;
+  if (imageUrl !== undefined) updates.image_url = imageUrl || null;
+  if (isActive !== undefined) updates.is_active = Boolean(isActive);
+  if (sortOrder !== undefined) updates.sort_order = Number(sortOrder);
+
+  const { data: updated, error: updateError } = await supabaseServer
+    .from('categories')
+    .update(updates)
+    .eq('id', id)
+    .select('*')
+    .single();
+
+  if (updateError) {
+    console.error('Supabase category update failed:', updateError.message);
+
+    if (updateError.code === '23505') {
+      return res.status(409).json({ error: 'اسم أو رابط التصنيف مستخدم بالفعل' });
+    }
+
+    return res.status(503).json({ error: 'تعذر تحديث التصنيف' });
+  }
+
+  const { count, error: countError } = await supabaseServer
+    .from('products')
+    .select('*', { count: 'exact', head: true })
+    .eq('category_id', id);
+
+  if (countError) {
+    console.error('Supabase category product count failed:', countError.message);
+  }
 
   const result = {
     id: updated.id,
@@ -875,22 +943,47 @@ router.put('/admin/categories/:id', requireAuth, requireRole(['super_admin', 'ma
     icon: updated.icon,
     imageUrl: updated.image_url,
     isActive: Boolean(updated.is_active),
-    sortOrder: updated.sort_order,
-    itemCount: Number(itemCountRow?.c || 0),
+    sortOrder: Number(updated.sort_order || 0),
+    itemCount: count || 0,
   };
 
   logAuditAction(req.admin, 'update_category', 'category', id, existing, result, req.ip);
   broadcastRealtimeEvent('category_updated', result);
+
   return res.json(result);
 });
 
-router.delete('/admin/categories/:id', requireAuth, requireRole(['super_admin', 'manager']), (req: AuthenticatedRequest, res: Response) => {
+router.delete('/admin/categories/:id', requireAuth, requireRole(['super_admin', 'manager']), async (req: AuthenticatedRequest, res: Response) => {
   const id = req.params.id;
-  // Disassociate any products linked to this category safely
-  db.prepare('UPDATE products SET category_id = NULL WHERE category_id = ?').run(id);
-  db.prepare('DELETE FROM categories WHERE id = ?').run(id);
-  logAuditAction(req.admin, 'delete_category', 'category', id, null, null, req.ip);
+
+  const { data: existing, error: existingError } = await supabaseServer
+    .from('categories')
+    .select('*')
+    .eq('id', id)
+    .maybeSingle();
+
+  if (existingError) {
+    console.error('Supabase category delete lookup failed:', existingError.message);
+    return res.status(503).json({ error: 'تعذر تحميل التصنيف' });
+  }
+
+  if (!existing) {
+    return res.status(404).json({ error: 'التصنيف غير موجود' });
+  }
+
+  const { error: deleteError } = await supabaseServer
+    .from('categories')
+    .delete()
+    .eq('id', id);
+
+  if (deleteError) {
+    console.error('Supabase category delete failed:', deleteError.message);
+    return res.status(503).json({ error: 'تعذر حذف التصنيف' });
+  }
+
+  logAuditAction(req.admin, 'delete_category', 'category', id, existing, null, req.ip);
   broadcastRealtimeEvent('category_deleted', { id });
+
   return res.json({ message: 'تم حذف التصنيف وفصل المنتجات المرتبطة بنجاح' });
 });
 
