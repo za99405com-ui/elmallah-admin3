@@ -2228,6 +2228,246 @@ router.get('/admin/order-demand', requireAuth, (_req: AuthenticatedRequest, res:
 });
 
 // ==========================================
+// 11.5. SECURE CUSTOMER APP INTEGRATION API
+// Server-to-server only. The integration key must never reach the browser.
+// ==========================================
+
+function requireIntegrationKey(req: Request, res: Response, next: express.NextFunction) {
+  const configuredKey = process.env.CUSTOMER_APP_INTEGRATION_KEY;
+  const providedKey = req.header('X-Integration-Key');
+
+  // Fail closed when the server secret has not been configured.
+  if (!configuredKey) {
+    return res.status(503).json({ error: 'Integration service is not configured' });
+  }
+
+  if (!providedKey) {
+    return res.status(401).json({ error: 'Unauthorized integration request' });
+  }
+
+  const expected = Buffer.from(configuredKey, 'utf8');
+  const received = Buffer.from(providedKey, 'utf8');
+
+  if (expected.length !== received.length || !crypto.timingSafeEqual(expected, received)) {
+    return res.status(401).json({ error: 'Unauthorized integration request' });
+  }
+
+  next();
+}
+
+function normalizeIntegrationPhone(value: unknown): string {
+  if (typeof value !== 'string') return '';
+  return value.trim().replace(/[^0-9+]/g, '');
+}
+
+function mapIntegrationOrder(order: Record<string, unknown>) {
+  const items = db
+    .prepare(`
+      SELECT *
+      FROM order_items
+      WHERE order_id = ?
+      ORDER BY created_at ASC
+    `)
+    .all(String(order.id)) as Record<string, unknown>[];
+
+  return {
+    id: order.id,
+    orderNumber: order.order_number,
+    customerId: order.customer_id || undefined,
+    customerName: order.customer_name,
+    customerPhone: order.customer_phone,
+    customerAddress: order.customer_address,
+    city: order.city || '',
+    district: order.district || '',
+    subtotal: Number(order.subtotal || 0),
+    discountAmount: Number(order.discount_amount || 0),
+    couponCode: order.coupon_code || undefined,
+    deliveryFee: Number(order.delivery_fee || 0),
+    totalAmount: Number(order.total_amount || 0),
+    depositAmount: Number(order.deposit_amount || 0),
+    depositStatus: order.deposit_status,
+    depositMethod: order.deposit_method || undefined,
+    depositReference: order.deposit_reference || undefined,
+    remainingAmount: Number(order.remaining_amount || 0),
+    status: order.status,
+    notes: order.notes || '',
+    createdAt: order.created_at,
+    updatedAt: order.updated_at,
+    items: items.map((item) => ({
+      id: item.id,
+      productId: item.product_id,
+      variantId: item.variant_id || undefined,
+      productName: item.product_name,
+      variantTitle: item.variant_title || undefined,
+      pricingUnit: item.pricing_unit,
+      weightKg: item.weight_kg != null ? Number(item.weight_kg) : undefined,
+      pieceCount: item.piece_count != null ? Number(item.piece_count) : undefined,
+      unitPrice: Number(item.unit_price || 0),
+      quantity: Number(item.quantity || 0),
+      totalPrice: Number(item.total_price || 0),
+    })),
+  };
+}
+
+// Validate a coupon without consuming it.
+// Coupon usage is incremented only by the authoritative order-creation transaction.
+router.post('/integration/coupons/validate', requireIntegrationKey, (req: Request, res: Response) => {
+  const rawCode = req.body?.code;
+  const subtotalCheck = parseAndValidateNumber(req.body?.subtotal, 'subtotal', { min: 0 });
+
+  if (typeof rawCode !== 'string' || !rawCode.trim()) {
+    return res.status(400).json({ valid: false, error: 'Coupon code is required' });
+  }
+
+  if (!subtotalCheck.valid || subtotalCheck.value === undefined) {
+    return res.status(400).json({ valid: false, error: 'Invalid subtotal' });
+  }
+
+  const cleanCode = rawCode.trim().toUpperCase();
+  const subtotal = subtotalCheck.value;
+
+  // Keep this validation aligned with POST /api/orders.
+  const coupon = db
+    .prepare('SELECT * FROM coupons WHERE UPPER(code) = ?')
+    .get(cleanCode) as Record<string, unknown> | undefined;
+
+  if (!coupon) {
+    return res.status(400).json({
+      valid: false,
+      error: `كود الخصم "${cleanCode}" غير صالح أو غير موجود`,
+    });
+  }
+
+  if (!coupon.is_active) {
+    return res.status(400).json({
+      valid: false,
+      error: `كود الخصم "${cleanCode}" غير مفعّل حالياً`,
+    });
+  }
+
+  if (coupon.expiry_date && new Date(String(coupon.expiry_date)) < new Date()) {
+    return res.status(400).json({
+      valid: false,
+      error: `كود الخصم "${cleanCode}" منتهي الصلاحية`,
+    });
+  }
+
+  const minOrderValue = Number(coupon.min_order_value || 0);
+  if (subtotal < minOrderValue) {
+    return res.status(400).json({
+      valid: false,
+      error: `الحد الأدنى لاستخدام كود الخصم هو ${minOrderValue} ج.م`,
+      minOrderValue,
+    });
+  }
+
+  const usageLimit = coupon.usage_limit != null ? Number(coupon.usage_limit) : null;
+  const usedCount = Number(coupon.used_count || 0);
+
+  if (usageLimit !== null && usedCount >= usageLimit) {
+    return res.status(400).json({
+      valid: false,
+      error: `تم استنفاد الحد الأقصى لاستخدام كود الخصم "${cleanCode}"`,
+    });
+  }
+
+  let discountAmount = 0;
+  const discountType = String(coupon.discount_type);
+  const discountValue = Number(coupon.discount_value);
+
+  if (discountType === 'percentage') {
+    discountAmount = Math.round(((subtotal * discountValue) / 100) * 100) / 100;
+
+    if (coupon.max_discount_value) {
+      discountAmount = Math.min(discountAmount, Number(coupon.max_discount_value));
+    }
+  } else {
+    discountAmount = Math.min(subtotal, discountValue);
+  }
+
+  return res.json({
+    valid: true,
+    code: cleanCode,
+    discountType,
+    discountValue,
+    discountAmount,
+    minOrderValue,
+    maxDiscountValue:
+      coupon.max_discount_value != null ? Number(coupon.max_discount_value) : undefined,
+    expiryDate: coupon.expiry_date,
+  });
+});
+
+// Return order history for one customer.
+// Protected server-to-server endpoint; phone is never accepted as browser authorization.
+router.post('/integration/customer/orders', requireIntegrationKey, (req: Request, res: Response) => {
+  const phone = normalizeIntegrationPhone(req.body?.phone);
+
+  if (phone.length < 8 || phone.length > 20) {
+    return res.status(400).json({ error: 'Invalid phone' });
+  }
+
+  const rows = db
+    .prepare(`
+      SELECT *
+      FROM orders
+      WHERE customer_phone = ?
+      ORDER BY created_at DESC
+      LIMIT 100
+    `)
+    .all(phone) as Record<string, unknown>[];
+
+  return res.json({
+    orders: rows.map(mapIntegrationOrder),
+  });
+});
+
+// Look up one order while also proving ownership with the customer's phone.
+router.post('/integration/orders/lookup', requireIntegrationKey, (req: Request, res: Response) => {
+  const rawOrderIdOrNumber = req.body?.orderIdOrNumber;
+  const phone = normalizeIntegrationPhone(req.body?.phone);
+
+  if (typeof rawOrderIdOrNumber !== 'string' || !rawOrderIdOrNumber.trim()) {
+    return res.status(400).json({ error: 'Order id or number is required' });
+  }
+
+  if (phone.length < 8 || phone.length > 20) {
+    return res.status(400).json({ error: 'Invalid phone' });
+  }
+
+  const orderIdOrNumber = rawOrderIdOrNumber.trim();
+
+  // Deliberately use two parameterized exact queries rather than raw OR interpolation.
+  let row = db
+    .prepare(`
+      SELECT *
+      FROM orders
+      WHERE id = ? AND customer_phone = ?
+      LIMIT 1
+    `)
+    .get(orderIdOrNumber, phone) as Record<string, unknown> | undefined;
+
+  if (!row) {
+    row = db
+      .prepare(`
+        SELECT *
+        FROM orders
+        WHERE order_number = ? AND customer_phone = ?
+        LIMIT 1
+      `)
+      .get(orderIdOrNumber, phone) as Record<string, unknown> | undefined;
+  }
+
+  if (!row) {
+    return res.status(404).json({ error: 'Order not found' });
+  }
+
+  return res.json({
+    order: mapIntegrationOrder(row),
+  });
+});
+
+// ==========================================
 // 12. UNIFIED PUBLIC API (Customer Store endpoints)
 // Connecting to the EXACT SAME Database
 // ==========================================
