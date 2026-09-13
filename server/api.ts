@@ -1,6 +1,5 @@
 import express, { Request, Response, Router } from 'express';
 import crypto from 'node:crypto';
-import { db } from './db';
 import {
   requireAuth,
   requireRole,
@@ -55,28 +54,6 @@ function parseAndValidateNumber(
     return { valid: false, error: `الحقل ${fieldName} يجب أن يكون رقماً صحيحاً` };
   }
   return { valid: true, value: num };
-}
-
-// Collision-safe unique order number generator with bounded retries
-function generateUniqueOrderNumber(database: typeof db, maxRetries = 10): string | null {
-  for (let i = 0; i < maxRetries; i++) {
-    const candidate = `#ALM-${Math.floor(10000 + Math.random() * 90000)}`;
-    const row = database.prepare('SELECT id FROM orders WHERE order_number = ?').get(candidate);
-    if (!row) {
-      return candidate;
-    }
-  }
-  return null;
-}
-
-function isOrderNumberCollisionError(err: unknown): boolean {
-  if (!err || typeof err !== 'object') return false;
-  const message = String((err as any).message || '');
-  const code = String((err as any).code || '');
-  return (
-    (code === 'SQLITE_CONSTRAINT' || code === 'SQLITE_CONSTRAINT_UNIQUE' || message.includes('UNIQUE constraint failed')) &&
-    message.includes('orders.order_number')
-  );
 }
 
 // ==========================================
@@ -552,383 +529,287 @@ router.get('/admin/dashboard/stats', requireAuth, async (_req: AuthenticatedRequ
 });
 
 // ==========================================
-// 4. PRODUCTS & PRODUCT VARIANTS
+// 4. PRODUCTS & PRODUCT VARIANTS — SUPABASE
 // ==========================================
 
-// Helper to get product with variants
-function getProductWithVariants(productId: string) {
-  const product = db
-    .prepare(`
-      SELECT p.*, c.name as category_name
-      FROM products p
-      LEFT JOIN categories c ON p.category_id = c.id
-      WHERE p.id = ?
-    `)
-    .get(productId) as Record<string, unknown> | undefined;
-
-  if (!product) return null;
-
-  const variants = db
-    .prepare(`
-      SELECT * FROM product_variants
-      WHERE product_id = ?
-      ORDER BY sort_order ASC, weight_kg ASC, piece_count ASC
-    `)
-    .all(productId) as Record<string, unknown>[];
-
+function mapVariantRow(v: Record<string, unknown>) {
   return {
-    id: product.id,
-    name: product.name,
-    description: product.description || '',
-    categoryId: product.category_id,
-    categoryName: product.category_name || '',
-    pricingUnit: product.pricing_unit,
-    price: product.base_price,
-    imageUrl: product.image_url,
-    isActive: Boolean(product.is_active),
-    minOrderQuantity: product.min_order_quantity,
-    maxOrderQuantity: product.max_order_quantity,
-    sortOrder: product.sort_order,
-    badge: product.badge,
-    variants: variants.map((v) => ({
-      id: v.id,
-      productId: v.product_id,
-      title: v.title,
-      weightKg: v.weight_kg,
-      pieceCount: v.piece_count,
-      approxPieceWeightG: v.approx_piece_weight_g,
-      price: v.price,
-      isActive: Boolean(v.is_active),
-      sortOrder: v.sort_order,
-      createdAt: v.created_at,
-    })),
-    createdAt: product.created_at,
+    id: v.id,
+    productId: v.product_id,
+    title: v.title,
+    weightKg: v.weight_kg != null ? Number(v.weight_kg) : undefined,
+    pieceCount: v.piece_count != null ? Number(v.piece_count) : undefined,
+    approxPieceWeightG: v.approx_piece_weight_g != null ? Number(v.approx_piece_weight_g) : undefined,
+    price: Number(v.price || 0),
+    stockQuantity: Number(v.stock_quantity || 0),
+    isActive: Boolean(v.is_active),
+    sortOrder: Number(v.sort_order || 0),
+    createdAt: v.created_at,
   };
 }
 
-// GET /api/admin/products
-router.get('/admin/products', requireAuth, (_req: AuthenticatedRequest, res: Response) => {
-  const products = db
-    .prepare(`
-      SELECT p.*, c.name as category_name
-      FROM products p
-      LEFT JOIN categories c ON p.category_id = c.id
-      ORDER BY p.sort_order ASC, p.created_at DESC
-    `)
-    .all() as Record<string, unknown>[];
-
-  const variants = db
-    .prepare('SELECT * FROM product_variants ORDER BY sort_order ASC, weight_kg ASC, piece_count ASC')
-    .all() as Record<string, unknown>[];
-
-  const variantsByProduct: Record<string, unknown[]> = {};
-  for (const v of variants) {
-    const pId = String(v.product_id);
-    if (!variantsByProduct[pId]) variantsByProduct[pId] = [];
-    variantsByProduct[pId].push({
-      id: v.id,
-      productId: v.product_id,
-      title: v.title,
-      weightKg: v.weight_kg,
-      pieceCount: v.piece_count,
-      approxPieceWeightG: v.approx_piece_weight_g,
-      price: v.price,
-      isActive: Boolean(v.is_active),
-      sortOrder: v.sort_order,
-      createdAt: v.created_at,
-    });
-  }
-
-  const result = products.map((p) => ({
+function mapProductRow(
+  p: Record<string, unknown>,
+  categoryName = '',
+  variants: Record<string, unknown>[] = []
+) {
+  return {
     id: p.id,
     name: p.name,
     description: p.description || '',
     categoryId: p.category_id,
-    categoryName: p.category_name || '',
+    categoryName,
     pricingUnit: p.pricing_unit,
-    price: p.base_price,
+    price: Number(p.base_price || 0),
+    stockQuantity: Number(p.stock_quantity || 0),
+    inStock: Boolean(p.in_stock),
     imageUrl: p.image_url,
     isActive: Boolean(p.is_active),
-    minOrderQuantity: p.min_order_quantity,
-    maxOrderQuantity: p.max_order_quantity,
-    sortOrder: p.sort_order,
+    minOrderQuantity: p.min_order_quantity != null ? Number(p.min_order_quantity) : undefined,
+    maxOrderQuantity: p.max_order_quantity != null ? Number(p.max_order_quantity) : undefined,
+    sortOrder: Number(p.sort_order || 0),
     badge: p.badge,
-    variants: variantsByProduct[String(p.id)] || [],
+    variants: variants.map(mapVariantRow),
     createdAt: p.created_at,
-  }));
+  };
+}
 
-  return res.json(result);
+async function getProductWithVariants(productId: string) {
+  const { data: product, error } = await supabaseServer
+    .from('products')
+    .select('*')
+    .eq('id', productId)
+    .maybeSingle();
+
+  if (error) throw new Error(`PRODUCT_LOOKUP_FAILED:${error.message}`);
+  if (!product) return null;
+
+  const variantsResult = await supabaseServer
+    .from('product_variants')
+    .select('*')
+    .eq('product_id', productId)
+    .order('sort_order', { ascending: true })
+    .order('weight_kg', { ascending: true })
+    .order('piece_count', { ascending: true });
+
+  if (variantsResult.error) throw new Error(`VARIANT_LOOKUP_FAILED:${variantsResult.error.message}`);
+
+  let categoryName = '';
+  if (product.category_id) {
+    const categoryResult = await supabaseServer
+      .from('categories')
+      .select('name')
+      .eq('id', product.category_id)
+      .maybeSingle();
+
+    if (categoryResult.error) throw new Error(`CATEGORY_LOOKUP_FAILED:${categoryResult.error.message}`);
+    categoryName = categoryResult.data?.name || '';
+  }
+
+  return mapProductRow(
+    product,
+    categoryName,
+    (variantsResult.data || []) as Record<string, unknown>[]
+  );
+}
+
+router.get('/admin/products', requireAuth, async (_req: AuthenticatedRequest, res: Response) => {
+  const [productsResult, variantsResult, categoriesResult] = await Promise.all([
+    supabaseServer.from('products').select('*').order('sort_order', { ascending: true }).order('created_at', { ascending: false }),
+    supabaseServer.from('product_variants').select('*').order('sort_order', { ascending: true }).order('weight_kg', { ascending: true }).order('piece_count', { ascending: true }),
+    supabaseServer.from('categories').select('id,name'),
+  ]);
+
+  const failed = [productsResult, variantsResult, categoriesResult].find((r) => r.error);
+  if (failed?.error) {
+    console.error('Supabase admin products read failed:', failed.error.message);
+    return res.status(503).json({ error: 'تعذر تحميل المنتجات' });
+  }
+
+  const categoryNames = new Map((categoriesResult.data || []).map((c) => [String(c.id), String(c.name)]));
+  const variantsByProduct = new Map<string, Record<string, unknown>[]>();
+  for (const v of variantsResult.data || []) {
+    const productId = String(v.product_id);
+    const list = variantsByProduct.get(productId) || [];
+    list.push(v as Record<string, unknown>);
+    variantsByProduct.set(productId, list);
+  }
+
+  return res.json((productsResult.data || []).map((p) =>
+    mapProductRow(p, categoryNames.get(String(p.category_id || '')) || '', variantsByProduct.get(String(p.id)) || [])
+  ));
 });
 
-// POST /api/admin/products (Manager & Super Admin)
-router.post('/admin/products', requireAuth, requireRole(['super_admin', 'manager']), (req: AuthenticatedRequest, res: Response) => {
-  const {
-    name,
-    description,
-    categoryId,
-    pricingUnit,
-    price,
-    imageUrl,
-    badge,
-    variants,
-    minOrderQuantity,
-    maxOrderQuantity,
-    sortOrder,
-  } = req.body;
+router.post('/admin/products', requireAuth, requireRole(['super_admin', 'manager']), async (req: AuthenticatedRequest, res: Response) => {
+  const { name, description, categoryId, pricingUnit, price, imageUrl, badge, variants, minOrderQuantity, maxOrderQuantity, sortOrder } = req.body;
+  if (!name || price === undefined) return res.status(400).json({ error: 'اسم المنتج والسعر الأساسي مطلوبان' });
 
-  if (!name || price === undefined) {
-    return res.status(400).json({ error: 'اسم المنتج والسعر الأساسي مطلوبان' });
-  }
+  const priceCheck = parseAndValidateNumber(price, 'السعر الأساسي', { min: 0 });
+  if (!priceCheck.valid) return res.status(400).json({ error: priceCheck.error });
 
   const productId = `prod-${Date.now()}-${crypto.randomBytes(3).toString('hex')}`;
   const now = new Date().toISOString();
+  const { error: productError } = await supabaseServer.from('products').insert({
+    id: productId,
+    name: String(name).trim(),
+    description: description || '',
+    category_id: categoryId || null,
+    pricing_unit: pricingUnit || 'kg',
+    base_price: priceCheck.value!,
+    image_url: imageUrl || 'https://images.unsplash.com/photo-1534483509719-3feaee7c30da?auto=format&fit=crop&w=800&q=80',
+    min_order_quantity: minOrderQuantity || null,
+    max_order_quantity: maxOrderQuantity || null,
+    sort_order: sortOrder || 0,
+    badge: badge || null,
+    is_active: true,
+    created_at: now,
+  });
 
-  // Execute in transaction
-  db.exec('BEGIN TRANSACTION;');
-  try {
-    db.prepare(`
-      INSERT INTO products (
-        id, name, description, category_id, pricing_unit, base_price,
-        image_url, min_order_quantity, max_order_quantity,
-        sort_order, badge, is_active, created_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?)
-    `).run(
-      productId,
-      name.trim(),
-      description || '',
-      categoryId || null,
-      pricingUnit || 'kg',
-      Number(price),
-      imageUrl || 'https://images.unsplash.com/photo-1534483509719-3feaee7c30da?auto=format&fit=crop&w=800&q=80',
-      minOrderQuantity || null,
-      maxOrderQuantity || null,
-      sortOrder || 0,
-      badge || null,
-      now
-    );
-
-    // Insert variants if provided
-    if (Array.isArray(variants) && variants.length > 0) {
-      const insertVar = db.prepare(`
-        INSERT INTO product_variants (
-          id, product_id, title, weight_kg, piece_count, approx_piece_weight_g,
-          price, is_active, sort_order, created_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, ?)
-      `);
-
-      for (let i = 0; i < variants.length; i++) {
-        const v = variants[i];
-        const vId = `var-${Date.now()}-${i}-${crypto.randomBytes(2).toString('hex')}`;
-        insertVar.run(
-          vId,
-          productId,
-          v.title || `${v.pieceCount || 1} قطع / ${v.weightKg || 1} كجم`,
-          Number(v.weightKg || 1),
-          Number(v.pieceCount || 1),
-          v.approxPieceWeightG ? Number(v.approxPieceWeightG) : null,
-          Number(v.price || price),
-          v.sortOrder || i,
-          now
-        );
-      }
-    }
-
-    db.exec('COMMIT;');
-
-    const created = getProductWithVariants(productId);
-    logAuditAction(req.admin, 'create_product', 'product', productId, null, created, req.ip);
-    broadcastRealtimeEvent('product_created', created);
-
-    return res.status(201).json(created);
-  } catch (err) {
-    db.exec('ROLLBACK;');
-    console.error('Error creating product:', err);
-    return res.status(500).json({ error: 'حدث خطأ أثناء إنشاء المنتج' });
+  if (productError) {
+    console.error('Supabase product create failed:', productError.message);
+    return res.status(productError.code === '23505' ? 409 : 503).json({ error: 'تعذر إنشاء المنتج' });
   }
+
+  if (Array.isArray(variants) && variants.length > 0) {
+    const rows = variants.map((v, i) => ({
+      id: `var-${Date.now()}-${i}-${crypto.randomBytes(2).toString('hex')}`,
+      product_id: productId,
+      title: v.title || `${v.pieceCount || 1} قطع / ${v.weightKg || 1} كجم`,
+      weight_kg: Number(v.weightKg || 1),
+      piece_count: Number(v.pieceCount || 1),
+      approx_piece_weight_g: v.approxPieceWeightG ? Number(v.approxPieceWeightG) : null,
+      price: Number(v.price || priceCheck.value!),
+      is_active: true,
+      sort_order: v.sortOrder || i,
+      created_at: now,
+    }));
+    const { error } = await supabaseServer.from('product_variants').insert(rows);
+    if (error) {
+      await supabaseServer.from('products').delete().eq('id', productId);
+      console.error('Supabase product variants create failed:', error.message);
+      return res.status(503).json({ error: 'تعذر إنشاء أحجام المنتج' });
+    }
+  }
+
+  const created = await getProductWithVariants(productId);
+  logAuditAction(req.admin, 'create_product', 'product', productId, null, created, req.ip);
+  broadcastRealtimeEvent('product_created', created);
+  return res.status(201).json(created);
 });
 
-// PUT /api/admin/products/:id
-router.put('/admin/products/:id', requireAuth, requireRole(['super_admin', 'manager']), (req: AuthenticatedRequest, res: Response) => {
+router.put('/admin/products/:id', requireAuth, requireRole(['super_admin', 'manager']), async (req: AuthenticatedRequest, res: Response) => {
   const productId = req.params.id;
-  const existing = getProductWithVariants(productId);
-  if (!existing) {
-    return res.status(404).json({ error: 'المنتج غير موجود' });
+  const existing = await getProductWithVariants(productId);
+  if (!existing) return res.status(404).json({ error: 'المنتج غير موجود' });
+
+  const { name, description, categoryId, pricingUnit, price, imageUrl, badge, isActive, variants } = req.body;
+  const updates: Record<string, unknown> = {};
+  if (name !== undefined) updates.name = String(name).trim();
+  if (description !== undefined) updates.description = description;
+  if (categoryId !== undefined) updates.category_id = categoryId || null;
+  if (pricingUnit !== undefined) updates.pricing_unit = pricingUnit;
+  if (price !== undefined) {
+    const v = parseAndValidateNumber(price, 'السعر الأساسي', { min: 0 });
+    if (!v.valid) return res.status(400).json({ error: v.error });
+    updates.base_price = v.value!;
+  }
+  if (imageUrl !== undefined) updates.image_url = imageUrl;
+  if (badge !== undefined) updates.badge = badge || null;
+  if (isActive !== undefined) updates.is_active = Boolean(isActive);
+
+  if (Object.keys(updates).length > 0) {
+    const { error } = await supabaseServer.from('products').update(updates).eq('id', productId);
+    if (error) return res.status(503).json({ error: 'تعذر تعديل المنتج' });
   }
 
-  const {
-    name,
-    description,
-    categoryId,
-    pricingUnit,
-    price,
-    imageUrl,
-    badge,
-    isActive,
-    variants,
-  } = req.body;
+  if (Array.isArray(variants)) {
+    const { data: currentVariants, error: currentError } = await supabaseServer.from('product_variants').select('id').eq('product_id', productId);
+    if (currentError) return res.status(503).json({ error: 'تعذر تحميل أحجام المنتج' });
 
-  db.exec('BEGIN TRANSACTION;');
-  try {
-    db.prepare(`
-      UPDATE products SET
-        name = COALESCE(?, name),
-        description = COALESCE(?, description),
-        category_id = COALESCE(?, category_id),
-        pricing_unit = COALESCE(?, pricing_unit),
-        base_price = COALESCE(?, base_price),
-        image_url = COALESCE(?, image_url),
-        badge = COALESCE(?, badge),
-        is_active = COALESCE(?, is_active)
-      WHERE id = ?
-    `).run(
-      name !== undefined ? name.trim() : null,
-      description !== undefined ? description : null,
-      categoryId !== undefined ? categoryId : null,
-      pricingUnit !== undefined ? pricingUnit : null,
-      price !== undefined ? Number(price) : null,
-      imageUrl !== undefined ? imageUrl : null,
-      badge !== undefined ? badge : null,
-      isActive !== undefined ? (isActive ? 1 : 0) : null,
-      productId
-    );
-
-    // If variants array is explicitly provided, update them
-    if (Array.isArray(variants)) {
-      // Remove variants not in the new array
-      const keepIds = variants.filter((v) => v.id).map((v) => v.id);
-      if (keepIds.length > 0) {
-        const placeholders = keepIds.map(() => '?').join(',');
-        db.prepare(`DELETE FROM product_variants WHERE product_id = ? AND id NOT IN (${placeholders})`).run(productId, ...keepIds);
-      } else {
-        db.prepare('DELETE FROM product_variants WHERE product_id = ?').run(productId);
-      }
-
-      const updateVar = db.prepare(`
-        UPDATE product_variants SET
-          title = ?, weight_kg = ?, piece_count = ?, approx_piece_weight_g = ?,
-          price = ?, is_active = ?, sort_order = ?
-        WHERE id = ?
-      `);
-
-      const insertVar = db.prepare(`
-        INSERT INTO product_variants (
-          id, product_id, title, weight_kg, piece_count, approx_piece_weight_g,
-          price, is_active, sort_order, created_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, ?)
-      `);
-
-      for (let i = 0; i < variants.length; i++) {
-        const v = variants[i];
-        if (v.id && keepIds.includes(v.id)) {
-          updateVar.run(
-            v.title,
-            Number(v.weightKg || 1),
-            Number(v.pieceCount || 1),
-            v.approxPieceWeightG ? Number(v.approxPieceWeightG) : null,
-            Number(v.price),
-            v.isActive !== false ? 1 : 0,
-            v.sortOrder || i,
-            v.id
-          );
-        } else {
-          const vId = `var-${Date.now()}-${i}-${crypto.randomBytes(2).toString('hex')}`;
-          insertVar.run(
-            vId,
-            productId,
-            v.title,
-            Number(v.weightKg || 1),
-            Number(v.pieceCount || 1),
-            v.approxPieceWeightG ? Number(v.approxPieceWeightG) : null,
-            Number(v.price),
-            v.isActive !== false ? 1 : 0,
-            v.sortOrder || i,
-            new Date().toISOString()
-          );
-        }
-      }
+    const currentIds = new Set((currentVariants || []).map((v) => String(v.id)));
+    const keepIds = new Set(variants.filter((v) => v.id && currentIds.has(String(v.id))).map((v) => String(v.id)));
+    const removeIds = [...currentIds].filter((id) => !keepIds.has(id));
+    if (removeIds.length > 0) {
+      const { error } = await supabaseServer.from('product_variants').delete().in('id', removeIds);
+      if (error) return res.status(503).json({ error: 'تعذر تحديث أحجام المنتج' });
     }
 
-    db.exec('COMMIT;');
+    const now = new Date().toISOString();
+    const rows = variants.map((v, i) => ({
+      id: v.id && currentIds.has(String(v.id)) ? String(v.id) : `var-${Date.now()}-${i}-${crypto.randomBytes(2).toString('hex')}`,
+      product_id: productId,
+      title: v.title || `${v.pieceCount || 1} قطع / ${v.weightKg || 1} كجم`,
+      weight_kg: Number(v.weightKg || 1),
+      piece_count: Number(v.pieceCount || 1),
+      approx_piece_weight_g: v.approxPieceWeightG ? Number(v.approxPieceWeightG) : null,
+      price: Number(v.price ?? existing.price),
+      is_active: v.isActive !== false,
+      sort_order: v.sortOrder || i,
+      created_at: now,
+    }));
 
-    const updated = getProductWithVariants(productId);
-    logAuditAction(req.admin, 'update_product', 'product', productId, existing, updated, req.ip);
-    broadcastRealtimeEvent('product_updated', updated);
-
-    return res.json(updated);
-  } catch (err) {
-    db.exec('ROLLBACK;');
-    console.error('Error updating product:', err);
-    return res.status(500).json({ error: 'حدث خطأ أثناء تعديل المنتج' });
+    if (rows.length > 0) {
+      const { error } = await supabaseServer.from('product_variants').upsert(rows, { onConflict: 'id' });
+      if (error) return res.status(503).json({ error: 'تعذر تحديث أحجام المنتج' });
+    }
   }
+
+  const updated = await getProductWithVariants(productId);
+  logAuditAction(req.admin, 'update_product', 'product', productId, existing, updated, req.ip);
+  broadcastRealtimeEvent('product_updated', updated);
+  return res.json(updated);
 });
 
-// DELETE /api/admin/products/:id (Manager and Super Admin only; operator FORBIDDEN)
-router.delete('/admin/products/:id', requireAuth, requireRole(['super_admin', 'manager']), (req: AuthenticatedRequest, res: Response) => {
+router.delete('/admin/products/:id', requireAuth, requireRole(['super_admin', 'manager']), async (req: AuthenticatedRequest, res: Response) => {
   const productId = req.params.id;
-  const existing = getProductWithVariants(productId);
-  if (!existing) {
-    return res.status(404).json({ error: 'المنتج غير موجود' });
-  }
+  const existing = await getProductWithVariants(productId);
+  if (!existing) return res.status(404).json({ error: 'المنتج غير موجود' });
 
-  db.prepare('DELETE FROM products WHERE id = ?').run(productId);
+  const { error } = await supabaseServer.from('products').delete().eq('id', productId);
+  if (error) return res.status(503).json({ error: 'تعذر حذف المنتج' });
+
   logAuditAction(req.admin, 'delete_product', 'product', productId, existing, null, req.ip);
   broadcastRealtimeEvent('product_deleted', { id: productId });
-
   return res.json({ message: 'تم حذف المنتج بنجاح' });
 });
 
-// POST /api/admin/products/:id/variants
-router.post('/admin/products/:id/variants', requireAuth, requireRole(['super_admin', 'manager']), (req: AuthenticatedRequest, res: Response) => {
+router.post('/admin/products/:id/variants', requireAuth, requireRole(['super_admin', 'manager']), async (req: AuthenticatedRequest, res: Response) => {
   const productId = req.params.id;
-  const product = db.prepare('SELECT id FROM products WHERE id = ?').get(productId);
+  const { data: product, error: productError } = await supabaseServer.from('products').select('id').eq('id', productId).maybeSingle();
+  if (productError) return res.status(503).json({ error: 'تعذر تحميل المنتج' });
   if (!product) return res.status(404).json({ error: 'المنتج غير موجود' });
 
   const { title, weightKg, pieceCount, approxPieceWeightG, price } = req.body;
-  if (!title || price === undefined) {
-    return res.status(400).json({ error: 'اسم الحجم والسعر مطلوبان' });
-  }
+  if (!title || price === undefined) return res.status(400).json({ error: 'اسم الحجم والسعر مطلوبان' });
+
+  const priceCheck = parseAndValidateNumber(price, 'السعر', { min: 0 });
+  if (!priceCheck.valid) return res.status(400).json({ error: priceCheck.error });
 
   const variantId = `var-${Date.now()}-${crypto.randomBytes(3).toString('hex')}`;
-  const now = new Date().toISOString();
-
-  db.prepare(`
-    INSERT INTO product_variants (
-      id, product_id, title, weight_kg, piece_count, approx_piece_weight_g, price, is_active, created_at
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?)
-  `).run(
-    variantId,
-    productId,
-    String(title).trim(),
-    Number(weightKg || 1),
-    Number(pieceCount || 1),
-    approxPieceWeightG ? Number(approxPieceWeightG) : null,
-    Number(price),
-    now
-  );
-
-  const updatedProduct = getProductWithVariants(productId);
-  broadcastRealtimeEvent('product_updated', updatedProduct);
-
-  return res.status(201).json({
-    id: variantId,
-    productId,
-    title,
-    weightKg: Number(weightKg || 1),
-    pieceCount: Number(pieceCount || 1),
-    price: Number(price),
+  const { error } = await supabaseServer.from('product_variants').insert({
+    id: variantId, product_id: productId, title: String(title).trim(),
+    weight_kg: Number(weightKg || 1), piece_count: Number(pieceCount || 1),
+    approx_piece_weight_g: approxPieceWeightG ? Number(approxPieceWeightG) : null,
+    price: priceCheck.value!, is_active: true, created_at: new Date().toISOString(),
   });
+  if (error) return res.status(503).json({ error: 'تعذر إنشاء الحجم' });
+
+  const updatedProduct = await getProductWithVariants(productId);
+  broadcastRealtimeEvent('product_updated', updatedProduct);
+  return res.status(201).json({ id: variantId, productId, title, weightKg: Number(weightKg || 1), pieceCount: Number(pieceCount || 1), price: priceCheck.value! });
 });
 
-// DELETE /api/admin/products/:id/variants/:variantId
-router.delete('/admin/products/:id/variants/:variantId', requireAuth, requireRole(['super_admin', 'manager']), (req: AuthenticatedRequest, res: Response) => {
+router.delete('/admin/products/:id/variants/:variantId', requireAuth, requireRole(['super_admin', 'manager']), async (req: AuthenticatedRequest, res: Response) => {
   const { id: productId, variantId } = req.params;
-  const existing = db.prepare('SELECT id FROM product_variants WHERE id = ? AND product_id = ?').get(variantId, productId);
+  const { data: existing, error: lookupError } = await supabaseServer.from('product_variants').select('id').eq('id', variantId).eq('product_id', productId).maybeSingle();
+  if (lookupError) return res.status(503).json({ error: 'تعذر تحميل الحجم' });
   if (!existing) return res.status(404).json({ error: 'الحجم غير موجود' });
 
-  db.prepare('DELETE FROM product_variants WHERE id = ? AND product_id = ?').run(variantId, productId);
-  const updatedProduct = getProductWithVariants(productId);
-  broadcastRealtimeEvent('product_updated', updatedProduct);
+  const { error } = await supabaseServer.from('product_variants').delete().eq('id', variantId).eq('product_id', productId);
+  if (error) return res.status(503).json({ error: 'تعذر حذف الحجم' });
 
+  const updatedProduct = await getProductWithVariants(productId);
+  broadcastRealtimeEvent('product_updated', updatedProduct);
   return res.json({ message: 'تم حذف الحجم بنجاح' });
 });
 
@@ -1150,934 +1031,479 @@ router.delete('/admin/categories/:id', requireAuth, requireRole(['super_admin', 
 });
 
 // ==========================================
-// 6. ORDERS & ORDER ITEMS
+// 6. ORDERS & ORDER ITEMS — SUPABASE
 // ==========================================
 
-function getOrderWithItems(orderId: string) {
-  const order = db.prepare('SELECT * FROM orders WHERE id = ?').get(orderId) as Record<string, unknown> | undefined;
-  if (!order) return null;
+function parseSnapshotData(value: unknown) {
+  if (typeof value !== 'string' || !value) return undefined;
+  try { return JSON.parse(value); } catch { return undefined; }
+}
 
-  const items = db.prepare('SELECT * FROM order_items WHERE order_id = ?').all(orderId) as Record<string, unknown>[];
-
+function mapOrderRow(order: Record<string, unknown>, items: Record<string, unknown>[] = []) {
   return {
-    id: String(order.id),
-    orderNumber: String(order.order_number),
+    id: String(order.id), orderNumber: String(order.order_number),
     customerId: order.customer_id ? String(order.customer_id) : undefined,
-    customerName: String(order.customer_name),
-    customerPhone: String(order.customer_phone),
-    customerAddress: String(order.customer_address),
-    city: String(order.city || ''),
-    district: String(order.district || ''),
-    subtotal: Number(order.subtotal || 0),
-    discountAmount: Number(order.discount_amount || 0),
-    couponCode: order.coupon_code as string | null,
-    deliveryFee: Number(order.delivery_fee || 0),
-    totalAmount: Number(order.total_amount || 0),
-    depositAmount: Number(order.deposit_amount || 0),
-    depositStatus: String(order.deposit_status || 'not_required'),
-    depositMethod: order.deposit_method as string | null,
-    depositReference: order.deposit_reference as string | null,
-    depositNotes: order.deposit_notes as string | null,
-    depositConfirmedAt: order.deposit_confirmed_at as string | null,
-    depositConfirmedBy: order.deposit_confirmed_by as string | null,
-    remainingAmount: Number(order.remaining_amount || 0),
-    status: String(order.status),
-    notes: order.notes as string | null,
+    customerName: String(order.customer_name), customerPhone: String(order.customer_phone),
+    customerAddress: String(order.customer_address), city: String(order.city || ''), district: String(order.district || ''),
+    subtotal: Number(order.subtotal || 0), discountAmount: Number(order.discount_amount || 0),
+    couponCode: order.coupon_code as string | null, deliveryFee: Number(order.delivery_fee || 0),
+    totalAmount: Number(order.total_amount || 0), depositAmount: Number(order.deposit_amount || 0),
+    depositStatus: String(order.deposit_status || 'not_required'), depositMethod: order.deposit_method as string | null,
+    depositReference: order.deposit_reference as string | null, depositNotes: order.deposit_notes as string | null,
+    depositConfirmedAt: order.deposit_confirmed_at as string | null, depositConfirmedBy: order.deposit_confirmed_by as string | null,
+    remainingAmount: Number(order.remaining_amount || 0), status: String(order.status), notes: order.notes as string | null,
     items: items.map((i) => ({
-      id: String(i.id),
-      productId: String(i.product_id),
-      productName: String(i.product_name),
-      variantId: i.variant_id ? String(i.variant_id) : undefined,
-      variantTitle: i.variant_title ? String(i.variant_title) : undefined,
-      pricingUnit: String(i.pricing_unit),
-      weightKg: Number(i.weight_kg || 0),
-      pieceCount: Number(i.piece_count || 0),
-      unitPrice: Number(i.unit_price || 0),
-      quantity: Number(i.quantity || 0),
-      totalPrice: Number(i.total_price || 0),
-      snapshotData: i.snapshot_data ? JSON.parse(String(i.snapshot_data)) : undefined,
+      id: String(i.id), productId: String(i.product_id), productName: String(i.product_name),
+      variantId: i.variant_id ? String(i.variant_id) : undefined, variantTitle: i.variant_title ? String(i.variant_title) : undefined,
+      pricingUnit: String(i.pricing_unit), weightKg: i.weight_kg != null ? Number(i.weight_kg) : 0,
+      pieceCount: i.piece_count != null ? Number(i.piece_count) : 0, unitPrice: Number(i.unit_price || 0),
+      quantity: Number(i.quantity || 0), totalPrice: Number(i.total_price || 0), snapshotData: parseSnapshotData(i.snapshot_data),
     })),
-    createdAt: String(order.created_at),
-    updatedAt: String(order.updated_at),
+    createdAt: String(order.created_at), updatedAt: String(order.updated_at),
   };
 }
 
-// GET /api/admin/orders
-router.get('/admin/orders', requireAuth, (req: AuthenticatedRequest, res: Response) => {
-  const { status, depositStatus, search } = req.query;
+async function getOrderWithItems(orderId: string) {
+  const { data: order, error } = await supabaseServer.from('orders').select('*').eq('id', orderId).maybeSingle();
+  if (error) throw new Error(`ORDER_LOOKUP_FAILED:${error.message}`);
+  if (!order) return null;
+  const { data: items, error: itemsError } = await supabaseServer.from('order_items').select('*').eq('order_id', orderId).order('created_at', { ascending: true });
+  if (itemsError) throw new Error(`ORDER_ITEMS_LOOKUP_FAILED:${itemsError.message}`);
+  return mapOrderRow(order, (items || []) as Record<string, unknown>[]);
+}
 
-  let query = 'SELECT * FROM orders WHERE 1=1';
-  const params: (string | number)[] = [];
+async function verifyOrderItems(
+  items: Array<Record<string, unknown>>, mode: 'admin' | 'public'
+): Promise<{ error?: string; serviceError?: boolean; verifiedItems?: Array<Record<string, unknown>>; subtotal?: number }> {
+  const productIds = [...new Set(items.map((item) => String(item.productId || '')).filter(Boolean))];
+  if (productIds.length === 0) return { error: 'قائمة الأصناف غير صالحة' };
+  const variantIds = [...new Set(items.map((item) => String(item.variantId || '')).filter(Boolean))];
 
-  if (status && status !== 'all') {
-    query += ' AND status = ?';
-    params.push(String(status));
+  const productsResult = await supabaseServer.from('products')
+    .select('id,name,base_price,pricing_unit,is_active,min_order_quantity,max_order_quantity').in('id', productIds);
+  if (productsResult.error) return { serviceError: true, error: 'تعذر التحقق من المنتجات حالياً' };
+
+  let variants: Record<string, unknown>[] = [];
+  if (variantIds.length > 0) {
+    const vr = await supabaseServer.from('product_variants').select('id,product_id,title,price,weight_kg,piece_count,is_active').in('id', variantIds);
+    if (vr.error) return { serviceError: true, error: 'تعذر التحقق من أحجام المنتجات حالياً' };
+    variants = (vr.data || []) as Record<string, unknown>[];
   }
 
-  if (depositStatus && depositStatus !== 'all') {
-    query += ' AND deposit_status = ?';
-    params.push(String(depositStatus));
-  }
+  const productMap = new Map((productsResult.data || []).map((p) => [String(p.id), p as Record<string, unknown>]));
+  const variantMap = new Map(variants.map((v) => [String(v.id), v]));
+  let subtotal = 0;
+  const verifiedItems: Array<Record<string, unknown>> = [];
 
-  if (search) {
-    query += ' AND (order_number LIKE ? OR customer_name LIKE ? OR customer_phone LIKE ? OR deposit_reference LIKE ?)';
-    const s = `%${search}%`;
-    params.push(s, s, s, s);
-  }
-
-  query += ' ORDER BY created_at DESC LIMIT 200';
-
-  const orders = db.prepare(query).all(...params) as Record<string, unknown>[];
-
-  // Fetch all items for these orders efficiently
-  if (orders.length === 0) return res.json([]);
-
-  const orderIds = orders.map((o) => String(o.id));
-  const placeholders = orderIds.map(() => '?').join(',');
-  const items = db.prepare(`SELECT * FROM order_items WHERE order_id IN (${placeholders})`).all(...orderIds) as Record<string, unknown>[];
-
-  const itemsByOrder: Record<string, unknown[]> = {};
   for (const item of items) {
-    const oId = String(item.order_id);
-    if (!itemsByOrder[oId]) itemsByOrder[oId] = [];
-    itemsByOrder[oId].push({
-      id: item.id,
-      productId: item.product_id,
-      productName: item.product_name,
-      variantId: item.variant_id,
-      variantTitle: item.variant_title,
-      pricingUnit: item.pricing_unit,
-      weightKg: item.weight_kg,
-      pieceCount: item.piece_count,
-      unitPrice: item.unit_price,
-      quantity: item.quantity,
-      totalPrice: item.total_price,
-    });
+    const productId = String(item.productId || '');
+    const quantity = Number(item.quantity);
+    if (!Number.isFinite(quantity) || quantity <= 0) {
+      return { error: mode === 'public' ? `الكمية المطلوبة غير صالحة للصنف (${String(item.productName || productId)})` : `كمية غير صالحة للصنف (${String(item.productName || productId)})` };
+    }
+
+    const prod = productMap.get(productId);
+    if (!prod) return { error: mode === 'public' ? `الصنف المطلوب غير موجود (${productId})` : `المنتج المحدد غير موجود (${productId})` };
+
+    const productName = String(prod.name);
+    const pricingUnit = String(prod.pricing_unit || 'kg');
+    if (!Boolean(prod.is_active)) return { error: mode === 'public' ? `الصنف "${productName}" غير متاح حالياً للطلب` : `الصنف "${productName}" غير متاح حالياً` };
+    if (pricingUnit === 'piece' && !Number.isInteger(quantity)) return { error: `الكمية المطلوبة للصنف "${productName}" بالقطعة ويجب أن تكون عدداً صحيحاً بدون كسور` };
+    if (pricingUnit !== 'piece' && quantity < 0.05) return { error: `أقل كمية/وزن يمكن طلبه للصنف "${productName}" هو 0.05 كجم` };
+
+    const minOrder = prod.min_order_quantity != null ? Number(prod.min_order_quantity) : null;
+    const maxOrder = prod.max_order_quantity != null ? Number(prod.max_order_quantity) : null;
+    const unitLabel = pricingUnit === 'piece' ? 'قطعة' : 'كجم';
+    if (minOrder != null && minOrder > 0 && quantity < minOrder) return { error: `الحد الأدنى للطلب للصنف "${productName}" هو ${minOrder} ${unitLabel}` };
+    if (maxOrder != null && maxOrder > 0 && quantity > maxOrder) return { error: `الحد الأقصى للطلب للصنف "${productName}" هو ${maxOrder} ${unitLabel}` };
+
+    let unitPrice = Number(prod.base_price || 0);
+    let variantTitle: string | undefined;
+    let weightKg: number | undefined;
+    let pieceCount: number | undefined;
+    let variantId: string | undefined;
+
+    if (item.variantId) {
+      variantId = String(item.variantId);
+      const variant = variantMap.get(variantId);
+      if (!variant || String(variant.product_id) !== productId) return { error: mode === 'public' ? `الخيار أو الحجم المختار غير تابع للصنف ${productName}` : `الحجم المختار غير تابع للصنف "${productName}"` };
+      if (!Boolean(variant.is_active)) return { error: mode === 'public' ? `الحجم "${String(variant.title)}" غير متاح حالياً للطلب` : `الحجم "${String(variant.title)}" غير متاح حالياً` };
+      unitPrice = Number(variant.price || 0);
+      variantTitle = String(variant.title);
+      weightKg = variant.weight_kg != null ? Number(variant.weight_kg) : undefined;
+      pieceCount = variant.piece_count != null ? Number(variant.piece_count) : undefined;
+    }
+
+    const totalPrice = Math.round(unitPrice * quantity * 100) / 100;
+    subtotal += totalPrice;
+    const snapshotData = { productId, variantId, productName, variantTitle, pricingUnit, weightKg, pieceCount, unitPrice, quantity, totalPrice };
+    verifiedItems.push({ ...snapshotData, snapshotData });
   }
 
-  const result = orders.map((o) => ({
-    id: o.id,
-    orderNumber: o.order_number,
-    customerId: o.customer_id,
-    customerName: o.customer_name,
-    customerPhone: o.customer_phone,
-    customerAddress: o.customer_address,
-    city: o.city,
-    district: o.district,
-    subtotal: o.subtotal,
-    discountAmount: o.discount_amount,
-    couponCode: o.coupon_code,
-    deliveryFee: o.delivery_fee,
-    totalAmount: o.total_amount,
-    depositAmount: o.deposit_amount,
-    depositStatus: o.deposit_status,
-    depositMethod: o.deposit_method,
-    depositReference: o.deposit_reference,
-    depositNotes: o.deposit_notes,
-    depositConfirmedAt: o.deposit_confirmed_at,
-    depositConfirmedBy: o.deposit_confirmed_by,
-    remainingAmount: o.remaining_amount,
-    status: o.status,
-    notes: o.notes,
-    items: itemsByOrder[String(o.id)] || [],
-    createdAt: o.created_at,
-    updatedAt: o.updated_at,
-  }));
+  return { verifiedItems, subtotal: Math.round(subtotal * 100) / 100 };
+}
 
-  return res.json(result);
+async function validateCouponForSubtotal(
+  rawCode: unknown, subtotal: number
+): Promise<{ error?: string; serviceError?: boolean; couponId?: string | null; cleanCode?: string | null; discountAmount?: number; coupon?: Record<string, unknown> }> {
+  if (!rawCode) return { couponId: null, cleanCode: null, discountAmount: 0 };
+  const cleanCode = String(rawCode).trim().toUpperCase();
+  const { data: coupon, error } = await supabaseServer.from('coupons').select('*').ilike('code', cleanCode).maybeSingle();
+  if (error) return { serviceError: true, error: 'تعذر التحقق من كود الخصم حالياً' };
+  if (!coupon) return { error: `كود الخصم "${cleanCode}" غير صالح أو غير موجود` };
+  if (!coupon.is_active) return { error: `كود الخصم "${cleanCode}" غير مفعّل حالياً` };
+  if (coupon.expiry_date && new Date(String(coupon.expiry_date)) < new Date()) return { error: `كود الخصم "${cleanCode}" منتهي الصلاحية` };
+
+  const minOrderValue = Number(coupon.min_order_value || 0);
+  if (subtotal < minOrderValue) return { error: `الحد الأدنى لاستخدام كود الخصم هو ${minOrderValue} ج.م` };
+  const usageLimit = coupon.usage_limit != null ? Number(coupon.usage_limit) : null;
+  const usedCount = Number(coupon.used_count || 0);
+  if (usageLimit !== null && usedCount >= usageLimit) return { error: `تم استنفاد الحد الأقصى لاستخدام كود الخصم "${cleanCode}"` };
+
+  let discountAmount = 0;
+  if (coupon.discount_type === 'percentage') {
+    discountAmount = Math.round(((subtotal * Number(coupon.discount_value)) / 100) * 100) / 100;
+    if (coupon.max_discount_value != null) discountAmount = Math.min(discountAmount, Number(coupon.max_discount_value));
+  } else {
+    discountAmount = Math.min(subtotal, Number(coupon.discount_value));
+  }
+  return { couponId: String(coupon.id), cleanCode, discountAmount, coupon };
+}
+
+router.get('/admin/orders', requireAuth, async (req: AuthenticatedRequest, res: Response) => {
+  const { status, depositStatus, search } = req.query;
+  let query = supabaseServer.from('orders').select('*');
+  if (status && status !== 'all') query = query.eq('status', String(status));
+  if (depositStatus && depositStatus !== 'all') query = query.eq('deposit_status', String(depositStatus));
+  if (search) {
+    const term = String(search).replace(/[(),]/g, ' ').trim();
+    if (term) query = query.or(`order_number.ilike.%${term}%,customer_name.ilike.%${term}%,customer_phone.ilike.%${term}%,deposit_reference.ilike.%${term}%`);
+  }
+
+  const { data: orders, error } = await query.order('created_at', { ascending: false }).limit(200);
+  if (error) return res.status(503).json({ error: 'تعذر تحميل الطلبات' });
+  if (!orders || orders.length === 0) return res.json([]);
+
+  const { data: items, error: itemsError } = await supabaseServer.from('order_items').select('*').in('order_id', orders.map((o) => String(o.id))).order('created_at', { ascending: true });
+  if (itemsError) return res.status(503).json({ error: 'تعذر تحميل عناصر الطلبات' });
+
+  const byOrder = new Map<string, Record<string, unknown>[]>();
+  for (const item of items || []) {
+    const id = String(item.order_id); const list = byOrder.get(id) || [];
+    list.push(item as Record<string, unknown>); byOrder.set(id, list);
+  }
+  return res.json(orders.map((o) => mapOrderRow(o, byOrder.get(String(o.id)) || [])));
 });
 
-// POST /api/admin/orders (Manual order entry by admin)
-router.post('/admin/orders', requireAuth, (req: AuthenticatedRequest, res: Response) => {
-  const {
-    customerName,
-    customerPhone,
-    customerAddress,
-    city,
-    district,
-    items,
-    depositAmount,
-    depositMethod,
-    depositReference,
-    depositStatus,
-    notes,
-    deliveryFee,
-    couponCode,
-  } = req.body;
+router.post('/admin/orders', requireAuth, async (req: AuthenticatedRequest, res: Response) => {
+  const { customerName, customerPhone, customerAddress, city, district, items, depositAmount, depositMethod, depositReference, depositStatus, notes, deliveryFee, couponCode } = req.body;
+  if (!customerName || !customerPhone || !Array.isArray(items) || items.length === 0) return res.status(400).json({ error: 'اسم العميل، الهاتف، وقائمة الأصناف مطلوبة' });
 
-  if (!customerName || !customerPhone || !items || !Array.isArray(items) || items.length === 0) {
-    return res.status(400).json({ error: 'اسم العميل، الهاتف، وقائمة الأصناف مطلوبة' });
-  }
+  const verification = await verifyOrderItems(items as Array<Record<string, unknown>>, 'admin');
+  if (verification.error) return res.status(verification.serviceError ? 503 : 400).json({ error: verification.error });
+  const subtotal = verification.subtotal!;
 
-  const orderId = `order-${Date.now()}-${crypto.randomBytes(3).toString('hex')}`;
+  const couponResult = await validateCouponForSubtotal(couponCode, subtotal);
+  if (couponResult.error) return res.status(couponResult.serviceError ? 503 : 400).json({ error: couponResult.error });
+
+  const fee = deliveryFee !== undefined ? Number(deliveryFee) : 15;
+  if (!Number.isFinite(fee) || fee < 0) return res.status(400).json({ error: 'سعر التوصيل غير صالح' });
+  const totalAmount = Math.max(0, Math.round((subtotal - (couponResult.discountAmount || 0) + fee) * 100) / 100);
+  const deposit = Number(depositAmount || 0);
+  if (!Number.isFinite(deposit) || deposit < 0 || deposit > totalAmount) return res.status(400).json({ error: 'قيمة العربون غير صالحة' });
+
+  const finalDepositStatus = depositStatus || (deposit > 0 ? 'confirmed' : 'pending');
+  if (!['confirmed', 'pending', 'not_required', 'rejected'].includes(finalDepositStatus)) return res.status(400).json({ error: 'حالة العربون غير صالحة' });
+
   const now = new Date().toISOString();
+  const remainingAmount = Math.max(0, Math.round((totalAmount - deposit) * 100) / 100);
+  const payload = {
+    customerName: String(customerName).trim(), customerPhone: String(customerPhone).trim(), customerAddress: customerAddress || '',
+    city: city || 'القاهرة', district: district || '', subtotal, discountAmount: couponResult.discountAmount || 0,
+    couponCode: couponResult.cleanCode, deliveryFee: fee, totalAmount, depositAmount: deposit, depositStatus: finalDepositStatus,
+    depositMethod: depositMethod || 'instapay', depositReference: depositReference || null, depositNotes: null,
+    depositConfirmedAt: finalDepositStatus === 'confirmed' ? now : null,
+    depositConfirmedBy: finalDepositStatus === 'confirmed' ? req.admin!.name : null,
+    remainingAmount, status: 'pending', notes: notes || null,
+  };
 
-  db.exec('BEGIN TRANSACTION;');
-  try {
-    let subtotal = 0;
-    const processedItems: {
-      productId: string;
-      variantId?: string;
-      productName: string;
-      variantTitle?: string;
-      pricingUnit: string;
-      weightKg?: number;
-      pieceCount?: number;
-      unitPrice: number;
-      quantity: number;
-      totalPrice: number;
-    }[] = [];
-
-    for (const item of items) {
-      const rawQty = item.quantity;
-      const quantity = Number(rawQty);
-      if (isNaN(quantity) || !isFinite(quantity) || quantity <= 0) {
-        db.exec('ROLLBACK;');
-        return res.status(400).json({ error: `كمية غير صالحة للصنف (${item.productName || item.productId})` });
-      }
-
-      // Verify product against DB
-      const prod = db.prepare('SELECT id, name, base_price, pricing_unit, is_active, min_order_quantity, max_order_quantity FROM products WHERE id = ?').get(item.productId) as
-        | { id: string; name: string; base_price: number; pricing_unit: string; is_active: number; min_order_quantity?: number | null; max_order_quantity?: number | null }
-        | undefined;
-
-      if (!prod) {
-        db.exec('ROLLBACK;');
-        return res.status(400).json({ error: `المنتج المحدد غير موجود (${item.productId})` });
-      }
-
-      if (!prod.is_active) {
-        db.exec('ROLLBACK;');
-        return res.status(400).json({ error: `الصنف "${prod.name}" غير متاح حالياً` });
-      }
-
-      if (prod.pricing_unit === 'piece' && !Number.isInteger(quantity)) {
-        db.exec('ROLLBACK;');
-        return res.status(400).json({ error: `الكمية المطلوبة للصنف "${prod.name}" بالقطعة ويجب أن تكون عدداً صحيحاً بدون كسور` });
-      }
-
-      if (prod.pricing_unit !== 'piece' && quantity < 0.05) {
-        db.exec('ROLLBACK;');
-        return res.status(400).json({ error: `أقل كمية/وزن يمكن طلبه للصنف "${prod.name}" هو 0.05 كجم` });
-      }
-
-      if (prod.min_order_quantity != null && prod.min_order_quantity > 0 && quantity < prod.min_order_quantity) {
-        db.exec('ROLLBACK;');
-        const unitLabel = prod.pricing_unit === 'piece' ? 'قطعة' : 'كجم';
-        return res.status(400).json({ error: `الحد الأدنى للطلب للصنف "${prod.name}" هو ${prod.min_order_quantity} ${unitLabel}` });
-      }
-
-      if (prod.max_order_quantity != null && prod.max_order_quantity > 0 && quantity > prod.max_order_quantity) {
-        db.exec('ROLLBACK;');
-        const unitLabel = prod.pricing_unit === 'piece' ? 'قطعة' : 'كجم';
-        return res.status(400).json({ error: `الحد الأقصى للطلب للصنف "${prod.name}" هو ${prod.max_order_quantity} ${unitLabel}` });
-      }
-
-      let unitPrice = prod.base_price;
-      let productName = prod.name;
-      let variantTitle = item.variantTitle;
-      let weightKg = item.weightKg;
-      let pieceCount = item.pieceCount;
-      const pricingUnit = prod.pricing_unit || 'kg';
-
-      if (item.variantId) {
-        const v = db.prepare('SELECT id, title, price, weight_kg, piece_count, is_active FROM product_variants WHERE id = ? AND product_id = ?').get(item.variantId, prod.id) as
-          | { id: string; title: string; price: number; weight_kg: number; piece_count: number; is_active: number }
-          | undefined;
-
-        if (!v) {
-          db.exec('ROLLBACK;');
-          return res.status(400).json({ error: `الحجم المختار غير تابع للصنف "${prod.name}"` });
-        }
-        if (!v.is_active) {
-          db.exec('ROLLBACK;');
-          return res.status(400).json({ error: `الحجم "${v.title}" غير متاح حالياً` });
-        }
-
-        variantTitle = v.title;
-        unitPrice = v.price;
-        weightKg = v.weight_kg;
-        pieceCount = v.piece_count;
-      }
-
-      const itemTotal = Math.round(unitPrice * quantity * 100) / 100;
-      subtotal += itemTotal;
-
-      processedItems.push({
-        productId: item.productId,
-        variantId: item.variantId,
-        productName,
-        variantTitle,
-        pricingUnit,
-        weightKg,
-        pieceCount,
-        unitPrice,
-        quantity,
-        totalPrice: itemTotal,
-      });
-    }
-
-    // Process coupon if provided
-    let discountAmount = 0;
-    if (couponCode) {
-      const cleanCode = String(couponCode).trim().toUpperCase();
-      const coupon = db.prepare('SELECT * FROM coupons WHERE UPPER(code) = ?').get(cleanCode) as Record<string, unknown> | undefined;
-      if (!coupon || !coupon.is_active) {
-        db.exec('ROLLBACK;');
-        return res.status(400).json({ error: `كود الخصم "${cleanCode}" غير صالح أو غير مفعل` });
-      }
-      if (coupon.expiry_date && new Date(String(coupon.expiry_date)) < new Date()) {
-        db.exec('ROLLBACK;');
-        return res.status(400).json({ error: `كود الخصم "${cleanCode}" منتهي الصلاحية` });
-      }
-      if (subtotal < Number(coupon.min_order_value || 0)) {
-        db.exec('ROLLBACK;');
-        return res.status(400).json({ error: `الحد الأدنى لاستخدام الكود هو ${coupon.min_order_value} ج.م` });
-      }
-      if (coupon.usage_limit != null && Number(coupon.used_count || 0) >= Number(coupon.usage_limit)) {
-        db.exec('ROLLBACK;');
-        return res.status(400).json({ error: `تم استنفاد الحد الأقصى لكود الخصم "${cleanCode}"` });
-      }
-
-      if (coupon.discount_type === 'percentage') {
-        discountAmount = Math.round(((subtotal * Number(coupon.discount_value)) / 100) * 100) / 100;
-        if (coupon.max_discount_value) {
-          discountAmount = Math.min(discountAmount, Number(coupon.max_discount_value));
-        }
-      } else {
-        discountAmount = Math.min(subtotal, Number(coupon.discount_value));
-      }
-      db.prepare('UPDATE coupons SET used_count = used_count + 1 WHERE id = ?').run(String(coupon.id));
-    }
-
-    const fee = Number(deliveryFee !== undefined ? deliveryFee : 15);
-    const totalAmount = Math.max(0, Math.round((subtotal - discountAmount + fee) * 100) / 100);
-    const deposit = Number(depositAmount || 0);
-    const finalDepositStatus = depositStatus || (deposit > 0 ? 'confirmed' : 'pending');
-    const remaining = Math.max(0, Math.round((totalAmount - deposit) * 100) / 100);
-
-    // Upsert Customer
-    let customerId: string | null = null;
-    const existingCust = db.prepare('SELECT id, total_orders, total_spent FROM customers WHERE phone = ?').get(customerPhone.trim()) as
-      | { id: string; total_orders: number; total_spent: number }
-      | undefined;
-
-    if (existingCust) {
-      customerId = existingCust.id;
-      db.prepare(`
-        UPDATE customers SET
-          total_orders = total_orders + 1,
-          total_spent = total_spent + ?,
-          last_order_date = ?,
-          name = ?,
-          address = COALESCE(?, address),
-          city = COALESCE(?, city),
-          district = COALESCE(?, district)
-        WHERE id = ?
-      `).run(totalAmount, now, customerName.trim(), customerAddress, city, district, customerId);
-    } else {
-      customerId = `cust-${Date.now()}-${crypto.randomBytes(3).toString('hex')}`;
-      db.prepare(`
-        INSERT INTO customers (id, name, phone, city, district, address, total_orders, total_spent, last_order_date, status, created_at)
-        VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?, 'active', ?)
-      `).run(customerId, customerName.trim(), customerPhone.trim(), city || 'القاهرة', district || '', customerAddress || '', totalAmount, now, now);
-    }
-
-    // Insert Order with atomic collision handling and bounded retries
-    const insertOrderStmt = db.prepare(`
-      INSERT INTO orders (
-        id, order_number, customer_id, customer_name, customer_phone, customer_address,
-        city, district, subtotal, discount_amount, coupon_code, delivery_fee, total_amount,
-        deposit_amount, deposit_status, deposit_method, deposit_reference, deposit_notes,
-        deposit_confirmed_at, deposit_confirmed_by, remaining_amount, status, notes,
-        created_at, updated_at
-      ) VALUES (
-        ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?
-      )
-    `);
-
-    let finalOrderNumber: string | null = null;
-    const maxOrderInsertRetries = 10;
-
-    for (let attempt = 0; attempt < maxOrderInsertRetries; attempt++) {
-      const candidateNumber = generateUniqueOrderNumber(db) || `#ALM-${Math.floor(10000 + Math.random() * 90000)}`;
-      db.exec('SAVEPOINT order_insert_sp;');
-      try {
-        insertOrderStmt.run(
-          orderId,
-          candidateNumber,
-          customerId,
-          customerName.trim(),
-          customerPhone.trim(),
-          customerAddress || '',
-          city || 'القاهرة',
-          district || '',
-          subtotal,
-          discountAmount,
-          couponCode ? String(couponCode).toUpperCase().trim() : null,
-          fee,
-          totalAmount,
-          deposit,
-          finalDepositStatus,
-          depositMethod || 'instapay',
-          depositReference || null,
-          null,
-          finalDepositStatus === 'confirmed' ? now : null,
-          finalDepositStatus === 'confirmed' ? req.admin!.name : null,
-          remaining,
-          notes || null,
-          now,
-          now
-        );
-        db.exec('RELEASE SAVEPOINT order_insert_sp;');
-        finalOrderNumber = candidateNumber;
-        break;
-      } catch (insertErr) {
-        db.exec('ROLLBACK TO SAVEPOINT order_insert_sp;');
-        if (isOrderNumberCollisionError(insertErr)) {
-          // Collision on orders.order_number: retry with a new candidate number
-          continue;
-        }
-        // Non-collision database error: abort and do not retry
-        throw insertErr;
-      }
-    }
-
-    if (!finalOrderNumber) {
-      db.exec('ROLLBACK;');
-      return res.status(500).json({ error: 'تعذر إنشاء رقم فريد للطلب بعد عدة محاولات، يرجى إعادة المحاولة' });
-    }
-
-    // Insert Order Items
-    const insertItem = db.prepare(`
-      INSERT INTO order_items (
-        id, order_id, product_id, variant_id, product_name, variant_title,
-        pricing_unit, weight_kg, piece_count, unit_price, quantity, total_price,
-        snapshot_data, created_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    `);
-
-    for (const pi of processedItems) {
-      const itemId = `item-${Date.now()}-${crypto.randomBytes(3).toString('hex')}`;
-      insertItem.run(
-        itemId,
-        orderId,
-        pi.productId,
-        pi.variantId || null,
-        pi.productName,
-        pi.variantTitle || null,
-        pi.pricingUnit,
-        pi.weightKg || null,
-        pi.pieceCount || null,
-        pi.unitPrice,
-        pi.quantity,
-        pi.totalPrice,
-        JSON.stringify(pi),
-        now
-      );
-    }
-
-    db.exec('COMMIT;');
-
-    const createdOrder = getOrderWithItems(orderId);
-    logAuditAction(req.admin, 'create_manual_order', 'order', orderId, null, { orderNumber: finalOrderNumber, totalAmount }, req.ip);
-    broadcastRealtimeEvent('new_order', createdOrder);
-
-    return res.status(201).json(createdOrder);
-  } catch (err) {
-    db.exec('ROLLBACK;');
-    console.error('Error creating manual order:', err);
-    return res.status(500).json({ error: 'حدث خطأ أثناء حفظ الطلب' });
+  const { data: rpcData, error: rpcError } = await supabaseServer.rpc('create_order_atomic', {
+    p_payload: payload, p_items: verification.verifiedItems, p_coupon_id: couponResult.couponId || null,
+  });
+  if (rpcError) {
+    if (rpcError.message.includes('COUPON_NOT_AVAILABLE')) return res.status(400).json({ error: 'كود الخصم لم يعد متاحاً، يرجى إعادة المحاولة' });
+    console.error('Supabase manual order RPC failed:', rpcError.message);
+    return res.status(503).json({ error: 'حدث خطأ أثناء حفظ الطلب' });
   }
+
+  const rpcOrder = (rpcData as { order?: Record<string, unknown> } | null)?.order;
+  const orderId = rpcOrder?.id ? String(rpcOrder.id) : '';
+  if (!orderId) return res.status(503).json({ error: 'تم إنشاء الطلب لكن تعذر تحميل رقمه' });
+
+  const createdOrder = await getOrderWithItems(orderId);
+  logAuditAction(req.admin, 'create_manual_order', 'order', orderId, null, { orderNumber: createdOrder?.orderNumber, totalAmount }, req.ip);
+  broadcastRealtimeEvent('new_order', createdOrder);
+  return res.status(201).json(createdOrder);
 });
 
-// PUT /api/admin/orders/:id/status
-router.put('/admin/orders/:id/status', requireAuth, (req: AuthenticatedRequest, res: Response) => {
-  const orderId = req.params.id;
-  const { status } = req.body;
-
-  const validStatuses = ['pending', 'preparing', 'delivering', 'completed', 'cancelled'];
-  if (!validStatuses.includes(status)) {
-    return res.status(400).json({ error: 'حالة الطلب غير صالحة' });
-  }
-
-  const existing = getOrderWithItems(orderId);
+router.put('/admin/orders/:id/status', requireAuth, async (req: AuthenticatedRequest, res: Response) => {
+  const orderId = req.params.id; const { status } = req.body;
+  if (!['pending', 'preparing', 'delivering', 'completed', 'cancelled'].includes(status)) return res.status(400).json({ error: 'حالة الطلب غير صالحة' });
+  const existing = await getOrderWithItems(orderId);
   if (!existing) return res.status(404).json({ error: 'الطلب غير موجود' });
 
-  const now = new Date().toISOString();
-  db.prepare('UPDATE orders SET status = ?, updated_at = ? WHERE id = ?').run(status, now, orderId);
+  const { error } = await supabaseServer.from('orders').update({ status, updated_at: new Date().toISOString() }).eq('id', orderId);
+  if (error) return res.status(503).json({ error: 'تعذر تحديث حالة الطلب' });
 
-  const updated = getOrderWithItems(orderId);
+  const updated = await getOrderWithItems(orderId);
   logAuditAction(req.admin, 'update_order_status', 'order', orderId, { oldStatus: existing.status }, { newStatus: status }, req.ip);
   broadcastRealtimeEvent('order_status_updated', updated);
-
   return res.json(updated);
 });
 
-// PUT /api/admin/orders/:id/deposit
-router.put('/admin/orders/:id/deposit', requireAuth, requireRole(['super_admin', 'manager']), (req: AuthenticatedRequest, res: Response) => {
+router.put('/admin/orders/:id/deposit', requireAuth, requireRole(['super_admin', 'manager']), async (req: AuthenticatedRequest, res: Response) => {
   const orderId = req.params.id;
   const { depositStatus, depositAmount, depositMethod, depositReference, depositNotes } = req.body;
-
-  const existing = getOrderWithItems(orderId);
+  const existing = await getOrderWithItems(orderId);
   if (!existing) return res.status(404).json({ error: 'الطلب غير موجود' });
 
-  // Strict validation of depositStatus against supported statuses
-  const allowedDepositStatuses = ['confirmed', 'pending', 'not_required', 'rejected'] as const;
-  if (depositStatus !== undefined) {
-    if (typeof depositStatus !== 'string' || !allowedDepositStatuses.includes(depositStatus as any)) {
-      return res.status(400).json({
-        error: 'حالة العربون غير صالحة. الحالات المسموحة: مؤكد (confirmed)، قيد التحصيل (pending)، غير مطلوب (not_required)، مرفوض (rejected)',
-      });
-    }
+  const allowed = ['confirmed', 'pending', 'not_required', 'rejected'];
+  if (depositStatus !== undefined && (typeof depositStatus !== 'string' || !allowed.includes(depositStatus))) {
+    return res.status(400).json({ error: 'حالة العربون غير صالحة. الحالات المسموحة: مؤكد (confirmed)، قيد التحصيل (pending)، غير مطلوب (not_required)، مرفوض (rejected)' });
   }
 
-  // Strict validation of depositAmount
   let newDepositAmount = existing.depositAmount;
   if (depositAmount !== undefined) {
     const val = parseAndValidateNumber(depositAmount, 'قيمة العربون', { min: 0 });
-    if (!val.valid) {
-      return res.status(400).json({ error: val.error });
-    }
-    const parsedAmount = Math.round(val.value! * 100) / 100;
-    if (parsedAmount > existing.totalAmount) {
-      return res.status(400).json({
-        error: `قيمة العربون (${parsedAmount} ج.م) لا يمكن أن تتجاوز إجمالي الطلب (${existing.totalAmount} ج.م)`,
-      });
-    }
-    newDepositAmount = parsedAmount;
+    if (!val.valid) return res.status(400).json({ error: val.error });
+    const parsed = Math.round(val.value! * 100) / 100;
+    if (parsed > existing.totalAmount) return res.status(400).json({ error: `قيمة العربون (${parsed} ج.م) لا يمكن أن تتجاوز إجمالي الطلب (${existing.totalAmount} ج.م)` });
+    newDepositAmount = parsed;
   }
 
   const now = new Date().toISOString();
   const newRemaining = Math.max(0, Math.round((existing.totalAmount - newDepositAmount) * 100) / 100);
-  const effectiveDepositStatus = depositStatus !== undefined ? depositStatus : existing.depositStatus;
-
-  // Metadata lifecycle rules:
-  // A) depositStatus omitted: preserve existing deposit_confirmed_at / deposit_confirmed_by
-  // B) explicitly changed TO "confirmed": set to current timestamp and current admin
-  // C) explicitly changed FROM "confirmed" to non-confirmed: clear both to NULL
-  // D) explicitly set to "confirmed" when already "confirmed": preserve existing confirmation metadata
+  const effectiveStatus = depositStatus !== undefined ? depositStatus : existing.depositStatus;
   let finalConfirmedAt: string | null = existing.depositConfirmedAt || null;
   let finalConfirmedBy: string | null = existing.depositConfirmedBy || null;
 
   if (depositStatus !== undefined) {
-    if (depositStatus === 'confirmed') {
-      if (existing.depositStatus !== 'confirmed') {
-        // Transition TO confirmed
-        finalConfirmedAt = now;
-        finalConfirmedBy = req.admin!.name;
-      }
-      // If existing.depositStatus === 'confirmed', keep existing finalConfirmedAt and finalConfirmedBy
-    } else {
-      // Any non-confirmed status (pending, not_required, rejected)
-      if (existing.depositStatus === 'confirmed') {
-        // Transition FROM confirmed to non-confirmed
-        finalConfirmedAt = null;
-        finalConfirmedBy = null;
-      }
+    if (depositStatus === 'confirmed' && existing.depositStatus !== 'confirmed') {
+      finalConfirmedAt = now; finalConfirmedBy = req.admin!.name;
+    } else if (depositStatus !== 'confirmed' && existing.depositStatus === 'confirmed') {
+      finalConfirmedAt = null; finalConfirmedBy = null;
     }
   }
 
-  db.prepare(`
-    UPDATE orders SET
-      deposit_status = COALESCE(?, deposit_status),
-      deposit_amount = ?,
-      remaining_amount = ?,
-      deposit_method = COALESCE(?, deposit_method),
-      deposit_reference = COALESCE(?, deposit_reference),
-      deposit_notes = COALESCE(?, deposit_notes),
-      deposit_confirmed_at = ?,
-      deposit_confirmed_by = ?,
-      updated_at = ?
-    WHERE id = ?
-  `).run(
-    depositStatus !== undefined ? depositStatus : null,
-    newDepositAmount,
-    newRemaining,
-    depositMethod !== undefined ? depositMethod : null,
-    depositReference !== undefined ? depositReference : null,
-    depositNotes !== undefined ? depositNotes : null,
-    finalConfirmedAt,
-    finalConfirmedBy,
-    now,
-    orderId
-  );
+  const updates: Record<string, unknown> = {
+    deposit_amount: newDepositAmount, remaining_amount: newRemaining,
+    deposit_confirmed_at: finalConfirmedAt, deposit_confirmed_by: finalConfirmedBy, updated_at: now,
+  };
+  if (depositStatus !== undefined) updates.deposit_status = depositStatus;
+  if (depositMethod !== undefined) updates.deposit_method = depositMethod;
+  if (depositReference !== undefined) updates.deposit_reference = depositReference;
+  if (depositNotes !== undefined) updates.deposit_notes = depositNotes;
 
-  const updated = getOrderWithItems(orderId);
-  logAuditAction(
-    req.admin,
-    'update_order_deposit',
-    'order',
-    orderId,
+  const { error } = await supabaseServer.from('orders').update(updates).eq('id', orderId);
+  if (error) return res.status(503).json({ error: 'تعذر تحديث بيانات العربون' });
+
+  const updated = await getOrderWithItems(orderId);
+  logAuditAction(req.admin, 'update_order_deposit', 'order', orderId,
     { oldDeposit: existing.depositStatus, oldAmount: existing.depositAmount },
-    { newDeposit: effectiveDepositStatus, amount: newDepositAmount },
-    req.ip
-  );
+    { newDeposit: effectiveStatus, amount: newDepositAmount }, req.ip);
   broadcastRealtimeEvent('deposit_updated', updated);
-
   return res.json(updated);
 });
 
-// DELETE /api/admin/orders/:id (Super Admin only)
-router.delete('/admin/orders/:id', requireAuth, requireRole(['super_admin']), (req: AuthenticatedRequest, res: Response) => {
+router.delete('/admin/orders/:id', requireAuth, requireRole(['super_admin']), async (req: AuthenticatedRequest, res: Response) => {
   const orderId = req.params.id;
-  const existing = getOrderWithItems(orderId);
+  const existing = await getOrderWithItems(orderId);
   if (!existing) return res.status(404).json({ error: 'الطلب غير موجود' });
 
-  db.exec('BEGIN TRANSACTION;');
-  try {
-    db.prepare('DELETE FROM order_items WHERE order_id = ?').run(orderId);
-    db.prepare('DELETE FROM orders WHERE id = ?').run(orderId);
-    db.exec('COMMIT;');
+  const { error } = await supabaseServer.from('orders').delete().eq('id', orderId);
+  if (error) return res.status(503).json({ error: 'حدث خطأ أثناء حذف الطلب' });
 
-    logAuditAction(req.admin, 'delete_order', 'order', orderId, { orderNumber: existing.orderNumber }, null, req.ip);
-    broadcastRealtimeEvent('order_deleted', { id: orderId });
-
-    return res.json({ message: 'تم حذف الطلب وعناصره بنجاح' });
-  } catch (err) {
-    db.exec('ROLLBACK;');
-    console.error('Error deleting order:', err);
-    return res.status(500).json({ error: 'حدث خطأ أثناء حذف الطلب' });
-  }
+  logAuditAction(req.admin, 'delete_order', 'order', orderId, { orderNumber: existing.orderNumber }, null, req.ip);
+  broadcastRealtimeEvent('order_deleted', { id: orderId });
+  return res.json({ message: 'تم حذف الطلب وعناصره بنجاح' });
 });
 
 // ==========================================
 // 7. CUSTOMERS
 // ==========================================
-router.get('/admin/customers', requireAuth, (_req: AuthenticatedRequest, res: Response) => {
-  const customers = db
-    .prepare('SELECT * FROM customers ORDER BY total_orders DESC, created_at DESC')
-    .all() as Record<string, unknown>[];
+function mapCustomerRow(c: Record<string, unknown>) {
+  return {
+    id: c.id, name: c.name, email: c.email || '', phone: c.phone, city: c.city || 'القاهرة',
+    district: c.district || '', address: c.address || '', totalOrders: Number(c.total_orders || 0),
+    totalSpent: Number(c.total_spent || 0), lastOrderDate: c.last_order_date, status: c.status || 'active',
+    notes: c.notes || '', registeredAt: c.created_at,
+  };
+}
 
-  return res.json(
-    customers.map((c) => ({
-      id: c.id,
-      name: c.name,
-      email: c.email || '',
-      phone: c.phone,
-      city: c.city || 'القاهرة',
-      district: c.district || '',
-      address: c.address || '',
-      totalOrders: Number(c.total_orders || 0),
-      totalSpent: Number(c.total_spent || 0),
-      lastOrderDate: c.last_order_date,
-      status: c.status || 'active',
-      notes: c.notes || '',
-      registeredAt: c.created_at,
-    }))
-  );
+router.get('/admin/customers', requireAuth, async (_req: AuthenticatedRequest, res: Response) => {
+  const { data, error } = await supabaseServer.from('customers').select('*').order('total_orders', { ascending: false }).order('created_at', { ascending: false });
+  if (error) return res.status(503).json({ error: 'تعذر تحميل العملاء' });
+  return res.json((data || []).map(mapCustomerRow));
 });
 
-router.put('/admin/customers/:id', requireAuth, (req: AuthenticatedRequest, res: Response) => {
-  const customerId = req.params.id;
-  const { name, phone, city, district, address, status, notes } = req.body;
+router.put('/admin/customers/:id', requireAuth, async (req: AuthenticatedRequest, res: Response) => {
+  const customerId = req.params.id; const { name, phone, city, district, address, status, notes } = req.body;
+  const updates: Record<string, unknown> = {};
+  if (name !== undefined) updates.name = name; if (phone !== undefined) updates.phone = phone;
+  if (city !== undefined) updates.city = city; if (district !== undefined) updates.district = district;
+  if (address !== undefined) updates.address = address; if (status !== undefined) updates.status = status;
+  if (notes !== undefined) updates.notes = notes;
 
-  db.prepare(`
-    UPDATE customers SET
-      name = COALESCE(?, name),
-      phone = COALESCE(?, phone),
-      city = COALESCE(?, city),
-      district = COALESCE(?, district),
-      address = COALESCE(?, address),
-      status = COALESCE(?, status),
-      notes = COALESCE(?, notes)
-    WHERE id = ?
-  `).run(
-    name ?? null,
-    phone ?? null,
-    city ?? null,
-    district ?? null,
-    address ?? null,
-    status ?? null,
-    notes ?? null,
-    customerId
-  );
+  const { data: updated, error } = await supabaseServer.from('customers').update(updates).eq('id', customerId).select('*').maybeSingle();
+  if (error) return res.status(error.code === '23505' ? 409 : 503).json({ error: error.code === '23505' ? 'رقم الهاتف مستخدم لعميل آخر' : 'تعذر تحديث العميل' });
+  if (!updated) return res.status(404).json({ error: 'العميل غير موجود' });
 
-  const updated = db.prepare('SELECT * FROM customers WHERE id = ?').get(customerId);
   logAuditAction(req.admin, 'update_customer', 'customer', customerId, null, updated, req.ip);
   broadcastRealtimeEvent('customer_updated', updated);
-
   return res.json(updated);
 });
 
-router.post('/admin/customers', requireAuth, (req: AuthenticatedRequest, res: Response) => {
+router.post('/admin/customers', requireAuth, async (req: AuthenticatedRequest, res: Response) => {
   const { name, phone, email, city, district, address, notes, status } = req.body;
-  if (!name || !phone) {
-    return res.status(400).json({ error: 'اسم العميل ورقم الهاتف مطلوبان' });
-  }
+  if (!name || !phone) return res.status(400).json({ error: 'اسم العميل ورقم الهاتف مطلوبان' });
+  const cleanPhone = String(phone).trim();
 
-  const existing = db.prepare('SELECT id FROM customers WHERE phone = ?').get(phone.trim());
-  if (existing) {
-    return res.status(400).json({ error: 'يوجد عميل مسجل بالفعل بهذا الهاتف' });
-  }
+  const { data: existing, error: lookupError } = await supabaseServer.from('customers').select('id').eq('phone', cleanPhone).maybeSingle();
+  if (lookupError) return res.status(503).json({ error: 'تعذر التحقق من العميل' });
+  if (existing) return res.status(400).json({ error: 'يوجد عميل مسجل بالفعل بهذا الهاتف' });
 
-  const id = `cust-${Date.now()}-${crypto.randomBytes(2).toString('hex')}`;
-  const now = new Date().toISOString();
+  const id = `cust-${Date.now()}-${crypto.randomBytes(2).toString('hex')}`; const now = new Date().toISOString();
+  const { error } = await supabaseServer.from('customers').insert({
+    id, name: String(name).trim(), email: email?.trim() || null, phone: cleanPhone,
+    city: city || 'القاهرة', district: district || '', address: address || '',
+    total_orders: 0, total_spent: 0, status: status || 'active', notes: notes || null, created_at: now,
+  });
+  if (error) return res.status(error.code === '23505' ? 409 : 503).json({ error: error.code === '23505' ? 'يوجد عميل مسجل بالفعل بهذا الهاتف' : 'تعذر إنشاء العميل' });
 
-  db.prepare(`
-    INSERT INTO customers (id, name, email, phone, city, district, address, total_orders, total_spent, status, notes, created_at)
-    VALUES (?, ?, ?, ?, ?, ?, ?, 0, 0, ?, ?, ?)
-  `).run(
-    id,
-    name.trim(),
-    email?.trim() || null,
-    phone.trim(),
-    city || 'القاهرة',
-    district || '',
-    address || '',
-    status || 'active',
-    notes || null,
-    now
-  );
-
-  const created = {
-    id,
-    name: name.trim(),
-    email: email?.trim() || '',
-    phone: phone.trim(),
-    city: city || 'القاهرة',
-    district: district || '',
-    address: address || '',
-    totalOrders: 0,
-    totalSpent: 0,
-    status: status || 'active',
-    notes: notes || '',
-    registeredAt: now,
-  };
-
+  const created = { id, name: String(name).trim(), email: email?.trim() || '', phone: cleanPhone, city: city || 'القاهرة',
+    district: district || '', address: address || '', totalOrders: 0, totalSpent: 0, status: status || 'active',
+    notes: notes || '', registeredAt: now };
   logAuditAction(req.admin, 'create_customer', 'customer', id, null, created, req.ip);
   broadcastRealtimeEvent('customer_created', created);
   return res.status(201).json(created);
 });
 
-router.delete('/admin/customers/:id', requireAuth, requireRole(['super_admin', 'manager']), (req: AuthenticatedRequest, res: Response) => {
+router.delete('/admin/customers/:id', requireAuth, requireRole(['super_admin', 'manager']), async (req: AuthenticatedRequest, res: Response) => {
   const id = req.params.id;
-  const existing = db.prepare('SELECT * FROM customers WHERE id = ?').get(id) as Record<string, unknown> | undefined;
+  const { data: existing, error: lookupError } = await supabaseServer.from('customers').select('*').eq('id', id).maybeSingle();
+  if (lookupError) return res.status(503).json({ error: 'تعذر تحميل العميل' });
   if (!existing) return res.status(404).json({ error: 'العميل غير موجود' });
 
-  // Check if customer has orders
-  const ordersCountRow = db.prepare('SELECT COUNT(*) as c FROM orders WHERE customer_id = ?').get(id) as { c: number };
-  const hasOrders = (ordersCountRow?.c || 0) > 0;
+  const { count, error: countError } = await supabaseServer.from('orders').select('id', { count: 'exact', head: true }).eq('customer_id', id);
+  if (countError) return res.status(503).json({ error: 'تعذر التحقق من طلبات العميل' });
 
-  if (hasOrders) {
-    // Soft-delete to preserve order history safely
-    db.prepare("UPDATE customers SET status = 'blocked', notes = COALESCE(notes || ' | ', '') || 'تم أرشفة/حظر العميل بواسطة الإدارة' WHERE id = ?").run(id);
-    const archivedCust = db.prepare('SELECT * FROM customers WHERE id = ?').get(id);
+  if ((count || 0) > 0) {
+    const archiveNote = existing.notes ? `${existing.notes} | تم أرشفة/حظر العميل بواسطة الإدارة` : 'تم أرشفة/حظر العميل بواسطة الإدارة';
+    const { data: archived, error } = await supabaseServer.from('customers').update({ status: 'blocked', notes: archiveNote }).eq('id', id).select('*').single();
+    if (error) return res.status(503).json({ error: 'تعذر أرشفة العميل' });
     logAuditAction(req.admin, 'archive_customer', 'customer', id, existing, { status: 'blocked', archived: true }, req.ip);
-    broadcastRealtimeEvent('customer_updated', archivedCust);
+    broadcastRealtimeEvent('customer_updated', archived);
     return res.json({ message: 'تم أرشفة وحظر العميل وحفظ سجل طلباته بنجاح' });
-  } else {
-    // Safe hard-delete if no orders exist
-    db.prepare('DELETE FROM customers WHERE id = ?').run(id);
-    logAuditAction(req.admin, 'delete_customer', 'customer', id, existing, null, req.ip);
-    broadcastRealtimeEvent('customer_deleted', { id });
-    return res.json({ message: 'تم حذف العميل بنجاح' });
   }
+
+  const { error } = await supabaseServer.from('customers').delete().eq('id', id);
+  if (error) return res.status(503).json({ error: 'تعذر حذف العميل' });
+  logAuditAction(req.admin, 'delete_customer', 'customer', id, existing, null, req.ip);
+  broadcastRealtimeEvent('customer_deleted', { id });
+  return res.json({ message: 'تم حذف العميل بنجاح' });
 });
 
 // ==========================================
 // 8. COUPONS
 // ==========================================
-router.get('/admin/coupons', requireAuth, (_req: AuthenticatedRequest, res: Response) => {
-  const coupons = db.prepare('SELECT * FROM coupons ORDER BY created_at DESC').all() as Record<string, unknown>[];
-  return res.json(
-    coupons.map((c) => ({
-      id: c.id,
-      code: c.code,
-      discountType: c.discount_type,
-      discountValue: c.discount_value,
-      minOrderValue: c.min_order_value,
-      maxDiscountValue: c.max_discount_value,
-      usageLimit: c.usage_limit,
-      usedCount: c.used_count,
-      expiryDate: c.expiry_date,
-      isActive: Boolean(c.is_active),
-      createdAt: c.created_at,
-    }))
-  );
+function mapCouponRow(c: Record<string, unknown>) {
+  return {
+    id: c.id, code: c.code, discountType: c.discount_type, discountValue: Number(c.discount_value || 0),
+    minOrderValue: Number(c.min_order_value || 0), maxDiscountValue: c.max_discount_value != null ? Number(c.max_discount_value) : undefined,
+    usageLimit: Number(c.usage_limit || 100), usedCount: Number(c.used_count || 0), expiryDate: c.expiry_date,
+    isActive: Boolean(c.is_active), createdAt: c.created_at,
+  };
+}
+
+router.get('/admin/coupons', requireAuth, async (_req: AuthenticatedRequest, res: Response) => {
+  const { data, error } = await supabaseServer.from('coupons').select('*').order('created_at', { ascending: false });
+  if (error) return res.status(503).json({ error: 'تعذر تحميل الكوبونات' });
+  return res.json((data || []).map(mapCouponRow));
 });
 
-router.post('/admin/coupons', requireAuth, requireRole(['super_admin', 'manager']), (req: AuthenticatedRequest, res: Response) => {
+router.post('/admin/coupons', requireAuth, requireRole(['super_admin', 'manager']), async (req: AuthenticatedRequest, res: Response) => {
   const { code, discountType, discountValue, minOrderValue, maxDiscountValue, usageLimit, expiryDate } = req.body;
-  if (!code || !discountType || discountValue === undefined || !expiryDate) {
-    return res.status(400).json({ error: 'كود الكوبون، نوع الخصم، القيمة وتاريخ الانتهاء مطلوبة' });
-  }
+  if (!code || !discountType || discountValue === undefined || !expiryDate) return res.status(400).json({ error: 'كود الكوبون، نوع الخصم، القيمة وتاريخ الانتهاء مطلوبة' });
+  if (discountType !== 'percentage' && discountType !== 'fixed') return res.status(400).json({ error: 'نوع الخصم يجب أن يكون إما نسبة مئوية (percentage) أو قيمة ثابتة (fixed)' });
 
-  if (discountType !== 'percentage' && discountType !== 'fixed') {
-    return res.status(400).json({ error: 'نوع الخصم يجب أن يكون إما نسبة مئوية (percentage) أو قيمة ثابتة (fixed)' });
-  }
+  const dVal = parseAndValidateNumber(discountValue, 'قيمة الخصم', { min: 0, max: discountType === 'percentage' ? 100 : undefined });
+  if (!dVal.valid) return res.status(400).json({ error: dVal.error });
+  const minVal = parseAndValidateNumber(minOrderValue !== undefined ? minOrderValue : 0, 'الحد الأدنى للطلب', { min: 0 });
+  if (!minVal.valid) return res.status(400).json({ error: minVal.error });
 
-  const dValCheck = parseAndValidateNumber(discountValue, 'قيمة الخصم', {
-    min: 0,
-    max: discountType === 'percentage' ? 100 : undefined,
-  });
-  if (!dValCheck.valid) {
-    return res.status(400).json({ error: dValCheck.error });
-  }
-
-  const minOrderCheck = parseAndValidateNumber(minOrderValue !== undefined ? minOrderValue : 0, 'الحد الأدنى للطلب', { min: 0 });
-  if (!minOrderCheck.valid) {
-    return res.status(400).json({ error: minOrderCheck.error });
-  }
-
-  let parsedMaxDiscount: number | null = null;
+  let maxDiscount: number | null = null;
   if (maxDiscountValue !== undefined && maxDiscountValue !== null && maxDiscountValue !== '') {
-    const maxDiscCheck = parseAndValidateNumber(maxDiscountValue, 'الحد الأقصى للخصم', { min: 0 });
-    if (!maxDiscCheck.valid) {
-      return res.status(400).json({ error: maxDiscCheck.error });
-    }
-    parsedMaxDiscount = maxDiscCheck.value!;
+    const v = parseAndValidateNumber(maxDiscountValue, 'الحد الأقصى للخصم', { min: 0 });
+    if (!v.valid) return res.status(400).json({ error: v.error }); maxDiscount = v.value!;
   }
-
-  const usageLimitCheck = parseAndValidateNumber(usageLimit !== undefined ? usageLimit : 100, 'حد الاستخدام', {
-    min: 1,
-    integerOnly: true,
-  });
-  if (!usageLimitCheck.valid) {
-    return res.status(400).json({ error: usageLimitCheck.error });
-  }
+  const usage = parseAndValidateNumber(usageLimit !== undefined ? usageLimit : 100, 'حد الاستخدام', { min: 1, integerOnly: true });
+  if (!usage.valid) return res.status(400).json({ error: usage.error });
 
   const id = `cpn-${Date.now()}-${crypto.randomBytes(2).toString('hex')}`;
-  const cleanCode = String(code).toUpperCase().trim();
+  const { data: createdRow, error } = await supabaseServer.from('coupons').insert({
+    id, code: String(code).toUpperCase().trim(), discount_type: discountType, discount_value: dVal.value!,
+    min_order_value: minVal.value!, max_discount_value: maxDiscount, usage_limit: usage.value!,
+    used_count: 0, expiry_date: expiryDate, is_active: true, created_at: new Date().toISOString(),
+  }).select('*').single();
 
-  db.prepare(`
-    INSERT INTO coupons (id, code, discount_type, discount_value, min_order_value, max_discount_value, usage_limit, used_count, expiry_date, is_active, created_at)
-    VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?, 1, ?)
-  `).run(
-    id,
-    cleanCode,
-    discountType,
-    dValCheck.value!,
-    minOrderCheck.value!,
-    parsedMaxDiscount,
-    usageLimitCheck.value!,
-    expiryDate,
-    new Date().toISOString()
-  );
-
-  const created = {
-    id,
-    code: cleanCode,
-    discountType,
-    discountValue: dValCheck.value!,
-    minOrderValue: minOrderCheck.value!,
-    maxDiscountValue: parsedMaxDiscount,
-    usageLimit: usageLimitCheck.value!,
-    usedCount: 0,
-    expiryDate,
-    isActive: true,
-  };
+  if (error) return res.status(error.code === '23505' ? 409 : 503).json({ error: error.code === '23505' ? 'كود الكوبون مستخدم بالفعل' : 'تعذر إنشاء الكوبون' });
+  const created = mapCouponRow(createdRow);
   logAuditAction(req.admin, 'create_coupon', 'coupon', id, null, created, req.ip);
   broadcastRealtimeEvent('coupon_created', created);
-
   return res.status(201).json(created);
 });
 
-router.put('/admin/coupons/:id', requireAuth, requireRole(['super_admin', 'manager']), (req: AuthenticatedRequest, res: Response) => {
-  const id = req.params.id;
-  const { code, discountType, discountValue, minOrderValue, maxDiscountValue, usageLimit, expiryDate, isActive } = req.body;
-
-  const existing = db.prepare('SELECT * FROM coupons WHERE id = ?').get(id) as Record<string, unknown> | undefined;
+router.put('/admin/coupons/:id', requireAuth, requireRole(['super_admin', 'manager']), async (req: AuthenticatedRequest, res: Response) => {
+  const id = req.params.id; const { code, discountType, discountValue, minOrderValue, maxDiscountValue, usageLimit, expiryDate, isActive } = req.body;
+  const { data: existing, error: lookupError } = await supabaseServer.from('coupons').select('*').eq('id', id).maybeSingle();
+  if (lookupError) return res.status(503).json({ error: 'تعذر تحميل الكوبون' });
   if (!existing) return res.status(404).json({ error: 'الكوبون غير موجود' });
-
-  if (discountType !== undefined && discountType !== 'percentage' && discountType !== 'fixed') {
-    return res.status(400).json({ error: 'نوع الخصم يجب أن يكون إما نسبة مئوية (percentage) أو قيمة ثابتة (fixed)' });
-  }
+  if (discountType !== undefined && discountType !== 'percentage' && discountType !== 'fixed') return res.status(400).json({ error: 'نوع الخصم يجب أن يكون إما نسبة مئوية (percentage) أو قيمة ثابتة (fixed)' });
 
   const effectiveType = discountType !== undefined ? discountType : String(existing.discount_type);
-
-  let parsedDiscountValue: number | null = null;
+  const updates: Record<string, unknown> = {};
+  if (code !== undefined) updates.code = String(code).toUpperCase().trim();
+  if (discountType !== undefined) updates.discount_type = discountType;
   if (discountValue !== undefined) {
-    const dValCheck = parseAndValidateNumber(discountValue, 'قيمة الخصم', {
-      min: 0,
-      max: effectiveType === 'percentage' ? 100 : undefined,
-    });
-    if (!dValCheck.valid) {
-      return res.status(400).json({ error: dValCheck.error });
-    }
-    parsedDiscountValue = dValCheck.value!;
+    const v = parseAndValidateNumber(discountValue, 'قيمة الخصم', { min: 0, max: effectiveType === 'percentage' ? 100 : undefined });
+    if (!v.valid) return res.status(400).json({ error: v.error }); updates.discount_value = v.value!;
   }
-
-  let parsedMinOrderValue: number | null = null;
   if (minOrderValue !== undefined) {
-    const minOrderCheck = parseAndValidateNumber(minOrderValue, 'الحد الأدنى للطلب', { min: 0 });
-    if (!minOrderCheck.valid) {
-      return res.status(400).json({ error: minOrderCheck.error });
-    }
-    parsedMinOrderValue = minOrderCheck.value!;
+    const v = parseAndValidateNumber(minOrderValue, 'الحد الأدنى للطلب', { min: 0 });
+    if (!v.valid) return res.status(400).json({ error: v.error }); updates.min_order_value = v.value!;
   }
-
-  let parsedMaxDiscountValue: number | null | undefined = undefined;
   if (maxDiscountValue !== undefined) {
-    if (maxDiscountValue === null || maxDiscountValue === '') {
-      parsedMaxDiscountValue = null;
-    } else {
-      const maxDiscCheck = parseAndValidateNumber(maxDiscountValue, 'الحد الأقصى للخصم', { min: 0 });
-      if (!maxDiscCheck.valid) {
-        return res.status(400).json({ error: maxDiscCheck.error });
-      }
-      parsedMaxDiscountValue = maxDiscCheck.value!;
-    }
+    if (maxDiscountValue === null || maxDiscountValue === '') updates.max_discount_value = null;
+    else { const v = parseAndValidateNumber(maxDiscountValue, 'الحد الأقصى للخصم', { min: 0 }); if (!v.valid) return res.status(400).json({ error: v.error }); updates.max_discount_value = v.value!; }
   }
-
-  let parsedUsageLimit: number | null = null;
   if (usageLimit !== undefined) {
-    const usageCheck = parseAndValidateNumber(usageLimit, 'حد الاستخدام', { min: 1, integerOnly: true });
-    if (!usageCheck.valid) {
-      return res.status(400).json({ error: usageCheck.error });
-    }
-    parsedUsageLimit = usageCheck.value!;
+    const v = parseAndValidateNumber(usageLimit, 'حد الاستخدام', { min: 1, integerOnly: true });
+    if (!v.valid) return res.status(400).json({ error: v.error }); updates.usage_limit = v.value!;
   }
+  if (expiryDate !== undefined) updates.expiry_date = expiryDate;
+  if (isActive !== undefined) updates.is_active = Boolean(isActive);
 
-  const cleanCode = code ? String(code).toUpperCase().trim() : String(existing.code);
-
-  db.prepare(`
-    UPDATE coupons SET
-      code = COALESCE(?, code),
-      discount_type = COALESCE(?, discount_type),
-      discount_value = COALESCE(?, discount_value),
-      min_order_value = COALESCE(?, min_order_value),
-      max_discount_value = CASE WHEN ? = 1 THEN ? ELSE max_discount_value END,
-      usage_limit = COALESCE(?, usage_limit),
-      expiry_date = COALESCE(?, expiry_date),
-      is_active = COALESCE(?, is_active)
-    WHERE id = ?
-  `).run(
-    cleanCode,
-    discountType ?? null,
-    parsedDiscountValue,
-    parsedMinOrderValue,
-    parsedMaxDiscountValue !== undefined ? 1 : 0,
-    parsedMaxDiscountValue !== undefined ? parsedMaxDiscountValue : null,
-    parsedUsageLimit,
-    expiryDate ?? null,
-    isActive !== undefined ? (isActive ? 1 : 0) : null,
-    id
-  );
-
-  const updated = db.prepare('SELECT * FROM coupons WHERE id = ?').get(id) as Record<string, unknown>;
-  const result = {
-    id: updated.id,
-    code: updated.code,
-    discountType: updated.discount_type,
-    discountValue: Number(updated.discount_value),
-    minOrderValue: Number(updated.min_order_value || 0),
-    maxDiscountValue: updated.max_discount_value ? Number(updated.max_discount_value) : undefined,
-    usageLimit: Number(updated.usage_limit || 100),
-    usedCount: Number(updated.used_count || 0),
-    expiryDate: updated.expiry_date,
-    isActive: Boolean(updated.is_active),
-    createdAt: updated.created_at,
-  };
-
+  const { data: updated, error } = await supabaseServer.from('coupons').update(updates).eq('id', id).select('*').single();
+  if (error) return res.status(error.code === '23505' ? 409 : 503).json({ error: error.code === '23505' ? 'كود الكوبون مستخدم بالفعل' : 'تعذر تحديث الكوبون' });
+  const result = mapCouponRow(updated);
   logAuditAction(req.admin, 'update_coupon', 'coupon', id, existing, result, req.ip);
   broadcastRealtimeEvent('coupon_updated', result);
   return res.json(result);
 });
 
-router.delete('/admin/coupons/:id', requireAuth, requireRole(['super_admin', 'manager']), (req: AuthenticatedRequest, res: Response) => {
-  const id = req.params.id;
-  db.prepare('DELETE FROM coupons WHERE id = ?').run(id);
+router.delete('/admin/coupons/:id', requireAuth, requireRole(['super_admin', 'manager']), async (req: AuthenticatedRequest, res: Response) => {
+  const id = req.params.id; const { error } = await supabaseServer.from('coupons').delete().eq('id', id);
+  if (error) return res.status(503).json({ error: 'تعذر حذف الكوبون' });
   logAuditAction(req.admin, 'delete_coupon', 'coupon', id, null, null, req.ip);
   broadcastRealtimeEvent('coupon_deleted', { id });
   return res.json({ message: 'تم حذف الكوبون' });
@@ -2572,786 +1998,236 @@ router.get('/admin/audit-logs', requireAuth, requireRole(['super_admin', 'manage
 });
 
 // ==========================================
-// 11. ORDER DEMAND & REQUIRED QUANTITIES
-// (Stock system removed - calculations are derived strictly from active orders)
+// 11. ORDER DEMAND & REQUIRED QUANTITIES — SUPABASE
 // ==========================================
-router.get('/admin/order-demand', requireAuth, (_req: AuthenticatedRequest, res: Response) => {
-  const products = db.prepare(`
-    SELECT p.id, p.name, p.pricing_unit, c.name as category_name
-    FROM products p
-    LEFT JOIN categories c ON p.category_id = c.id
-    WHERE p.is_active = 1
-    ORDER BY p.name ASC
-  `).all() as Record<string, unknown>[];
-
-  const variants = db.prepare('SELECT * FROM product_variants WHERE is_active = 1 ORDER BY weight_kg ASC, piece_count ASC').all() as Record<string, unknown>[];
-
+router.get('/admin/order-demand', requireAuth, async (_req: AuthenticatedRequest, res: Response) => {
+  const [productsResult, variantsResult, categoriesResult] = await Promise.all([
+    supabaseServer.from('products').select('id,name,pricing_unit,category_id').eq('is_active', true).order('name', { ascending: true }),
+    supabaseServer.from('product_variants').select('*').eq('is_active', true).order('weight_kg', { ascending: true }).order('piece_count', { ascending: true }),
+    supabaseServer.from('categories').select('id,name'),
+  ]);
+  const failed = [productsResult, variantsResult, categoriesResult].find((r) => r.error);
+  if (failed?.error) return res.status(503).json({ error: 'تعذر تحميل احتياجات الطلبات' });
+  const categoryNames = new Map((categoriesResult.data || []).map((c) => [String(c.id), String(c.name)]));
   return res.json({
-    products: products.map((p) => ({
-      id: p.id,
-      name: p.name,
-      categoryName: p.category_name,
-      pricingUnit: p.pricing_unit,
-    })),
-    variants: variants.map((v) => ({
-      id: v.id,
-      productId: v.product_id,
-      title: v.title,
-      weightKg: v.weight_kg,
-      pieceCount: v.piece_count,
-      approxPieceWeightG: v.approx_piece_weight_g,
-      price: v.price,
-      isActive: Boolean(v.is_active),
-    })),
+    products: (productsResult.data || []).map((p) => ({ id: p.id, name: p.name, categoryName: categoryNames.get(String(p.category_id || '')) || '', pricingUnit: p.pricing_unit })),
+    variants: (variantsResult.data || []).map((v) => ({ id: v.id, productId: v.product_id, title: v.title, weightKg: v.weight_kg, pieceCount: v.piece_count, approxPieceWeightG: v.approx_piece_weight_g, price: v.price, isActive: Boolean(v.is_active) })),
   });
 });
 
 // ==========================================
 // 11.5. SECURE CUSTOMER APP INTEGRATION API
-// Server-to-server only. The integration key must never reach the browser.
 // ==========================================
-
 function requireIntegrationKey(req: Request, res: Response, next: express.NextFunction) {
-  const configuredKey = process.env.CUSTOMER_APP_INTEGRATION_KEY;
-  const providedKey = req.header('X-Integration-Key');
-
-  // Fail closed when the server secret has not been configured.
-  if (!configuredKey) {
-    return res.status(503).json({ error: 'Integration service is not configured' });
-  }
-
-  if (!providedKey) {
-    return res.status(401).json({ error: 'Unauthorized integration request' });
-  }
-
-  const expected = Buffer.from(configuredKey, 'utf8');
-  const received = Buffer.from(providedKey, 'utf8');
-
-  if (expected.length !== received.length || !crypto.timingSafeEqual(expected, received)) {
-    return res.status(401).json({ error: 'Unauthorized integration request' });
-  }
-
+  const configuredKey = process.env.CUSTOMER_APP_INTEGRATION_KEY; const providedKey = req.header('X-Integration-Key');
+  if (!configuredKey) return res.status(503).json({ error: 'Integration service is not configured' });
+  if (!providedKey) return res.status(401).json({ error: 'Unauthorized integration request' });
+  const expected = Buffer.from(configuredKey, 'utf8'); const received = Buffer.from(providedKey, 'utf8');
+  if (expected.length !== received.length || !crypto.timingSafeEqual(expected, received)) return res.status(401).json({ error: 'Unauthorized integration request' });
   next();
 }
 
 function normalizeIntegrationPhone(value: unknown): string {
-  if (typeof value !== 'string') return '';
-  return value.trim().replace(/[^0-9+]/g, '');
+  if (typeof value !== 'string') return ''; return value.trim().replace(/[^0-9+]/g, '');
 }
 
-function mapIntegrationOrder(order: Record<string, unknown>) {
-  const items = db
-    .prepare(`
-      SELECT *
-      FROM order_items
-      WHERE order_id = ?
-      ORDER BY created_at ASC
-    `)
-    .all(String(order.id)) as Record<string, unknown>[];
-
+function mapIntegrationOrder(order: Record<string, unknown>, items: Record<string, unknown>[]) {
   return {
-    id: order.id,
-    orderNumber: order.order_number,
-    customerId: order.customer_id || undefined,
-    customerName: order.customer_name,
-    customerPhone: order.customer_phone,
-    customerAddress: order.customer_address,
-    city: order.city || '',
-    district: order.district || '',
-    subtotal: Number(order.subtotal || 0),
-    discountAmount: Number(order.discount_amount || 0),
-    couponCode: order.coupon_code || undefined,
-    deliveryFee: Number(order.delivery_fee || 0),
-    totalAmount: Number(order.total_amount || 0),
-    depositAmount: Number(order.deposit_amount || 0),
-    depositStatus: order.deposit_status,
-    depositMethod: order.deposit_method || undefined,
-    depositReference: order.deposit_reference || undefined,
-    remainingAmount: Number(order.remaining_amount || 0),
-    status: order.status,
-    notes: order.notes || '',
-    createdAt: order.created_at,
-    updatedAt: order.updated_at,
+    id: order.id, orderNumber: order.order_number, customerId: order.customer_id || undefined,
+    customerName: order.customer_name, customerPhone: order.customer_phone, customerAddress: order.customer_address,
+    city: order.city || '', district: order.district || '', subtotal: Number(order.subtotal || 0),
+    discountAmount: Number(order.discount_amount || 0), couponCode: order.coupon_code || undefined,
+    deliveryFee: Number(order.delivery_fee || 0), totalAmount: Number(order.total_amount || 0),
+    depositAmount: Number(order.deposit_amount || 0), depositStatus: order.deposit_status,
+    depositMethod: order.deposit_method || undefined, depositReference: order.deposit_reference || undefined,
+    remainingAmount: Number(order.remaining_amount || 0), status: order.status, notes: order.notes || '',
+    createdAt: order.created_at, updatedAt: order.updated_at,
     items: items.map((item) => ({
-      id: item.id,
-      productId: item.product_id,
-      variantId: item.variant_id || undefined,
-      productName: item.product_name,
-      variantTitle: item.variant_title || undefined,
-      pricingUnit: item.pricing_unit,
+      id: item.id, productId: item.product_id, variantId: item.variant_id || undefined,
+      productName: item.product_name, variantTitle: item.variant_title || undefined, pricingUnit: item.pricing_unit,
       weightKg: item.weight_kg != null ? Number(item.weight_kg) : undefined,
       pieceCount: item.piece_count != null ? Number(item.piece_count) : undefined,
-      unitPrice: Number(item.unit_price || 0),
-      quantity: Number(item.quantity || 0),
-      totalPrice: Number(item.total_price || 0),
+      unitPrice: Number(item.unit_price || 0), quantity: Number(item.quantity || 0), totalPrice: Number(item.total_price || 0),
     })),
   };
 }
 
-// Validate a coupon without consuming it.
-// Coupon usage is incremented only by the authoritative order-creation transaction.
-router.post('/integration/coupons/validate', requireIntegrationKey, (req: Request, res: Response) => {
-  const rawCode = req.body?.code;
-  const subtotalCheck = parseAndValidateNumber(req.body?.subtotal, 'subtotal', { min: 0 });
-
-  if (typeof rawCode !== 'string' || !rawCode.trim()) {
-    return res.status(400).json({ valid: false, error: 'Coupon code is required' });
-  }
-
-  if (!subtotalCheck.valid || subtotalCheck.value === undefined) {
-    return res.status(400).json({ valid: false, error: 'Invalid subtotal' });
-  }
+router.post('/integration/coupons/validate', requireIntegrationKey, async (req: Request, res: Response) => {
+  const rawCode = req.body?.code; const subtotalCheck = parseAndValidateNumber(req.body?.subtotal, 'subtotal', { min: 0 });
+  if (typeof rawCode !== 'string' || !rawCode.trim()) return res.status(400).json({ valid: false, error: 'Coupon code is required' });
+  if (!subtotalCheck.valid || subtotalCheck.value === undefined) return res.status(400).json({ valid: false, error: 'Invalid subtotal' });
 
   const cleanCode = rawCode.trim().toUpperCase();
-  const subtotal = subtotalCheck.value;
+  const { data: coupon, error } = await supabaseServer.from('coupons').select('*').ilike('code', cleanCode).maybeSingle();
+  if (error) return res.status(503).json({ valid: false, error: 'Coupon service unavailable' });
+  if (!coupon) return res.status(400).json({ valid: false, error: `كود الخصم "${cleanCode}" غير صالح أو غير موجود` });
+  if (!coupon.is_active) return res.status(400).json({ valid: false, error: `كود الخصم "${cleanCode}" غير مفعّل حالياً` });
+  if (coupon.expiry_date && new Date(String(coupon.expiry_date)) < new Date()) return res.status(400).json({ valid: false, error: `كود الخصم "${cleanCode}" منتهي الصلاحية` });
 
-  // Keep this validation aligned with POST /api/orders.
-  const coupon = db
-    .prepare('SELECT * FROM coupons WHERE UPPER(code) = ?')
-    .get(cleanCode) as Record<string, unknown> | undefined;
+  const subtotal = subtotalCheck.value; const minOrderValue = Number(coupon.min_order_value || 0);
+  if (subtotal < minOrderValue) return res.status(400).json({ valid: false, error: `الحد الأدنى لاستخدام كود الخصم "${cleanCode}" هو ${minOrderValue} ج.م` });
+  const usageLimit = coupon.usage_limit != null ? Number(coupon.usage_limit) : null; const usedCount = Number(coupon.used_count || 0);
+  if (usageLimit !== null && usedCount >= usageLimit) return res.status(400).json({ valid: false, error: `تم استنفاد الحد الأقصى لاستخدام كود الخصم "${cleanCode}"` });
 
-  if (!coupon) {
-    return res.status(400).json({
-      valid: false,
-      error: `كود الخصم "${cleanCode}" غير صالح أو غير موجود`,
-    });
-  }
-
-  if (!coupon.is_active) {
-    return res.status(400).json({
-      valid: false,
-      error: `كود الخصم "${cleanCode}" غير مفعّل حالياً`,
-    });
-  }
-
-  if (coupon.expiry_date && new Date(String(coupon.expiry_date)) < new Date()) {
-    return res.status(400).json({
-      valid: false,
-      error: `كود الخصم "${cleanCode}" منتهي الصلاحية`,
-    });
-  }
-
-  const minOrderValue = Number(coupon.min_order_value || 0);
-  if (subtotal < minOrderValue) {
-    return res.status(400).json({
-      valid: false,
-      error: `الحد الأدنى لاستخدام كود الخصم هو ${minOrderValue} ج.م`,
-      minOrderValue,
-    });
-  }
-
-  const usageLimit = coupon.usage_limit != null ? Number(coupon.usage_limit) : null;
-  const usedCount = Number(coupon.used_count || 0);
-
-  if (usageLimit !== null && usedCount >= usageLimit) {
-    return res.status(400).json({
-      valid: false,
-      error: `تم استنفاد الحد الأقصى لاستخدام كود الخصم "${cleanCode}"`,
-    });
-  }
-
-  let discountAmount = 0;
-  const discountType = String(coupon.discount_type);
-  const discountValue = Number(coupon.discount_value);
-
+  let discountAmount = 0; const discountType = String(coupon.discount_type); const discountValue = Number(coupon.discount_value);
   if (discountType === 'percentage') {
     discountAmount = Math.round(((subtotal * discountValue) / 100) * 100) / 100;
+    if (coupon.max_discount_value != null) discountAmount = Math.min(discountAmount, Number(coupon.max_discount_value));
+  } else discountAmount = Math.min(subtotal, discountValue);
 
-    if (coupon.max_discount_value) {
-      discountAmount = Math.min(discountAmount, Number(coupon.max_discount_value));
-    }
-  } else {
-    discountAmount = Math.min(subtotal, discountValue);
-  }
-
-  return res.json({
-    valid: true,
-    code: cleanCode,
-    discountType,
-    discountValue,
-    discountAmount,
-    minOrderValue,
-    maxDiscountValue:
-      coupon.max_discount_value != null ? Number(coupon.max_discount_value) : undefined,
-    expiryDate: coupon.expiry_date,
-  });
+  return res.json({ valid: true, code: cleanCode, discountType, discountValue, discountAmount, minOrderValue,
+    maxDiscountValue: coupon.max_discount_value != null ? Number(coupon.max_discount_value) : undefined, expiryDate: coupon.expiry_date });
 });
 
-// Return order history for one customer.
-// Protected server-to-server endpoint; phone is never accepted as browser authorization.
-router.post('/integration/customer/orders', requireIntegrationKey, (req: Request, res: Response) => {
+router.post('/integration/customer/orders', requireIntegrationKey, async (req: Request, res: Response) => {
   const phone = normalizeIntegrationPhone(req.body?.phone);
+  if (phone.length < 8 || phone.length > 20) return res.status(400).json({ error: 'Invalid phone' });
 
-  if (phone.length < 8 || phone.length > 20) {
-    return res.status(400).json({ error: 'Invalid phone' });
-  }
+  const { data: orders, error } = await supabaseServer.from('orders').select('*').eq('customer_phone', phone).order('created_at', { ascending: false }).limit(100);
+  if (error) return res.status(503).json({ error: 'Order service unavailable' });
+  if (!orders || orders.length === 0) return res.json({ orders: [] });
 
-  const rows = db
-    .prepare(`
-      SELECT *
-      FROM orders
-      WHERE customer_phone = ?
-      ORDER BY created_at DESC
-      LIMIT 100
-    `)
-    .all(phone) as Record<string, unknown>[];
+  const { data: items, error: itemsError } = await supabaseServer.from('order_items').select('*').in('order_id', orders.map((o) => String(o.id))).order('created_at', { ascending: true });
+  if (itemsError) return res.status(503).json({ error: 'Order service unavailable' });
 
-  return res.json({
-    orders: rows.map(mapIntegrationOrder),
-  });
+  const byOrder = new Map<string, Record<string, unknown>[]>();
+  for (const item of items || []) { const id = String(item.order_id); const list = byOrder.get(id) || []; list.push(item as Record<string, unknown>); byOrder.set(id, list); }
+  return res.json({ orders: orders.map((o) => mapIntegrationOrder(o, byOrder.get(String(o.id)) || [])) });
 });
 
-// Look up one order while also proving ownership with the customer's phone.
-router.post('/integration/orders/lookup', requireIntegrationKey, (req: Request, res: Response) => {
-  const rawOrderIdOrNumber = req.body?.orderIdOrNumber;
-  const phone = normalizeIntegrationPhone(req.body?.phone);
+router.post('/integration/orders/lookup', requireIntegrationKey, async (req: Request, res: Response) => {
+  const raw = req.body?.orderIdOrNumber; const phone = normalizeIntegrationPhone(req.body?.phone);
+  if (typeof raw !== 'string' || !raw.trim()) return res.status(400).json({ error: 'Order id or number is required' });
+  if (phone.length < 8 || phone.length > 20) return res.status(400).json({ error: 'Invalid phone' });
+  const key = raw.trim();
 
-  if (typeof rawOrderIdOrNumber !== 'string' || !rawOrderIdOrNumber.trim()) {
-    return res.status(400).json({ error: 'Order id or number is required' });
+  let result = await supabaseServer.from('orders').select('*').eq('id', key).eq('customer_phone', phone).maybeSingle();
+  if (result.error) return res.status(503).json({ error: 'Order service unavailable' });
+  if (!result.data) {
+    result = await supabaseServer.from('orders').select('*').eq('order_number', key).eq('customer_phone', phone).maybeSingle();
+    if (result.error) return res.status(503).json({ error: 'Order service unavailable' });
   }
+  if (!result.data) return res.status(404).json({ error: 'Order not found' });
 
-  if (phone.length < 8 || phone.length > 20) {
-    return res.status(400).json({ error: 'Invalid phone' });
-  }
-
-  const orderIdOrNumber = rawOrderIdOrNumber.trim();
-
-  // Deliberately use two parameterized exact queries rather than raw OR interpolation.
-  let row = db
-    .prepare(`
-      SELECT *
-      FROM orders
-      WHERE id = ? AND customer_phone = ?
-      LIMIT 1
-    `)
-    .get(orderIdOrNumber, phone) as Record<string, unknown> | undefined;
-
-  if (!row) {
-    row = db
-      .prepare(`
-        SELECT *
-        FROM orders
-        WHERE order_number = ? AND customer_phone = ?
-        LIMIT 1
-      `)
-      .get(orderIdOrNumber, phone) as Record<string, unknown> | undefined;
-  }
-
-  if (!row) {
-    return res.status(404).json({ error: 'Order not found' });
-  }
-
-  return res.json({
-    order: mapIntegrationOrder(row),
-  });
+  const { data: items, error } = await supabaseServer.from('order_items').select('*').eq('order_id', result.data.id).order('created_at', { ascending: true });
+  if (error) return res.status(503).json({ error: 'Order service unavailable' });
+  return res.json({ order: mapIntegrationOrder(result.data, (items || []) as Record<string, unknown>[]) });
 });
 
 // ==========================================
-// 12. UNIFIED PUBLIC API (Customer Store endpoints)
-// Connecting to the EXACT SAME Database
+// 12. UNIFIED PUBLIC API — SUPABASE
 // ==========================================
+router.get('/products', async (_req: Request, res: Response) => {
+  const [productsResult, variantsResult, categoriesResult] = await Promise.all([
+    supabaseServer.from('products').select('*').eq('is_active', true).order('sort_order', { ascending: true }).order('created_at', { ascending: false }),
+    supabaseServer.from('product_variants').select('*').eq('is_active', true).order('sort_order', { ascending: true }).order('weight_kg', { ascending: true }).order('piece_count', { ascending: true }),
+    supabaseServer.from('categories').select('id,name'),
+  ]);
+  const failed = [productsResult, variantsResult, categoriesResult].find((r) => r.error);
+  if (failed?.error) return res.status(503).json({ error: 'تعذر تحميل المنتجات' });
 
-// GET /api/products (Customer Store)
-router.get('/products', (_req: Request, res: Response) => {
-  const products = db
-    .prepare(`
-      SELECT p.*, c.name as category_name
-      FROM products p
-      LEFT JOIN categories c ON p.category_id = c.id
-      WHERE p.is_active = 1
-      ORDER BY p.sort_order ASC, p.created_at DESC
-    `)
-    .all() as Record<string, unknown>[];
-
-  const variants = db
-    .prepare('SELECT * FROM product_variants WHERE is_active = 1 ORDER BY sort_order ASC, weight_kg ASC, piece_count ASC')
-    .all() as Record<string, unknown>[];
-
-  const variantsByProduct: Record<string, unknown[]> = {};
-  for (const v of variants) {
-    const pId = String(v.product_id);
-    if (!variantsByProduct[pId]) variantsByProduct[pId] = [];
-    variantsByProduct[pId].push({
-      id: v.id,
-      productId: v.product_id,
-      title: v.title,
-      weightKg: v.weight_kg,
-      pieceCount: v.piece_count,
-      approxPieceWeightG: v.approx_piece_weight_g,
-      price: Number(v.price),
-      stockQuantity: Number(v.stock_quantity || 0),
-      sortOrder: Number(v.sort_order || 0),
-      isActive: Boolean(v.is_active),
-    });
-  }
-
-  return res.json(
-    products.map((p) => ({
-      id: p.id,
-      name: p.name,
-      description: p.description || '',
-      categoryId: p.category_id,
-      categoryName: p.category_name || '',
-      pricingUnit: p.pricing_unit,
-      price: Number(p.base_price),
-      stockQuantity: Number(p.stock_quantity || 0),
-      inStock: Boolean(p.in_stock),
-      minOrderQuantity:
-        p.min_order_quantity != null ? Number(p.min_order_quantity) : undefined,
-      maxOrderQuantity:
-        p.max_order_quantity != null ? Number(p.max_order_quantity) : undefined,
-      sortOrder: Number(p.sort_order || 0),
-      imageUrl: p.image_url,
-      badge: p.badge,
-      isActive: Boolean(p.is_active),
-      variants: variantsByProduct[String(p.id)] || [],
-    }))
-  );
+  const categoryNames = new Map((categoriesResult.data || []).map((c) => [String(c.id), String(c.name)]));
+  const byProduct = new Map<string, Record<string, unknown>[]>();
+  for (const v of variantsResult.data || []) { const id = String(v.product_id); const list = byProduct.get(id) || []; list.push(v as Record<string, unknown>); byProduct.set(id, list); }
+  return res.json((productsResult.data || []).map((p) => mapProductRow(p, categoryNames.get(String(p.category_id || '')) || '', byProduct.get(String(p.id)) || [])));
 });
 
-// GET /api/categories (Customer Store)
 router.get('/categories', async (_req: Request, res: Response) => {
-  const { data: rows, error } = await supabaseServer
-    .from('categories')
-    .select('*')
-    .eq('is_active', true)
-    .order('sort_order', { ascending: true });
-
-  if (error) {
-    console.error('Supabase public categories read failed:', error.message);
-    return res.status(503).json({ error: 'تعذر تحميل التصنيفات' });
-  }
-
-  return res.json(rows || []);
+  const { data, error } = await supabaseServer.from('categories').select('*').eq('is_active', true).order('sort_order', { ascending: true });
+  if (error) return res.status(503).json({ error: 'تعذر تحميل التصنيفات' });
+  return res.json(data || []);
 });
 
-// GET /api/settings (Customer Store)
 router.get('/settings', async (_req: Request, res: Response) => {
-  const { data: s, error } = await supabaseServer
-    .from('store_settings')
-    .select('*')
-    .eq('id', 1)
-    .maybeSingle();
-
-  if (error) {
-    console.error('Supabase public settings read failed:', error.message);
-    return res.status(503).json({ error: 'تعذر تحميل إعدادات المتجر' });
-  }
+  const { data: s, error } = await supabaseServer.from('store_settings').select('*').eq('id', 1).maybeSingle();
+  if (error) return res.status(503).json({ error: 'تعذر تحميل إعدادات المتجر' });
   if (!s) return res.status(404).json({ error: 'الإعدادات غير موجودة' });
-
   return res.json({
-    storeName: s.store_name,
-    tagline: s.tagline,
-    phone: s.phone,
-    whatsapp: s.whatsapp,
-    instapayHandle: s.instapay_handle,
-    instapayNumber: s.instapay_number,
-    vodafoneCash: s.vodafone_cash,
-    address: s.address,
-    isOpen: Boolean(s.is_open),
-    closedReason: s.closed_reason,
-    deliveryFee: s.default_delivery_fee,
-    freeDeliveryThreshold: s.free_delivery_threshold,
-    minOrderAmount: s.min_order_amount,
-    depositPercentage: s.deposit_percentage,
-    minDepositAmount: s.min_deposit_amount,
-    workingHours: s.working_hours,
-    cutoffHour: Number(s.cutoff_hour ?? 3),
-    currency: s.currency,
+    storeName: s.store_name, tagline: s.tagline, phone: s.phone, whatsapp: s.whatsapp,
+    instapayHandle: s.instapay_handle, instapayNumber: s.instapay_number, vodafoneCash: s.vodafone_cash,
+    address: s.address, isOpen: Boolean(s.is_open), closedReason: s.closed_reason,
+    deliveryFee: s.default_delivery_fee, freeDeliveryThreshold: s.free_delivery_threshold,
+    minOrderAmount: s.min_order_amount, depositPercentage: s.deposit_percentage, minDepositAmount: s.min_deposit_amount,
+    workingHours: s.working_hours, cutoffHour: Number(s.cutoff_hour ?? 3), currency: s.currency,
   });
 });
 
-// POST /api/orders (Customer Order Placement - No Stock Deduction, Strict Validation)
-router.post('/orders', (req: Request, res: Response) => {
-  const {
-    customerName,
-    customerPhone,
-    customerAddress,
-    city,
-    district,
-    deliveryRegionId,
-    items,
-    couponCode,
-    depositMethod,
-    depositReference,
-    notes,
-  } = req.body;
-
-  // Rate Limiting for public customer order placement (max 5 orders / 10 mins per IP and phone)
+router.post('/orders', async (req: Request, res: Response) => {
+  const { customerName, customerPhone, customerAddress, city, district, deliveryRegionId, items, couponCode, depositMethod, depositReference, notes } = req.body;
   const clientIp = req.ip || 'unknown';
   const cleanPhone = customerPhone ? String(customerPhone).trim().replace(/[^0-9+]/g, '') : '';
-  const rateLimitKeys = [`order:ip:${clientIp}`];
-  if (cleanPhone) {
-    rateLimitKeys.push(`order:phone:${cleanPhone}`);
-  }
+  const rateLimitKeys = [`order:ip:${clientIp}`]; if (cleanPhone) rateLimitKeys.push(`order:phone:${cleanPhone}`);
 
-  if (!checkOrderRateLimit(rateLimitKeys)) {
-    return res.status(429).json({
-      error: 'تم تجاوز الحد الأقصى المسموح به لإنشاء الطلبات مؤقتاً. يرجى الانتظار بضع دقائق قبل المحاولة مجدداً.',
-    });
-  }
-
-  if (!customerName || !customerPhone || !items || !Array.isArray(items) || items.length === 0) {
-    return res.status(400).json({ error: 'بيانات العميل والأصناف مطلوبة لإتمام الطلب' });
-  }
-
-  const phoneForOrder = String(customerPhone).trim();
-  if (phoneForOrder.length < 8) {
-    return res.status(400).json({ error: 'رقم الهاتف غير صالح (يجب أن يتكون من 8 أرقام على الأقل)' });
-  }
-
-  const orderId = `order-${Date.now()}-${crypto.randomBytes(3).toString('hex')}`;
-  const now = new Date().toISOString();
-
+  if (!checkOrderRateLimit(rateLimitKeys)) return res.status(429).json({ error: 'تم تجاوز الحد الأقصى المسموح به لإنشاء الطلبات مؤقتاً. يرجى الانتظار بضع دقائق قبل المحاولة مجدداً.' });
+  if (!customerName || !customerPhone || !Array.isArray(items) || items.length === 0) return res.status(400).json({ error: 'بيانات العميل والأصناف مطلوبة لإتمام الطلب' });
+  if (String(customerPhone).trim().length < 8) return res.status(400).json({ error: 'رقم الهاتف غير صالح (يجب أن يتكون من 8 أرقام على الأقل)' });
   recordOrderAttempt(rateLimitKeys);
 
-  db.exec('BEGIN TRANSACTION;');
-  try {
-    // 1. Read store settings and verify store availability
-    const settings = db.prepare('SELECT * FROM store_settings WHERE id = 1').get() as Record<string, unknown> | undefined;
-    if (!settings) {
-      db.exec('ROLLBACK;');
-      return res.status(500).json({ error: 'إعدادات المتجر غير متوفرة حالياً، يرجى المحاولة لاحقاً' });
+  const { data: settings, error: settingsError } = await supabaseServer.from('store_settings').select('*').eq('id', 1).maybeSingle();
+  if (settingsError || !settings) return res.status(503).json({ error: 'إعدادات المتجر غير متوفرة حالياً، يرجى المحاولة لاحقاً' });
+  if (!settings.is_open) {
+    const reason = settings.closed_reason ? String(settings.closed_reason).trim() : '';
+    return res.status(400).json({ error: reason ? `المتجر مغلق حالياً: ${reason}` : 'المتجر مغلق حالياً ولا يستقبل طلبات جديدة في الوقت الحالي' });
+  }
+
+  const verification = await verifyOrderItems(items as Array<Record<string, unknown>>, 'public');
+  if (verification.error) return res.status(verification.serviceError ? 503 : 400).json({ error: verification.error });
+  const subtotal = verification.subtotal!;
+
+  const minOrderAmount = Number(settings.min_order_amount || 0);
+  if (minOrderAmount > 0 && subtotal < minOrderAmount) return res.status(400).json({ error: `الحد الأدنى للطلب في المتجر هو ${minOrderAmount} ج.م (إجمالي الأصناف الحالي: ${subtotal} ج.م)` });
+
+  const couponResult = await validateCouponForSubtotal(couponCode, subtotal);
+  if (couponResult.error) return res.status(couponResult.serviceError ? 503 : 400).json({ error: couponResult.error });
+
+  let fee = Number(settings.default_delivery_fee || 15);
+  if (deliveryRegionId) {
+    const { data: region, error } = await supabaseServer.from('delivery_regions').select('*').eq('id', deliveryRegionId).eq('is_active', true).maybeSingle();
+    if (error) return res.status(503).json({ error: 'تعذر التحقق من منطقة التوصيل' });
+    if (!region) return res.status(400).json({ error: 'منطقة التوصيل المحددة غير صالحة أو غير مفعّلة حالياً' });
+    fee = Number(region.delivery_fee);
+    const regionMin = Number(region.min_order_amount || 0);
+    if (regionMin > 0 && subtotal < regionMin) return res.status(400).json({ error: `الحد الأدنى للطلب لمنطقة ${region.name} هو ${regionMin} ج.م` });
+  } else if (district && typeof district === 'string' && district.trim()) {
+    const { data: regions, error } = await supabaseServer.from('delivery_regions').select('*').eq('is_active', true).ilike('name', `%${district.trim()}%`).limit(1);
+    if (error) return res.status(503).json({ error: 'تعذر التحقق من منطقة التوصيل' });
+    const region = regions?.[0];
+    if (region) {
+      fee = Number(region.delivery_fee); const regionMin = Number(region.min_order_amount || 0);
+      if (regionMin > 0 && subtotal < regionMin) return res.status(400).json({ error: `الحد الأدنى للطلب لمنطقة ${region.name} هو ${regionMin} ج.م` });
     }
+  }
 
-    if (!settings.is_open) {
-      db.exec('ROLLBACK;');
-      const reason = settings.closed_reason ? String(settings.closed_reason).trim() : '';
-      return res.status(400).json({
-        error: reason ? `المتجر مغلق حالياً: ${reason}` : 'المتجر مغلق حالياً ولا يستقبل طلبات جديدة في الوقت الحالي',
-      });
-    }
+  const freeThreshold = Number(settings.free_delivery_threshold || 400); if (freeThreshold > 0 && subtotal >= freeThreshold) fee = 0;
+  const totalAmount = Math.max(0, Math.round((subtotal - (couponResult.discountAmount || 0) + fee) * 100) / 100);
+  const depositPct = Number(settings.deposit_percentage || 20); const minDeposit = Number(settings.min_deposit_amount || 50);
+  let depositAmount = 0;
+  if (depositPct > 0) depositAmount = Math.min(totalAmount, Math.max(minDeposit, Math.round((totalAmount * depositPct) / 100)));
+  const remainingAmount = Math.max(0, Math.round((totalAmount - depositAmount) * 100) / 100);
 
-    let subtotal = 0;
-    const verifiedItems: {
-      productId: string;
-      variantId?: string;
-      productName: string;
-      variantTitle?: string;
-      pricingUnit: string;
-      weightKg?: number;
-      pieceCount?: number;
-      unitPrice: number;
-      quantity: number;
-      totalPrice: number;
-    }[] = [];
+  const payload = {
+    customerName: String(customerName).trim(), customerPhone: cleanPhone, customerAddress: customerAddress || '',
+    city: city || 'القاهرة', district: district || '', subtotal, discountAmount: couponResult.discountAmount || 0,
+    couponCode: couponResult.cleanCode, deliveryFee: fee, totalAmount, depositAmount, depositStatus: 'pending',
+    depositMethod: depositMethod || 'instapay', depositReference: depositReference || null, depositNotes: null,
+    depositConfirmedAt: null, depositConfirmedBy: null, remainingAmount, status: 'pending', notes: notes || null,
+  };
 
-    // CRITICAL SECURITY RULE: Validate prices and items strictly from server database!
-    for (const item of items) {
-      const rawQty = item.quantity;
-      const quantity = Number(rawQty);
-      if (isNaN(quantity) || !isFinite(quantity) || quantity <= 0) {
-        db.exec('ROLLBACK;');
-        return res.status(400).json({ error: `الكمية المطلوبة غير صالحة للصنف (${item.productName || item.productId})` });
-      }
-
-      const prod = db.prepare('SELECT id, name, base_price, pricing_unit, is_active, min_order_quantity, max_order_quantity FROM products WHERE id = ?').get(item.productId) as
-        | { id: string; name: string; base_price: number; pricing_unit: string; is_active: number; min_order_quantity?: number | null; max_order_quantity?: number | null }
-        | undefined;
-
-      if (!prod) {
-        db.exec('ROLLBACK;');
-        return res.status(400).json({ error: `الصنف المطلوب غير موجود (${item.productId})` });
-      }
-
-      if (!prod.is_active) {
-        db.exec('ROLLBACK;');
-        return res.status(400).json({ error: `الصنف "${prod.name}" غير متاح حالياً للطلب` });
-      }
-
-      if (prod.pricing_unit === 'piece' && !Number.isInteger(quantity)) {
-        db.exec('ROLLBACK;');
-        return res.status(400).json({ error: `الكمية المطلوبة للصنف "${prod.name}" بالقطعة ويجب أن تكون عدداً صحيحاً بدون كسور` });
-      }
-
-      if (prod.pricing_unit !== 'piece' && quantity < 0.05) {
-        db.exec('ROLLBACK;');
-        return res.status(400).json({ error: `أقل كمية/وزن يمكن طلبه للصنف "${prod.name}" هو 0.05 كجم` });
-      }
-
-      if (prod.min_order_quantity != null && prod.min_order_quantity > 0 && quantity < prod.min_order_quantity) {
-        db.exec('ROLLBACK;');
-        const unitLabel = prod.pricing_unit === 'piece' ? 'قطعة' : 'كجم';
-        return res.status(400).json({ error: `الحد الأدنى للطلب للصنف "${prod.name}" هو ${prod.min_order_quantity} ${unitLabel}` });
-      }
-
-      if (prod.max_order_quantity != null && prod.max_order_quantity > 0 && quantity > prod.max_order_quantity) {
-        db.exec('ROLLBACK;');
-        const unitLabel = prod.pricing_unit === 'piece' ? 'قطعة' : 'كجم';
-        return res.status(400).json({ error: `الحد الأقصى للطلب للصنف "${prod.name}" هو ${prod.max_order_quantity} ${unitLabel}` });
-      }
-
-      let unitPrice = prod.base_price;
-      let variantTitle: string | undefined;
-      let weightKg: number | undefined;
-      let pieceCount: number | undefined;
-
-      if (item.variantId) {
-        const v = db.prepare('SELECT id, title, price, weight_kg, piece_count, is_active FROM product_variants WHERE id = ? AND product_id = ?').get(item.variantId, prod.id) as
-          | { id: string; title: string; price: number; weight_kg: number; piece_count: number; is_active: number }
-          | undefined;
-
-        if (!v) {
-          db.exec('ROLLBACK;');
-          return res.status(400).json({ error: `الخيار أو الحجم المختار غير تابع للصنف ${prod.name}` });
-        }
-
-        if (!v.is_active) {
-          db.exec('ROLLBACK;');
-          return res.status(400).json({ error: `الحجم "${v.title}" غير متاح حالياً للطلب` });
-        }
-
-        unitPrice = v.price;
-        variantTitle = v.title;
-        weightKg = v.weight_kg;
-        pieceCount = v.piece_count;
-      }
-
-      const totalPrice = Math.round(unitPrice * quantity * 100) / 100;
-      subtotal += totalPrice;
-
-      verifiedItems.push({
-        productId: prod.id,
-        variantId: item.variantId,
-        productName: prod.name,
-        variantTitle,
-        pricingUnit: prod.pricing_unit,
-        weightKg,
-        pieceCount,
-        unitPrice,
-        quantity,
-        totalPrice,
-      });
-    }
-
-    // Enforce store-wide minimum order amount on server-calculated subtotal
-    const minOrderAmount = Number(settings.min_order_amount || 0);
-    if (minOrderAmount > 0 && subtotal < minOrderAmount) {
-      db.exec('ROLLBACK;');
-      return res.status(400).json({
-        error: `الحد الأدنى للطلب في المتجر هو ${minOrderAmount} ج.م (إجمالي الأصناف الحالي: ${subtotal} ج.م)`,
-      });
-    }
-
-    // Validate Coupon if provided
-    let discountAmount = 0;
-    if (couponCode) {
-      const cleanCode = String(couponCode).trim().toUpperCase();
-      const coupon = db.prepare('SELECT * FROM coupons WHERE UPPER(code) = ?').get(cleanCode) as Record<string, unknown> | undefined;
-      if (!coupon) {
-        db.exec('ROLLBACK;');
-        return res.status(400).json({ error: `كود الخصم "${cleanCode}" غير صالح أو غير موجود` });
-      }
-      if (!coupon.is_active) {
-        db.exec('ROLLBACK;');
-        return res.status(400).json({ error: `كود الخصم "${cleanCode}" غير مفعّل حالياً` });
-      }
-      if (coupon.expiry_date && new Date(String(coupon.expiry_date)) < new Date()) {
-        db.exec('ROLLBACK;');
-        return res.status(400).json({ error: `كود الخصم "${cleanCode}" منتهي الصلاحية` });
-      }
-      const minVal = Number(coupon.min_order_value || 0);
-      if (subtotal < minVal) {
-        db.exec('ROLLBACK;');
-        return res.status(400).json({ error: `الحد الأدنى لاستخدام كود الخصم هو ${minVal} ج.م` });
-      }
-      const usageLimit = coupon.usage_limit != null ? Number(coupon.usage_limit) : null;
-      const usedCount = Number(coupon.used_count || 0);
-      if (usageLimit !== null && usedCount >= usageLimit) {
-        db.exec('ROLLBACK;');
-        return res.status(400).json({ error: `تم استنفاد الحد الأقصى لاستخدام كود الخصم "${cleanCode}"` });
-      }
-
-      if (coupon.discount_type === 'percentage') {
-        discountAmount = Math.round(((subtotal * Number(coupon.discount_value)) / 100) * 100) / 100;
-        if (coupon.max_discount_value) {
-          discountAmount = Math.min(discountAmount, Number(coupon.max_discount_value));
-        }
-      } else {
-        discountAmount = Math.min(subtotal, Number(coupon.discount_value));
-      }
-      // Increment coupon usage
-      db.prepare('UPDATE coupons SET used_count = used_count + 1 WHERE id = ?').run(String(coupon.id));
-    }
-
-    // Delivery fee calculation with regions (reusing store_settings)
-    let fee = Number(settings.default_delivery_fee || 15);
-
-    if (deliveryRegionId) {
-      const reg = db.prepare('SELECT * FROM delivery_regions WHERE id = ? AND is_active = 1').get(deliveryRegionId) as Record<string, unknown> | undefined;
-      if (!reg) {
-        db.exec('ROLLBACK;');
-        return res.status(400).json({ error: 'منطقة التوصيل المحددة غير صالحة أو غير مفعّلة حالياً' });
-      }
-      fee = Number(reg.delivery_fee);
-      const regMinOrder = Number(reg.min_order_amount || 0);
-      if (regMinOrder > 0 && subtotal < regMinOrder) {
-        db.exec('ROLLBACK;');
-        return res.status(400).json({ error: `الحد الأدنى للطلب لمنطقة ${reg.name} هو ${regMinOrder} ج.م` });
-      }
-    } else if (district && typeof district === 'string' && district.trim()) {
-      const cleanDistrict = district.trim();
-      const reg = db.prepare('SELECT * FROM delivery_regions WHERE is_active = 1 AND name LIKE ?').get(`%${cleanDistrict}%`) as Record<string, unknown> | undefined;
-      if (reg) {
-        fee = Number(reg.delivery_fee);
-        const regMinOrder = Number(reg.min_order_amount || 0);
-        if (regMinOrder > 0 && subtotal < regMinOrder) {
-          db.exec('ROLLBACK;');
-          return res.status(400).json({ error: `الحد الأدنى للطلب لمنطقة ${reg.name} هو ${regMinOrder} ج.م` });
-        }
-      }
-    }
-
-    const freeThreshold = Number(settings.free_delivery_threshold || 400);
-    if (freeThreshold > 0 && subtotal >= freeThreshold) {
-      fee = 0;
-    }
-
-    const totalAmount = Math.max(0, Math.round((subtotal - discountAmount + fee) * 100) / 100);
-
-    // Calculate required deposit
-    const depositPct = Number(settings.deposit_percentage || 20);
-    const minDeposit = Number(settings.min_deposit_amount || 50);
-    let depositAmount = 0;
-    if (depositPct > 0) {
-      const calculated = Math.round((totalAmount * depositPct) / 100);
-      depositAmount = Math.min(totalAmount, Math.max(minDeposit, calculated));
-    }
-    const remainingAmount = Math.max(0, Math.round((totalAmount - depositAmount) * 100) / 100);
-
-    // Upsert Customer
-    let customerId: string | null = null;
-    const existingCust = db.prepare('SELECT id, total_orders, total_spent FROM customers WHERE phone = ?').get(cleanPhone) as
-      | { id: string; total_orders: number; total_spent: number }
-      | undefined;
-
-    if (existingCust) {
-      customerId = existingCust.id;
-      db.prepare(`
-        UPDATE customers SET
-          total_orders = total_orders + 1,
-          total_spent = total_spent + ?,
-          last_order_date = ?,
-          name = ?,
-          address = COALESCE(?, address),
-          city = COALESCE(?, city),
-          district = COALESCE(?, district)
-        WHERE id = ?
-      `).run(totalAmount, now, customerName.trim(), customerAddress, city, district, customerId);
-    } else {
-      customerId = `cust-${Date.now()}-${crypto.randomBytes(3).toString('hex')}`;
-      db.prepare(`
-        INSERT INTO customers (id, name, phone, city, district, address, total_orders, total_spent, last_order_date, status, created_at)
-        VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?, 'active', ?)
-      `).run(customerId, customerName.trim(), cleanPhone, city || 'القاهرة', district || '', customerAddress || '', totalAmount, now, now);
-    }
-
-    // Insert Order with atomic collision handling and bounded retries
-    const insertOrderStmt = db.prepare(`
-      INSERT INTO orders (
-        id, order_number, customer_id, customer_name, customer_phone, customer_address,
-        city, district, subtotal, discount_amount, coupon_code, delivery_fee, total_amount,
-        deposit_amount, deposit_status, deposit_method, deposit_reference, deposit_notes,
-        deposit_confirmed_at, deposit_confirmed_by, remaining_amount, status, notes,
-        created_at, updated_at
-      ) VALUES (
-        ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, null, null, null, ?, 'pending', ?, ?, ?
-      )
-    `);
-
-    let finalOrderNumber: string | null = null;
-    const maxOrderInsertRetries = 10;
-
-    for (let attempt = 0; attempt < maxOrderInsertRetries; attempt++) {
-      const candidateNumber = generateUniqueOrderNumber(db) || `#ALM-${Math.floor(10000 + Math.random() * 90000)}`;
-      db.exec('SAVEPOINT order_insert_sp;');
-      try {
-        insertOrderStmt.run(
-          orderId,
-          candidateNumber,
-          customerId,
-          customerName.trim(),
-          cleanPhone,
-          customerAddress || '',
-          city || 'القاهرة',
-          district || '',
-          subtotal,
-          discountAmount,
-          couponCode ? String(couponCode).toUpperCase().trim() : null,
-          fee,
-          totalAmount,
-          depositAmount,
-          depositMethod || 'instapay',
-          depositReference || null,
-          remainingAmount,
-          notes || null,
-          now,
-          now
-        );
-        db.exec('RELEASE SAVEPOINT order_insert_sp;');
-        finalOrderNumber = candidateNumber;
-        break;
-      } catch (insertErr) {
-        db.exec('ROLLBACK TO SAVEPOINT order_insert_sp;');
-        if (isOrderNumberCollisionError(insertErr)) {
-          // Collision on orders.order_number: retry with a new candidate number
-          continue;
-        }
-        // Non-collision database error: abort and do not retry
-        throw insertErr;
-      }
-    }
-
-    if (!finalOrderNumber) {
-      db.exec('ROLLBACK;');
-      return res.status(500).json({ error: 'تعذر إنشاء رقم فريد للطلب بعد عدة محاولات، يرجى المحاولة لاحقاً' });
-    }
-
-    // Insert Order Items
-    const insertItem = db.prepare(`
-      INSERT INTO order_items (
-        id, order_id, product_id, variant_id, product_name, variant_title,
-        pricing_unit, weight_kg, piece_count, unit_price, quantity, total_price,
-        snapshot_data, created_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    `);
-
-    for (const vi of verifiedItems) {
-      const itemId = `item-${Date.now()}-${crypto.randomBytes(3).toString('hex')}`;
-      insertItem.run(
-        itemId,
-        orderId,
-        vi.productId,
-        vi.variantId || null,
-        vi.productName,
-        vi.variantTitle || null,
-        vi.pricingUnit,
-        vi.weightKg || null,
-        vi.pieceCount || null,
-        vi.unitPrice,
-        vi.quantity,
-        vi.totalPrice,
-        JSON.stringify(vi),
-        now
-      );
-    }
-
-    db.exec('COMMIT;');
-
-    const createdOrder = getOrderWithItems(orderId);
-
-    // Audit and Realtime broadcast
-    logAuditAction(null, 'create_order', 'order', orderId, null, { orderNumber: finalOrderNumber, totalAmount, customerPhone: cleanPhone }, req.ip);
-    broadcastRealtimeEvent('new_order', createdOrder);
-
-    return res.status(201).json({
-      success: true,
-      message: 'تم استلام طلبك بنجاح وجاري مراجعة العربون وتجهيز الصيد الطازج',
-      order: createdOrder,
-    });
-  } catch (err) {
-    db.exec('ROLLBACK;');
-    console.error('Order placement transaction error:', err);
+  const { data: rpcData, error: rpcError } = await supabaseServer.rpc('create_order_atomic', {
+    p_payload: payload, p_items: verification.verifiedItems, p_coupon_id: couponResult.couponId || null,
+  });
+  if (rpcError) {
+    if (rpcError.message.includes('COUPON_NOT_AVAILABLE')) return res.status(400).json({ error: 'كود الخصم لم يعد متاحاً، يرجى إعادة المحاولة' });
+    console.error('Supabase public order RPC failed:', rpcError.message);
     return res.status(500).json({ error: 'حدث خطأ أثناء معالجة الطلب' });
   }
+
+  const rpcOrder = (rpcData as { order?: Record<string, unknown> } | null)?.order;
+  const orderId = rpcOrder?.id ? String(rpcOrder.id) : '';
+  if (!orderId) return res.status(503).json({ error: 'تم إنشاء الطلب لكن تعذر تحميل بياناته' });
+
+  const createdOrder = await getOrderWithItems(orderId);
+  logAuditAction(null, 'create_order', 'order', orderId, null, { orderNumber: createdOrder?.orderNumber, totalAmount, customerPhone: cleanPhone }, req.ip);
+  broadcastRealtimeEvent('new_order', createdOrder);
+  return res.status(201).json({ success: true, message: 'تم استلام طلبك بنجاح وجاري مراجعة العربون وتجهيز الصيد الطازج', order: createdOrder });
 });

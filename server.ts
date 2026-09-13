@@ -1,7 +1,6 @@
 import express from 'express';
 import path from 'node:path';
 import { createServer as createViteServer } from 'vite';
-import { initDatabase } from './server/db';
 import { router as apiRouter } from './server/api';
 
 function getValidPort(): number {
@@ -21,9 +20,6 @@ async function startServer() {
 
   // Configure reverse proxy trust for canonical req.ip derivation
   app.set('trust proxy', 1);
-
-  // Initialize SQLite database and schema
-  initDatabase();
 
   // CORS Hardening
   const configuredOrigins = (process.env.ALLOWED_ORIGINS || '')
