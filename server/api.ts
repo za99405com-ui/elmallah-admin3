@@ -69,6 +69,16 @@ function generateUniqueOrderNumber(database: typeof db, maxRetries = 10): string
   return null;
 }
 
+function isOrderNumberCollisionError(err: unknown): boolean {
+  if (!err || typeof err !== 'object') return false;
+  const message = String((err as any).message || '');
+  const code = String((err as any).code || '');
+  return (
+    (code === 'SQLITE_CONSTRAINT' || code === 'SQLITE_CONSTRAINT_UNIQUE' || message.includes('UNIQUE constraint failed')) &&
+    message.includes('orders.order_number')
+  );
+}
+
 // ==========================================
 // 1. ADMIN AUTHENTICATION (PURE SUPABASE AUTH)
 // ==========================================
@@ -1029,10 +1039,6 @@ router.post('/admin/orders', requireAuth, (req: AuthenticatedRequest, res: Respo
   }
 
   const orderId = `order-${Date.now()}-${crypto.randomBytes(3).toString('hex')}`;
-  const orderNumber = generateUniqueOrderNumber(db);
-  if (!orderNumber) {
-    return res.status(500).json({ error: 'تعذر إنشاء رقم فريد للطلب بعد عدة محاولات، يرجى إعادة المحاولة' });
-  }
   const now = new Date().toISOString();
 
   db.exec('BEGIN TRANSACTION;');
@@ -1206,8 +1212,8 @@ router.post('/admin/orders', requireAuth, (req: AuthenticatedRequest, res: Respo
       `).run(customerId, customerName.trim(), customerPhone.trim(), city || 'القاهرة', district || '', customerAddress || '', totalAmount, now, now);
     }
 
-    // Insert Order
-    db.prepare(`
+    // Insert Order with atomic collision handling and bounded retries
+    const insertOrderStmt = db.prepare(`
       INSERT INTO orders (
         id, order_number, customer_id, customer_name, customer_phone, customer_address,
         city, district, subtotal, discount_amount, coupon_code, delivery_fee, total_amount,
@@ -1217,32 +1223,59 @@ router.post('/admin/orders', requireAuth, (req: AuthenticatedRequest, res: Respo
       ) VALUES (
         ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?
       )
-    `).run(
-      orderId,
-      orderNumber,
-      customerId,
-      customerName.trim(),
-      customerPhone.trim(),
-      customerAddress || '',
-      city || 'القاهرة',
-      district || '',
-      subtotal,
-      discountAmount,
-      couponCode ? String(couponCode).toUpperCase().trim() : null,
-      fee,
-      totalAmount,
-      deposit,
-      finalDepositStatus,
-      depositMethod || 'instapay',
-      depositReference || null,
-      null,
-      finalDepositStatus === 'confirmed' ? now : null,
-      finalDepositStatus === 'confirmed' ? req.admin!.name : null,
-      remaining,
-      notes || null,
-      now,
-      now
-    );
+    `);
+
+    let finalOrderNumber: string | null = null;
+    const maxOrderInsertRetries = 10;
+
+    for (let attempt = 0; attempt < maxOrderInsertRetries; attempt++) {
+      const candidateNumber = generateUniqueOrderNumber(db) || `#ALM-${Math.floor(10000 + Math.random() * 90000)}`;
+      db.exec('SAVEPOINT order_insert_sp;');
+      try {
+        insertOrderStmt.run(
+          orderId,
+          candidateNumber,
+          customerId,
+          customerName.trim(),
+          customerPhone.trim(),
+          customerAddress || '',
+          city || 'القاهرة',
+          district || '',
+          subtotal,
+          discountAmount,
+          couponCode ? String(couponCode).toUpperCase().trim() : null,
+          fee,
+          totalAmount,
+          deposit,
+          finalDepositStatus,
+          depositMethod || 'instapay',
+          depositReference || null,
+          null,
+          finalDepositStatus === 'confirmed' ? now : null,
+          finalDepositStatus === 'confirmed' ? req.admin!.name : null,
+          remaining,
+          notes || null,
+          now,
+          now
+        );
+        db.exec('RELEASE SAVEPOINT order_insert_sp;');
+        finalOrderNumber = candidateNumber;
+        break;
+      } catch (insertErr) {
+        db.exec('ROLLBACK TO SAVEPOINT order_insert_sp;');
+        if (isOrderNumberCollisionError(insertErr)) {
+          // Collision on orders.order_number: retry with a new candidate number
+          continue;
+        }
+        // Non-collision database error: abort and do not retry
+        throw insertErr;
+      }
+    }
+
+    if (!finalOrderNumber) {
+      db.exec('ROLLBACK;');
+      return res.status(500).json({ error: 'تعذر إنشاء رقم فريد للطلب بعد عدة محاولات، يرجى إعادة المحاولة' });
+    }
 
     // Insert Order Items
     const insertItem = db.prepare(`
@@ -1276,7 +1309,7 @@ router.post('/admin/orders', requireAuth, (req: AuthenticatedRequest, res: Respo
     db.exec('COMMIT;');
 
     const createdOrder = getOrderWithItems(orderId);
-    logAuditAction(req.admin, 'create_manual_order', 'order', orderId, null, { orderNumber, totalAmount }, req.ip);
+    logAuditAction(req.admin, 'create_manual_order', 'order', orderId, null, { orderNumber: finalOrderNumber, totalAmount }, req.ip);
     broadcastRealtimeEvent('new_order', createdOrder);
 
     return res.status(201).json(createdOrder);
@@ -1348,6 +1381,32 @@ router.put('/admin/orders/:id/deposit', requireAuth, requireRole(['super_admin',
   const newRemaining = Math.max(0, Math.round((existing.totalAmount - newDepositAmount) * 100) / 100);
   const effectiveDepositStatus = depositStatus !== undefined ? depositStatus : existing.depositStatus;
 
+  // Metadata lifecycle rules:
+  // A) depositStatus omitted: preserve existing deposit_confirmed_at / deposit_confirmed_by
+  // B) explicitly changed TO "confirmed": set to current timestamp and current admin
+  // C) explicitly changed FROM "confirmed" to non-confirmed: clear both to NULL
+  // D) explicitly set to "confirmed" when already "confirmed": preserve existing confirmation metadata
+  let finalConfirmedAt: string | null = existing.depositConfirmedAt || null;
+  let finalConfirmedBy: string | null = existing.depositConfirmedBy || null;
+
+  if (depositStatus !== undefined) {
+    if (depositStatus === 'confirmed') {
+      if (existing.depositStatus !== 'confirmed') {
+        // Transition TO confirmed
+        finalConfirmedAt = now;
+        finalConfirmedBy = req.admin!.name;
+      }
+      // If existing.depositStatus === 'confirmed', keep existing finalConfirmedAt and finalConfirmedBy
+    } else {
+      // Any non-confirmed status (pending, not_required, rejected)
+      if (existing.depositStatus === 'confirmed') {
+        // Transition FROM confirmed to non-confirmed
+        finalConfirmedAt = null;
+        finalConfirmedBy = null;
+      }
+    }
+  }
+
   db.prepare(`
     UPDATE orders SET
       deposit_status = COALESCE(?, deposit_status),
@@ -1356,8 +1415,8 @@ router.put('/admin/orders/:id/deposit', requireAuth, requireRole(['super_admin',
       deposit_method = COALESCE(?, deposit_method),
       deposit_reference = COALESCE(?, deposit_reference),
       deposit_notes = COALESCE(?, deposit_notes),
-      deposit_confirmed_at = CASE WHEN ? = 'confirmed' THEN ? ELSE deposit_confirmed_at END,
-      deposit_confirmed_by = CASE WHEN ? = 'confirmed' THEN ? ELSE deposit_confirmed_by END,
+      deposit_confirmed_at = ?,
+      deposit_confirmed_by = ?,
       updated_at = ?
     WHERE id = ?
   `).run(
@@ -1367,10 +1426,8 @@ router.put('/admin/orders/:id/deposit', requireAuth, requireRole(['super_admin',
     depositMethod !== undefined ? depositMethod : null,
     depositReference !== undefined ? depositReference : null,
     depositNotes !== undefined ? depositNotes : null,
-    effectiveDepositStatus,
-    now,
-    effectiveDepositStatus,
-    req.admin!.name,
+    finalConfirmedAt,
+    finalConfirmedBy,
     now,
     orderId
   );
@@ -2294,10 +2351,6 @@ router.post('/orders', (req: Request, res: Response) => {
   }
 
   const orderId = `order-${Date.now()}-${crypto.randomBytes(3).toString('hex')}`;
-  const orderNumber = generateUniqueOrderNumber(db);
-  if (!orderNumber) {
-    return res.status(500).json({ error: 'تعذر إنشاء رقم فريد للطلب بعد عدة محاولات، يرجى المحاولة لاحقاً' });
-  }
   const now = new Date().toISOString();
 
   recordOrderAttempt(rateLimitKeys);
@@ -2543,8 +2596,8 @@ router.post('/orders', (req: Request, res: Response) => {
       `).run(customerId, customerName.trim(), cleanPhone, city || 'القاهرة', district || '', customerAddress || '', totalAmount, now, now);
     }
 
-    // Insert Order
-    db.prepare(`
+    // Insert Order with atomic collision handling and bounded retries
+    const insertOrderStmt = db.prepare(`
       INSERT INTO orders (
         id, order_number, customer_id, customer_name, customer_phone, customer_address,
         city, district, subtotal, discount_amount, coupon_code, delivery_fee, total_amount,
@@ -2554,28 +2607,55 @@ router.post('/orders', (req: Request, res: Response) => {
       ) VALUES (
         ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, null, null, null, ?, 'pending', ?, ?, ?
       )
-    `).run(
-      orderId,
-      orderNumber,
-      customerId,
-      customerName.trim(),
-      cleanPhone,
-      customerAddress || '',
-      city || 'القاهرة',
-      district || '',
-      subtotal,
-      discountAmount,
-      couponCode ? String(couponCode).toUpperCase().trim() : null,
-      fee,
-      totalAmount,
-      depositAmount,
-      depositMethod || 'instapay',
-      depositReference || null,
-      remainingAmount,
-      notes || null,
-      now,
-      now
-    );
+    `);
+
+    let finalOrderNumber: string | null = null;
+    const maxOrderInsertRetries = 10;
+
+    for (let attempt = 0; attempt < maxOrderInsertRetries; attempt++) {
+      const candidateNumber = generateUniqueOrderNumber(db) || `#ALM-${Math.floor(10000 + Math.random() * 90000)}`;
+      db.exec('SAVEPOINT order_insert_sp;');
+      try {
+        insertOrderStmt.run(
+          orderId,
+          candidateNumber,
+          customerId,
+          customerName.trim(),
+          cleanPhone,
+          customerAddress || '',
+          city || 'القاهرة',
+          district || '',
+          subtotal,
+          discountAmount,
+          couponCode ? String(couponCode).toUpperCase().trim() : null,
+          fee,
+          totalAmount,
+          depositAmount,
+          depositMethod || 'instapay',
+          depositReference || null,
+          remainingAmount,
+          notes || null,
+          now,
+          now
+        );
+        db.exec('RELEASE SAVEPOINT order_insert_sp;');
+        finalOrderNumber = candidateNumber;
+        break;
+      } catch (insertErr) {
+        db.exec('ROLLBACK TO SAVEPOINT order_insert_sp;');
+        if (isOrderNumberCollisionError(insertErr)) {
+          // Collision on orders.order_number: retry with a new candidate number
+          continue;
+        }
+        // Non-collision database error: abort and do not retry
+        throw insertErr;
+      }
+    }
+
+    if (!finalOrderNumber) {
+      db.exec('ROLLBACK;');
+      return res.status(500).json({ error: 'تعذر إنشاء رقم فريد للطلب بعد عدة محاولات، يرجى المحاولة لاحقاً' });
+    }
 
     // Insert Order Items
     const insertItem = db.prepare(`
@@ -2611,7 +2691,7 @@ router.post('/orders', (req: Request, res: Response) => {
     const createdOrder = getOrderWithItems(orderId);
 
     // Audit and Realtime broadcast
-    logAuditAction(null, 'create_order', 'order', orderId, null, { orderNumber, totalAmount, customerPhone: cleanPhone }, req.ip);
+    logAuditAction(null, 'create_order', 'order', orderId, null, { orderNumber: finalOrderNumber, totalAmount, customerPhone: cleanPhone }, req.ip);
     broadcastRealtimeEvent('new_order', createdOrder);
 
     return res.status(201).json({

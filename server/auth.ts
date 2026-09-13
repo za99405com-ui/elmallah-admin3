@@ -88,18 +88,38 @@ interface OrderRateLimitRecord {
   timestamps: number[];
 }
 const orderRateLimits = new Map<string, OrderRateLimitRecord>();
+let lastOrderRateLimitCleanup = Date.now();
+
+function cleanupStaleOrderRateLimits(now: number, windowMs: number): void {
+  // Opportunistic cleanup: run at most once per 60 seconds or if map grows large (> 500 entries)
+  if (now - lastOrderRateLimitCleanup < 60 * 1000 && orderRateLimits.size < 500) {
+    return;
+  }
+  lastOrderRateLimitCleanup = now;
+
+  for (const [key, record] of orderRateLimits.entries()) {
+    record.timestamps = record.timestamps.filter((ts) => now - ts < windowMs);
+    if (record.timestamps.length === 0) {
+      orderRateLimits.delete(key);
+    }
+  }
+}
 
 export function checkOrderRateLimit(keys: string[]): boolean {
   const now = Date.now();
   const windowMs = 10 * 60 * 1000; // 10 minutes
   const maxAttempts = 5;
 
+  cleanupStaleOrderRateLimits(now, windowMs);
+
   for (const key of keys) {
     if (!key) continue;
     const record = orderRateLimits.get(key);
     if (record) {
       record.timestamps = record.timestamps.filter((ts) => now - ts < windowMs);
-      if (record.timestamps.length >= maxAttempts) {
+      if (record.timestamps.length === 0) {
+        orderRateLimits.delete(key);
+      } else if (record.timestamps.length >= maxAttempts) {
         return false;
       }
     }
@@ -110,6 +130,8 @@ export function checkOrderRateLimit(keys: string[]): boolean {
 export function recordOrderAttempt(keys: string[]): void {
   const now = Date.now();
   const windowMs = 10 * 60 * 1000;
+
+  cleanupStaleOrderRateLimits(now, windowMs);
 
   for (const key of keys) {
     if (!key) continue;
