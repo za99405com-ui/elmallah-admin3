@@ -94,7 +94,6 @@ router.post('/admin/auth/login', async (req: Request, res: Response) => {
 
   const normalizedEmail = email.toLowerCase().trim();
 
-  // Rate Limiting check on both Email and Client IP
   const rateLimitCheck = checkLoginRateLimit(normalizedEmail, clientIp);
   if (!rateLimitCheck.allowed) {
     return res.status(429).json({
@@ -102,60 +101,76 @@ router.post('/admin/auth/login', async (req: Request, res: Response) => {
     });
   }
 
-  // Authenticate strictly with Supabase Auth exactly once using exact password
   try {
     const sbDataResult = await supabaseAuthClient.auth.signInWithPassword({
       email: normalizedEmail,
-      password: password,
+      password,
     });
 
     if (!sbDataResult.error && sbDataResult.data?.user && sbDataResult.data?.session) {
-      clearLoginRateLimit(normalizedEmail, clientIp);
       const user = sbDataResult.data.user;
 
-      // 1. Look up the authenticated user's normalized email in the local admins table
-      const localAdmin = db.prepare('SELECT id, name, email, role, avatar_url FROM admins WHERE email = ?').get(normalizedEmail) as
-        | { id: string; name: string; email: string; role: string; avatar_url?: string }
-        | undefined;
+      const { data: adminRow, error: adminError } = await supabaseServer
+        .from('admins')
+        .select('id, name, email, role, avatar_url')
+        .eq('email', normalizedEmail)
+        .maybeSingle();
 
-      // 2. If there is NO matching local admin record, reject dashboard login with HTTP 403
-      if (!localAdmin) {
+      if (adminError) {
+        console.error('Supabase admin lookup failed:', adminError.message);
+        return res.status(503).json({ error: 'تعذر التحقق من صلاحيات الحساب' });
+      }
+
+      if (!adminRow) {
         return res.status(403).json({
           error: 'غير مصرح: هذا الحساب ليس لديه صلاحيات وصول مسجلة في لوحة الإدارة.',
         });
       }
 
-      // 3. The role must come ONLY from the trusted local admins database record.
-      // NEVER use user.user_metadata.role and NEVER default a missing or invalid role to super_admin.
       const validRoles = ['super_admin', 'manager', 'operator'] as const;
       type AdminRole = (typeof validRoles)[number];
 
-      if (!localAdmin.role || !validRoles.includes(localAdmin.role as AdminRole)) {
+      if (!adminRow.role || !validRoles.includes(adminRow.role as AdminRole)) {
         return res.status(403).json({
           error: 'غير مصرح: دور الحساب غير صالح أو غير معتمد في لوحة الإدارة.',
         });
       }
 
-      const role: AdminRole = localAdmin.role as AdminRole;
+      clearLoginRateLimit(normalizedEmail, clientIp);
+
+      const role = adminRow.role as AdminRole;
 
       const payload = {
-        id: localAdmin.id || user.id,
+        id: adminRow.id || user.id,
         name:
-          localAdmin.name ||
+          adminRow.name ||
           normalizedEmail.split('@')[0] ||
           'كابتن زياد الملاح (المدير العام)',
-        email: localAdmin.email || user.email || normalizedEmail,
+        email: adminRow.email || user.email || normalizedEmail,
         role,
         avatarUrl:
-          localAdmin.avatar_url ||
+          adminRow.avatar_url ||
           'https://images.unsplash.com/photo-1534528741775-53994a69daeb?w=100&auto=format&fit=crop&q=80',
       };
 
-      try {
-        db.prepare('UPDATE admins SET last_login = ? WHERE email = ?').run(new Date().toISOString(), normalizedEmail);
-      } catch {}
+      const { error: lastLoginError } = await supabaseServer
+        .from('admins')
+        .update({ last_login: new Date().toISOString() })
+        .eq('email', normalizedEmail);
 
-      logAuditAction(payload, 'login_supabase', 'admin', user.id, null, { email: user.email, role }, String(clientIp));
+      if (lastLoginError) {
+        console.error('Supabase admin last_login update failed:', lastLoginError.message);
+      }
+
+      logAuditAction(
+        payload,
+        'login_supabase',
+        'admin',
+        user.id,
+        null,
+        { email: user.email, role },
+        String(clientIp)
+      );
 
       return res.json({
         token: sbDataResult.data.session.access_token,
@@ -163,11 +178,12 @@ router.post('/admin/auth/login', async (req: Request, res: Response) => {
         admin: payload,
       });
     }
-  } catch (err) {
-    // Network transient error
+  } catch {
+    // Authentication/network failure is handled below.
   }
 
   recordFailedLogin(normalizedEmail, clientIp);
+
   return res.status(401).json({
     error: 'بيانات الدخول غير صحيحة. يرجى التأكد من البريد الإلكتروني وكلمة المرور المسجلة في Supabase.',
   });
@@ -202,19 +218,28 @@ router.post('/admin/auth/change-password', requireAuth, async (req: Authenticate
 });
 
 // GET /api/admin/auth/admins (Super Admin only)
-router.get('/admin/auth/admins', requireAuth, requireRole(['super_admin']), (req: AuthenticatedRequest, res: Response) => {
-  const rows = db.prepare('SELECT id, name, email, role, avatar_url, created_at, last_login FROM admins ORDER BY created_at DESC').all();
-  return res.json(rows);
+router.get('/admin/auth/admins', requireAuth, requireRole(['super_admin']), async (_req: AuthenticatedRequest, res: Response) => {
+  const { data, error } = await supabaseServer
+    .from('admins')
+    .select('id, name, email, role, avatar_url, created_at, last_login')
+    .order('created_at', { ascending: false });
+
+  if (error) {
+    console.error('Supabase admins read failed:', error.message);
+    return res.status(503).json({ error: 'تعذر تحميل المستخدمين الإداريين' });
+  }
+
+  return res.json(data || []);
 });
 
-// POST /api/admin/auth/admins (Super Admin only - creates user in Supabase Auth)
+// POST /api/admin/auth/admins
 router.post('/admin/auth/admins', requireAuth, requireRole(['super_admin']), async (req: AuthenticatedRequest, res: Response) => {
   const { name, email, password, role } = req.body;
+
   if (!name || !email || !password || !role) {
     return res.status(400).json({ error: 'جميع الحقول مطلوبة' });
   }
 
-  // ISSUE 1: Strict admin role validation
   const ALLOWED_ADMIN_ROLES = ['super_admin', 'manager', 'operator'] as const;
   type AllowedAdminRole = (typeof ALLOWED_ADMIN_ROLES)[number];
 
@@ -224,29 +249,40 @@ router.post('/admin/auth/admins', requireAuth, requireRole(['super_admin']), asy
     });
   }
 
-  const validatedRole: AllowedAdminRole = role as AllowedAdminRole;
-
   if (typeof email !== 'string') {
     return res.status(400).json({ error: 'صيغة البريد الإلكتروني غير صحيحة' });
   }
 
   const normalizedEmail = email.toLowerCase().trim();
+  const cleanName = typeof name === 'string' ? name.trim() : String(name);
+
   if (!normalizedEmail) {
     return res.status(400).json({ error: 'البريد الإلكتروني مطلوب' });
   }
 
-  // ISSUE 2: Check if email already exists in local admins table before Supabase user creation
-  const existingAdmin = db.prepare('SELECT id FROM admins WHERE email = ?').get(normalizedEmail);
+  const { data: existingAdmin, error: lookupError } = await supabaseServer
+    .from('admins')
+    .select('id')
+    .eq('email', normalizedEmail)
+    .maybeSingle();
+
+  if (lookupError) {
+    console.error('Supabase admin duplicate check failed:', lookupError.message);
+    return res.status(503).json({ error: 'تعذر التحقق من البريد الإلكتروني' });
+  }
+
   if (existingAdmin) {
     return res.status(409).json({ error: 'البريد الإلكتروني مسجل بالفعل لمسؤول آخر' });
   }
+
+  const validatedRole = role as AllowedAdminRole;
 
   try {
     const { data, error } = await supabaseServer.auth.admin.createUser({
       email: normalizedEmail,
       password,
       email_confirm: true,
-      user_metadata: { name: typeof name === 'string' ? name.trim() : name, role: validatedRole },
+      user_metadata: { name: cleanName },
     });
 
     if (error) {
@@ -258,34 +294,49 @@ router.post('/admin/auth/admins', requireAuth, requireRole(['super_admin']), asy
     }
 
     const id = data.user.id;
+    const createdAt = new Date().toISOString();
+    const avatarUrl =
+      'https://images.unsplash.com/photo-1534528741775-53994a69daeb?w=100&auto=format&fit=crop&q=80';
 
-    // Normal INSERT INTO admins (NOT INSERT OR REPLACE)
-    try {
-      db.prepare(`
-        INSERT INTO admins (id, name, email, role, avatar_url, created_at)
-        VALUES (?, ?, ?, ?, ?, ?)
-      `).run(
+    const { error: insertError } = await supabaseServer
+      .from('admins')
+      .insert({
         id,
-        typeof name === 'string' ? name.trim() : name,
-        normalizedEmail,
-        validatedRole,
-        'https://images.unsplash.com/photo-1534528741775-53994a69daeb?w=100&auto=format&fit=crop&q=80',
-        new Date().toISOString()
-      );
-    } catch (dbErr) {
-      // Rollback / cleanup newly created Supabase user if local DB insert fails
+        name: cleanName,
+        email: normalizedEmail,
+        role: validatedRole,
+        avatar_url: avatarUrl,
+        created_at: createdAt,
+      });
+
+    if (insertError) {
       try {
         await supabaseServer.auth.admin.deleteUser(id);
       } catch {
-        // Cleanup attempt completed
+        // Best-effort cleanup.
       }
-      return res.status(500).json({ error: 'فشل حفظ بيانات المسؤول محلياً' });
+
+      console.error('Supabase admin profile insert failed:', insertError.message);
+      return res.status(500).json({ error: 'فشل حفظ بيانات المسؤول' });
     }
 
-    logAuditAction(req.admin, 'create_admin_supabase', 'admin', id, null, { email: normalizedEmail, role: validatedRole }, req.ip);
+    logAuditAction(
+      req.admin,
+      'create_admin_supabase',
+      'admin',
+      id,
+      null,
+      { email: normalizedEmail, role: validatedRole },
+      req.ip
+    );
 
-    return res.status(201).json({ id, name: typeof name === 'string' ? name.trim() : name, email: normalizedEmail, role: validatedRole });
-  } catch (err) {
+    return res.status(201).json({
+      id,
+      name: cleanName,
+      email: normalizedEmail,
+      role: validatedRole,
+    });
+  } catch {
     return res.status(500).json({ error: 'حدث خطأ أثناء إنشاء المستخدم في Supabase' });
   }
 });
@@ -293,18 +344,54 @@ router.post('/admin/auth/admins', requireAuth, requireRole(['super_admin']), asy
 // DELETE /api/admin/auth/admins/:id
 router.delete('/admin/auth/admins/:id', requireAuth, requireRole(['super_admin']), async (req: AuthenticatedRequest, res: Response) => {
   const targetId = req.params.id;
+
   if (targetId === req.admin!.id) {
     return res.status(400).json({ error: 'لا يمكنك حذف حسابك الحالي' });
   }
 
-  try {
-    await supabaseServer.auth.admin.deleteUser(targetId);
-  } catch {
-    // Proceed with local delete even if already removed from supabase
+  const { data: existing, error: lookupError } = await supabaseServer
+    .from('admins')
+    .select('*')
+    .eq('id', targetId)
+    .maybeSingle();
+
+  if (lookupError) {
+    console.error('Supabase admin delete lookup failed:', lookupError.message);
+    return res.status(503).json({ error: 'تعذر تحميل بيانات المستخدم الإداري' });
   }
 
-  db.prepare('DELETE FROM admins WHERE id = ?').run(targetId);
-  logAuditAction(req.admin, 'delete_admin_supabase', 'admin', targetId, null, null, req.ip);
+  if (!existing) {
+    return res.status(404).json({ error: 'المستخدم الإداري غير موجود' });
+  }
+
+  const { error: authDeleteError } = await supabaseServer.auth.admin.deleteUser(targetId);
+
+  if (authDeleteError) {
+    console.error('Supabase Auth admin delete failed:', authDeleteError.message);
+    return res.status(503).json({ error: 'تعذر حذف حساب المستخدم من نظام المصادقة' });
+  }
+
+  const { error: profileDeleteError } = await supabaseServer
+    .from('admins')
+    .delete()
+    .eq('id', targetId);
+
+  if (profileDeleteError) {
+    console.error('Supabase admin profile delete failed:', profileDeleteError.message);
+    return res.status(503).json({
+      error: 'تم حذف حساب المصادقة لكن تعذر حذف سجل المسؤول. يرجى مراجعة قاعدة البيانات.',
+    });
+  }
+
+  logAuditAction(
+    req.admin,
+    'delete_admin_supabase',
+    'admin',
+    targetId,
+    existing,
+    null,
+    req.ip
+  );
 
   return res.json({ message: 'تم حذف المستخدم الإداري' });
 });
@@ -326,66 +413,141 @@ router.get('/admin/realtime', requireAuth, (req: AuthenticatedRequest, res: Resp
 // ==========================================
 // 3. DASHBOARD STATS
 // ==========================================
-router.get('/admin/dashboard/stats', requireAuth, (_req: AuthenticatedRequest, res: Response) => {
-  const totalOrdersRow = db.prepare('SELECT COUNT(*) as count FROM orders').get() as { count: number };
-  
-  // Cutoff 3 AM calculation for "today"
+router.get('/admin/dashboard/stats', requireAuth, async (_req: AuthenticatedRequest, res: Response) => {
   const now = new Date();
   const cutoffToday = new Date(now);
+
   if (now.getHours() < 3) {
     cutoffToday.setDate(cutoffToday.getDate() - 1);
   }
+
   cutoffToday.setHours(3, 0, 0, 0);
   const cutoffIso = cutoffToday.toISOString();
 
-  const todayOrdersRow = db
-    .prepare('SELECT COUNT(*) as count, COALESCE(SUM(total_amount), 0) as totalSales FROM orders WHERE created_at >= ?')
-    .get(cutoffIso) as { count: number; totalSales: number };
+  const [
+    totalOrdersResult,
+    todayOrdersResult,
+    statusResult,
+    pendingDepositsResult,
+    totalSalesResult,
+    customersResult,
+    productsResult,
+    variantsResult,
+    activeOrdersResult,
+  ] = await Promise.all([
+    supabaseServer.from('orders').select('id', { count: 'exact', head: true }),
 
-  const statusRows = db.prepare('SELECT status, COUNT(*) as count FROM orders GROUP BY status').all() as {
-    status: string;
-    count: number;
-  }[];
+    supabaseServer
+      .from('orders')
+      .select('total_amount')
+      .gte('created_at', cutoffIso),
 
-  const statusCounts: Record<string, number> = {};
-  for (const s of statusRows) {
-    statusCounts[s.status] = s.count;
+    supabaseServer
+      .from('orders')
+      .select('status'),
+
+    supabaseServer
+      .from('orders')
+      .select('deposit_amount')
+      .eq('deposit_status', 'pending'),
+
+    supabaseServer
+      .from('orders')
+      .select('total_amount')
+      .neq('status', 'cancelled'),
+
+    supabaseServer.from('customers').select('id', { count: 'exact', head: true }),
+
+    supabaseServer.from('products').select('id', { count: 'exact', head: true }),
+
+    supabaseServer.from('product_variants').select('id', { count: 'exact', head: true }),
+
+    supabaseServer
+      .from('orders')
+      .select('id')
+      .in('status', ['pending', 'preparing']),
+  ]);
+
+  const resultsWithErrors = [
+    totalOrdersResult,
+    todayOrdersResult,
+    statusResult,
+    pendingDepositsResult,
+    totalSalesResult,
+    customersResult,
+    productsResult,
+    variantsResult,
+    activeOrdersResult,
+  ];
+
+  const failed = resultsWithErrors.find((result) => result.error);
+
+  if (failed?.error) {
+    console.error('Supabase dashboard stats failed:', failed.error.message);
+    return res.status(503).json({ error: 'تعذر تحميل إحصائيات لوحة التحكم' });
   }
 
-  const depositPendingRow = db
-    .prepare("SELECT COUNT(*) as count, COALESCE(SUM(deposit_amount), 0) as totalAmount FROM orders WHERE deposit_status = 'pending'")
-    .get() as { count: number; totalAmount: number };
+  const todayOrders = todayOrdersResult.data || [];
+  const statusRows = statusResult.data || [];
+  const pendingDeposits = pendingDepositsResult.data || [];
+  const salesOrders = totalSalesResult.data || [];
 
-  const totalSalesRow = db
-    .prepare("SELECT COALESCE(SUM(total_amount), 0) as totalSales FROM orders WHERE status != 'cancelled'")
-    .get() as { totalSales: number };
+  const statusCounts: Record<string, number> = {};
+  for (const row of statusRows) {
+    const status = String(row.status || '');
+    if (status) statusCounts[status] = (statusCounts[status] || 0) + 1;
+  }
 
-  const customersCountRow = db.prepare('SELECT COUNT(*) as count FROM customers').get() as { count: number };
-  const productsCountRow = db.prepare('SELECT COUNT(*) as count FROM products').get() as { count: number };
-  const activeDemandsRow = db.prepare(`
-    SELECT COUNT(DISTINCT oi.product_id) as count 
-    FROM order_items oi 
-    JOIN orders o ON oi.order_id = o.id 
-    WHERE o.status IN ('pending', 'preparing')
-  `).get() as { count: number } | undefined;
-  const totalVariantsRow = db.prepare('SELECT COUNT(*) as count FROM product_variants').get() as { count: number };
+  const todaySales = todayOrders.reduce(
+    (sum, row) => sum + Number(row.total_amount || 0),
+    0
+  );
+
+  const pendingDepositsAmount = pendingDeposits.reduce(
+    (sum, row) => sum + Number(row.deposit_amount || 0),
+    0
+  );
+
+  const totalSales = salesOrders.reduce(
+    (sum, row) => sum + Number(row.total_amount || 0),
+    0
+  );
+
+  let activeDemandsCount = 0;
+  const activeOrderIds = (activeOrdersResult.data || []).map((o) => o.id);
+
+  if (activeOrderIds.length > 0) {
+    const { data: demandItems, error: demandError } = await supabaseServer
+      .from('order_items')
+      .select('product_id')
+      .in('order_id', activeOrderIds);
+
+    if (demandError) {
+      console.error('Supabase active demands stats failed:', demandError.message);
+      return res.status(503).json({ error: 'تعذر تحميل الطلبات النشطة' });
+    }
+
+    activeDemandsCount = new Set(
+      (demandItems || []).map((item) => String(item.product_id))
+    ).size;
+  }
 
   return res.json({
-    totalOrders: totalOrdersRow.count,
-    todayOrders: todayOrdersRow.count,
-    pendingOrders: statusCounts['pending'] || 0,
-    preparingOrders: statusCounts['preparing'] || 0,
-    deliveringOrders: statusCounts['delivering'] || 0,
-    completedOrders: statusCounts['completed'] || 0,
-    cancelledOrders: statusCounts['cancelled'] || 0,
-    pendingDepositsCount: depositPendingRow.count,
-    pendingDepositsAmount: depositPendingRow.totalAmount,
-    totalSales: totalSalesRow.totalSales,
-    todaySales: todayOrdersRow.totalSales,
-    totalCustomers: customersCountRow.count,
-    totalProducts: productsCountRow.count,
-    activeDemandsCount: activeDemandsRow?.count || 0,
-    totalVariants: totalVariantsRow.count,
+    totalOrders: totalOrdersResult.count || 0,
+    todayOrders: todayOrders.length,
+    pendingOrders: statusCounts.pending || 0,
+    preparingOrders: statusCounts.preparing || 0,
+    deliveringOrders: statusCounts.delivering || 0,
+    completedOrders: statusCounts.completed || 0,
+    cancelledOrders: statusCounts.cancelled || 0,
+    pendingDepositsCount: pendingDeposits.length,
+    pendingDepositsAmount,
+    totalSales,
+    todaySales,
+    totalCustomers: customersResult.count || 0,
+    totalProducts: productsResult.count || 0,
+    activeDemandsCount,
+    totalVariants: variantsResult.count || 0,
   });
 });
 
@@ -2380,10 +2542,20 @@ router.put('/admin/settings', requireAuth, requireRole(['super_admin', 'manager'
 // ==========================================
 // 10. AUDIT LOGS
 // ==========================================
-router.get('/admin/audit-logs', requireAuth, requireRole(['super_admin', 'manager']), (_req: AuthenticatedRequest, res: Response) => {
-  const logs = db.prepare('SELECT * FROM audit_logs ORDER BY created_at DESC LIMIT 100').all() as Record<string, unknown>[];
+router.get('/admin/audit-logs', requireAuth, requireRole(['super_admin', 'manager']), async (_req: AuthenticatedRequest, res: Response) => {
+  const { data: logs, error } = await supabaseServer
+    .from('audit_logs')
+    .select('*')
+    .order('created_at', { ascending: false })
+    .limit(100);
+
+  if (error) {
+    console.error('Supabase audit logs read failed:', error.message);
+    return res.status(503).json({ error: 'تعذر تحميل سجل العمليات' });
+  }
+
   return res.json(
-    logs.map((l) => ({
+    (logs || []).map((l) => ({
       id: l.id,
       adminId: l.admin_id,
       adminName: l.admin_name,
