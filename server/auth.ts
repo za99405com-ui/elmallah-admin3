@@ -177,10 +177,19 @@ export async function requireAuth(req: AuthenticatedRequest, res: Response, next
     const sbUser = data.user;
     const email = (sbUser.email || '').toLowerCase().trim();
 
-    // Look up trusted local admin record to retrieve role from database only
-    const localAdmin = db.prepare('SELECT id, name, role, avatar_url FROM admins WHERE email = ?').get(email) as
-      | { id: string; name: string; role: string; avatar_url?: string }
-      | undefined;
+    // Look up trusted admin record in Supabase to retrieve role from database only
+    const { data: localAdmin, error: adminLookupError } = await supabaseServer
+      .from('admins')
+      .select('id, name, role, avatar_url')
+      .eq('email', email)
+      .maybeSingle();
+
+    if (adminLookupError) {
+      console.error('Supabase admin lookup failed:', adminLookupError.message);
+      return res.status(503).json({
+        error: 'تعذر التحقق من صلاحيات حساب الإدارة.',
+      });
+    }
 
     if (!localAdmin) {
       return res.status(403).json({
@@ -250,25 +259,31 @@ export function logAuditAction(
   newValues?: unknown,
   ipAddress?: string
 ) {
-  try {
-    const id = `audit-${Date.now()}-${crypto.randomBytes(4).toString('hex')}`;
-    db.prepare(`
-      INSERT INTO audit_logs (id, admin_id, admin_name, admin_email, action, entity_type, entity_id, old_values, new_values, ip_address, created_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    `).run(
-      id,
-      admin?.id || 'system',
-      admin?.name || 'النظام',
-      admin?.email || 'system@almallah.com',
-      action,
-      entityType,
-      entityId,
-      oldValues ? JSON.stringify(oldValues) : null,
-      newValues ? JSON.stringify(newValues) : null,
-      ipAddress || 'unknown',
-      new Date().toISOString()
-    );
-  } catch (err) {
-    console.error('Audit log write error:', err);
-  }
+  const id = `audit-${Date.now()}-${crypto.randomBytes(4).toString('hex')}`;
+
+  void (async () => {
+    try {
+      const { error } = await supabaseServer
+        .from('audit_logs')
+        .insert({
+          id,
+          admin_id: admin?.id || 'system',
+          admin_name: admin?.name || 'النظام',
+          admin_email: admin?.email || 'system@almallah.com',
+          action,
+          entity_type: entityType,
+          entity_id: entityId,
+          old_values: oldValues ? JSON.stringify(oldValues) : null,
+          new_values: newValues ? JSON.stringify(newValues) : null,
+          ip_address: ipAddress || 'unknown',
+          created_at: new Date().toISOString(),
+        });
+
+      if (error) {
+        console.error('Supabase audit log write error:', error.message);
+      }
+    } catch (err) {
+      console.error('Supabase audit log write error:', err);
+    }
+  })();
 }
