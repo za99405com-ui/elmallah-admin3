@@ -18,7 +18,6 @@ import {
 import { api, getStoredToken, setStoredToken, removeStoredToken } from '../lib/api';
 import {
   getSupabaseClient,
-  signInWithSupabase,
   signOutFromSupabase,
   getSupabaseSession,
 } from '../lib/supabase';
@@ -765,34 +764,19 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
   // 10. Authentication Handlers
   const login = async (email: string, pass: string): Promise<boolean> => {
     try {
-      // 1. Authenticate with Supabase Auth
-      const { session, user, error: sbError } = await signInWithSupabase(email, pass);
-      if (session?.access_token && user) {
-        setStoredToken(session.access_token);
-        try {
-          // Fetch trusted admin record from backend database
-          const meRes = await api.getMe();
-          if (meRes?.admin) {
-            setAdminUser(meRes.admin);
-            setAuthCredentials({ email: meRes.admin.email });
-            setIsAuthenticated(true);
-            addToast({
-              type: 'success',
-              title: `مرحباً بك يا ${meRes.admin.name}!`,
-              description: 'تم تسجيل الدخول بنجاح عبر حساب Supabase السحابي',
-            });
-            await refreshData();
-            return true;
-          }
-        } catch (backendAuthErr) {
-          removeStoredToken();
-          await signOutFromSupabase();
-          throw backendAuthErr;
-        }
+      const normalizedEmail = (email || '').toLowerCase().trim();
+      if (!normalizedEmail || typeof pass !== 'string' || pass.length === 0) {
+        addToast({
+          type: 'error',
+          title: 'خطأ في تسجيل الدخول',
+          description: 'يرجى إدخال البريد الإلكتروني وكلمة المرور',
+        });
+        return false;
       }
 
-      // 2. Fallback to API login endpoint
-      const res = await api.login(email, pass);
+      // Normal admin dashboard login uses ONLY the backend api.login(email, pass) path.
+      // The backend /api/admin/auth/login is the single authentication authority.
+      const res = await api.login(normalizedEmail, pass);
       if (res?.token && res?.admin) {
         setStoredToken(res.token);
         setAdminUser(res.admin);
@@ -807,15 +791,12 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
         return true;
       }
 
-      if (sbError) {
-        throw sbError;
-      }
       return false;
     } catch (err) {
       const msg = err instanceof Error ? err.message : 'بيانات الدخول غير صحيحة';
       addToast({
         type: 'error',
-        title: 'خطأ في تسجيل الدخول عبر Supabase',
+        title: 'خطأ في تسجيل الدخول',
         description: msg,
       });
       return false;
