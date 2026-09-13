@@ -1,6 +1,6 @@
 import crypto from 'node:crypto';
 import { Request, Response, NextFunction } from 'express';
-import { supabaseServer } from './supabase';
+import { supabaseServer } from './supabase.js';
 
 export interface AdminPayload {
   id: string;

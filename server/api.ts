@@ -13,12 +13,12 @@ import {
   checkOrderRateLimit,
   recordOrderAttempt,
   logAuditAction,
-} from './auth';
-import { addRealtimeClient, broadcastRealtimeEvent } from './realtime';
+} from './auth.js';
+import { addRealtimeClient, broadcastRealtimeEvent } from './realtime.js';
 
 export const router = Router();
 
-import { supabaseAuthClient, supabaseServer } from './supabase';
+import { supabaseAuthClient, supabaseServer } from './supabase.js';
 
 // Safe numeric validation helper
 function parseAndValidateNumber(
