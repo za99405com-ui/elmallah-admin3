@@ -1236,32 +1236,65 @@ router.post('/admin/orders', requireAuth, async (req: AuthenticatedRequest, res:
   if (!Number.isFinite(fee) || fee < 0) return res.status(400).json({ error: 'سعر التوصيل غير صالح' });
   const totalAmount = Math.max(0, Math.round((subtotal - (couponResult.discountAmount || 0) + fee) * 100) / 100);
 
-  let deposit = Number(depositAmount || 0);
-  if (paymentMode === 'cash_on_delivery' && depositAmount === undefined) {
-    deposit = 0;
-  }
-  if (!Number.isFinite(deposit) || deposit < 0 || deposit > totalAmount) return res.status(400).json({ error: 'قيمة العربون غير صالحة' });
-
-  const defaultStatus = paymentMode === 'cash_on_delivery' ? 'not_required' : (deposit > 0 ? 'confirmed' : 'pending');
-  const finalDepositStatus = depositStatus || defaultStatus;
-  if (!['confirmed', 'pending', 'not_required', 'rejected'].includes(finalDepositStatus)) return res.status(400).json({ error: 'حالة العربون غير صالحة' });
-
+  // Determine effective paymentMode with legacy fallback
   const effectivePaymentMode: 'deposit_online' | 'cash_on_delivery' =
     paymentMode ||
-    (finalDepositStatus === 'not_required' || depositMethod === 'cash_on_delivery'
+    (depositStatus === 'not_required' || depositMethod === 'cash_on_delivery'
       ? 'cash_on_delivery'
       : 'deposit_online');
 
-  const defaultMethod = effectivePaymentMode === 'cash_on_delivery' ? 'cash_on_delivery' : 'instapay';
-  const finalDepositMethod = depositMethod || defaultMethod;
+  // Prevent inconsistent combinations
+  if (effectivePaymentMode === 'cash_on_delivery') {
+    if (depositAmount !== undefined && Number(depositAmount) > 0) {
+      return res.status(400).json({ error: 'لا يمكن تحديد قيمة عربون أكبر من صفر عند اختيار الدفع عند الاستلام (cash_on_delivery)' });
+    }
+    if (depositStatus !== undefined && depositStatus !== 'not_required') {
+      return res.status(400).json({ error: 'حالة العربون غير متوافقة مع الدفع عند الاستلام، يجب أن تكون not_required' });
+    }
+    if (depositMethod !== undefined && depositMethod !== 'cash_on_delivery') {
+      return res.status(400).json({ error: 'طريقة العربون غير متوافقة مع الدفع عند الاستلام، يجب أن تكون cash_on_delivery' });
+    }
+  } else {
+    if (depositMethod === 'cash_on_delivery') {
+      return res.status(400).json({ error: 'لا يمكن اختيار طريقة دفع عند الاستلام (cash_on_delivery) مع وضع العربون الإلكتروني (deposit_online)' });
+    }
+  }
+
+  let deposit = 0;
+  let finalDepositStatus: 'confirmed' | 'pending' | 'not_required' | 'rejected' = 'not_required';
+  let finalDepositMethod: string = 'cash_on_delivery';
+  let finalDepositReference: string | null = null;
+  let remainingAmount = totalAmount;
+
+  if (effectivePaymentMode === 'cash_on_delivery') {
+    // ALWAYS enforce consistency for cash_on_delivery
+    deposit = 0;
+    finalDepositStatus = 'not_required';
+    finalDepositMethod = 'cash_on_delivery';
+    finalDepositReference = null;
+    remainingAmount = totalAmount;
+  } else {
+    deposit = Number(depositAmount || 0);
+    if (!Number.isFinite(deposit) || deposit < 0 || deposit > totalAmount) {
+      return res.status(400).json({ error: 'قيمة العربون غير صالحة' });
+    }
+
+    finalDepositStatus = depositStatus || (deposit > 0 ? 'confirmed' : 'pending');
+    if (!['confirmed', 'pending', 'not_required', 'rejected'].includes(finalDepositStatus)) {
+      return res.status(400).json({ error: 'حالة العربون غير صالحة' });
+    }
+
+    finalDepositMethod = depositMethod || 'instapay';
+    finalDepositReference = depositReference ? String(depositReference).trim() : null;
+    remainingAmount = Math.max(0, Math.round((totalAmount - deposit) * 100) / 100);
+  }
 
   const now = new Date().toISOString();
-  const remainingAmount = Math.max(0, Math.round((totalAmount - deposit) * 100) / 100);
   const payload = {
     customerName: String(customerName).trim(), customerPhone: String(customerPhone).trim(), customerAddress: customerAddress || '',
     city: city || 'القاهرة', district: district || '', subtotal, discountAmount: couponResult.discountAmount || 0,
     couponCode: couponResult.cleanCode, deliveryFee: fee, totalAmount, depositAmount: deposit, depositStatus: finalDepositStatus,
-    depositMethod: finalDepositMethod, depositReference: depositReference || null, depositNotes: null,
+    depositMethod: finalDepositMethod, depositReference: finalDepositReference, depositNotes: null,
     depositConfirmedAt: finalDepositStatus === 'confirmed' ? now : null,
     depositConfirmedBy: finalDepositStatus === 'confirmed' ? req.admin!.name : null,
     remainingAmount, status: 'pending', notes: notes || null,
