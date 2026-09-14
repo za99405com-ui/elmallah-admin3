@@ -159,9 +159,7 @@ const AppContext = createContext<AppContextType | undefined>(undefined);
 
 export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => {
   // 1. Authentication State
-  const [isAuthenticated, setIsAuthenticated] = useState<boolean>(() => {
-    return Boolean(getStoredToken());
-  });
+  const [isAuthenticated, setIsAuthenticated] = useState<boolean>(false);
   const [isLoadingAuth, setIsLoadingAuth] = useState<boolean>(true);
   const [adminUser, setAdminUser] = useState<AdminUser>(defaultAdminUser);
   const [authCredentials, setAuthCredentials] = useState<AuthCredentials>({
@@ -521,13 +519,14 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
   // 9. Real-Time SSE Stream Listener (Authenticated via Authorization: Bearer header)
   useEffect(() => {
     const token = getStoredToken();
-    if (!isAuthenticated || !token) {
+    if (isLoadingAuth || !isAuthenticated || !token) {
       setRealtimeConnected(false);
       return;
     }
 
     const abortController = new AbortController();
     let retryTimeoutId: ReturnType<typeof setTimeout> | null = null;
+    let activeReader: ReadableStreamDefaultReader<Uint8Array> | null = null;
 
     const dispatchRealtimeEvent = (eventType: string, dataStr: string) => {
       if (eventType === 'connected') {
@@ -762,7 +761,8 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
       let shouldReconnect = true;
 
       try {
-        const response = await fetch('/api/admin/realtime', {
+        const url = `/api/admin/realtime?token=${encodeURIComponent(token)}`;
+        const response = await fetch(url, {
           method: 'GET',
           headers: {
             Authorization: `Bearer ${token}`,
@@ -783,6 +783,7 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
         }
 
         const reader = response.body.getReader();
+        activeReader = reader;
         const decoder = new TextDecoder('utf-8');
         let buffer = '';
 
@@ -835,12 +836,18 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
           }
         }
       } catch (err: unknown) {
-        if ((err as Error)?.name === 'AbortError' || abortController.signal.aborted) {
+        const error = err as Error;
+        if (
+          error?.name === 'AbortError' ||
+          abortController.signal.aborted ||
+          error?.message?.includes('aborted')
+        ) {
           shouldReconnect = false;
           return;
         }
-        console.error('Realtime SSE stream error:', err);
+        // Gracefully reconnect on transient network drops
       } finally {
+        activeReader = null;
         setRealtimeConnected(false);
         if (shouldReconnect && !abortController.signal.aborted) {
           retryTimeoutId = setTimeout(connectSSE, 3000);
@@ -852,12 +859,16 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
 
     return () => {
       abortController.abort();
+      if (activeReader) {
+        activeReader.cancel().catch(() => {});
+        activeReader = null;
+      }
       if (retryTimeoutId) {
         clearTimeout(retryTimeoutId);
       }
       setRealtimeConnected(false);
     };
-  }, [isAuthenticated, addToast, sendPhoneNotification]);
+  }, [isAuthenticated, isLoadingAuth, addToast, sendPhoneNotification]);
 
   // 10. Authentication Handlers
   const login = async (email: string, pass: string): Promise<boolean> => {

@@ -377,14 +377,26 @@ router.delete('/admin/auth/admins/:id', requireAuth, requireRole(['super_admin']
 // 2. REALTIME SSE STREAM (SECURED VIA SUPABASE SESSION & LOCAL ADMIN)
 // ==========================================
 router.get('/admin/realtime', requireAuth, (req: AuthenticatedRequest, res: Response) => {
-  res.setHeader('Content-Type', 'text/event-stream');
-  res.setHeader('Cache-Control', 'no-cache');
-  res.setHeader('Connection', 'keep-alive');
-  res.setHeader('X-Accel-Buffering', 'no');
+  // Prevent socket timeout for persistent SSE connections
+  req.socket.setTimeout(0);
+  req.socket.setNoDelay(true);
+  req.socket.setKeepAlive(true);
+
+  res.writeHead(200, {
+    'Content-Type': 'text/event-stream',
+    'Cache-Control': 'no-cache, no-transform',
+    'Connection': 'keep-alive',
+    'X-Accel-Buffering': 'no',
+    'Content-Encoding': 'none',
+  });
   res.flushHeaders();
 
   const clientId = `client-${Date.now()}-${Math.random().toString(36).substring(2, 7)}`;
   addRealtimeClient(clientId, res, req.admin!.id);
+
+  req.on('close', () => {
+    // client cleanup
+  });
 });
 
 // ==========================================
@@ -1040,6 +1052,14 @@ function parseSnapshotData(value: unknown) {
 }
 
 function mapOrderRow(order: Record<string, unknown>, items: Record<string, unknown>[] = []) {
+  const depositStatus = String(order.deposit_status || 'not_required');
+  const depositMethod = order.deposit_method as string | null;
+  const paymentMode: 'deposit_online' | 'cash_on_delivery' =
+    (order.payment_mode as 'deposit_online' | 'cash_on_delivery') ||
+    (depositStatus === 'not_required' || depositMethod === 'cash_on_delivery'
+      ? 'cash_on_delivery'
+      : 'deposit_online');
+
   return {
     id: String(order.id), orderNumber: String(order.order_number),
     customerId: order.customer_id ? String(order.customer_id) : undefined,
@@ -1048,10 +1068,12 @@ function mapOrderRow(order: Record<string, unknown>, items: Record<string, unkno
     subtotal: Number(order.subtotal || 0), discountAmount: Number(order.discount_amount || 0),
     couponCode: order.coupon_code as string | null, deliveryFee: Number(order.delivery_fee || 0),
     totalAmount: Number(order.total_amount || 0), depositAmount: Number(order.deposit_amount || 0),
-    depositStatus: String(order.deposit_status || 'not_required'), depositMethod: order.deposit_method as string | null,
+    depositStatus, depositMethod,
     depositReference: order.deposit_reference as string | null, depositNotes: order.deposit_notes as string | null,
     depositConfirmedAt: order.deposit_confirmed_at as string | null, depositConfirmedBy: order.deposit_confirmed_by as string | null,
-    remainingAmount: Number(order.remaining_amount || 0), status: String(order.status), notes: order.notes as string | null,
+    remainingAmount: Number(order.remaining_amount || 0),
+    paymentMode,
+    status: String(order.status), notes: order.notes as string | null,
     items: items.map((i) => ({
       id: String(i.id), productId: String(i.product_id), productName: String(i.product_name),
       variantId: i.variant_id ? String(i.variant_id) : undefined, variantTitle: i.variant_title ? String(i.variant_title) : undefined,
@@ -1196,8 +1218,12 @@ router.get('/admin/orders', requireAuth, async (req: AuthenticatedRequest, res: 
 });
 
 router.post('/admin/orders', requireAuth, async (req: AuthenticatedRequest, res: Response) => {
-  const { customerName, customerPhone, customerAddress, city, district, items, depositAmount, depositMethod, depositReference, depositStatus, notes, deliveryFee, couponCode } = req.body;
+  const { customerName, customerPhone, customerAddress, city, district, items, depositAmount, depositMethod, depositReference, depositStatus, notes, deliveryFee, couponCode, paymentMode } = req.body;
   if (!customerName || !customerPhone || !Array.isArray(items) || items.length === 0) return res.status(400).json({ error: 'اسم العميل، الهاتف، وقائمة الأصناف مطلوبة' });
+
+  if (paymentMode !== undefined && paymentMode !== 'deposit_online' && paymentMode !== 'cash_on_delivery') {
+    return res.status(400).json({ error: 'طريقة الدفع غير صالحة. الطرق المتاحة: عربون إلكتروني (deposit_online) أو دفع عند الاستلام (cash_on_delivery)' });
+  }
 
   const verification = await verifyOrderItems(items as Array<Record<string, unknown>>, 'admin');
   if (verification.error) return res.status(verification.serviceError ? 503 : 400).json({ error: verification.error });
@@ -1209,11 +1235,25 @@ router.post('/admin/orders', requireAuth, async (req: AuthenticatedRequest, res:
   const fee = deliveryFee !== undefined ? Number(deliveryFee) : 15;
   if (!Number.isFinite(fee) || fee < 0) return res.status(400).json({ error: 'سعر التوصيل غير صالح' });
   const totalAmount = Math.max(0, Math.round((subtotal - (couponResult.discountAmount || 0) + fee) * 100) / 100);
-  const deposit = Number(depositAmount || 0);
+
+  let deposit = Number(depositAmount || 0);
+  if (paymentMode === 'cash_on_delivery' && depositAmount === undefined) {
+    deposit = 0;
+  }
   if (!Number.isFinite(deposit) || deposit < 0 || deposit > totalAmount) return res.status(400).json({ error: 'قيمة العربون غير صالحة' });
 
-  const finalDepositStatus = depositStatus || (deposit > 0 ? 'confirmed' : 'pending');
+  const defaultStatus = paymentMode === 'cash_on_delivery' ? 'not_required' : (deposit > 0 ? 'confirmed' : 'pending');
+  const finalDepositStatus = depositStatus || defaultStatus;
   if (!['confirmed', 'pending', 'not_required', 'rejected'].includes(finalDepositStatus)) return res.status(400).json({ error: 'حالة العربون غير صالحة' });
+
+  const effectivePaymentMode: 'deposit_online' | 'cash_on_delivery' =
+    paymentMode ||
+    (finalDepositStatus === 'not_required' || depositMethod === 'cash_on_delivery'
+      ? 'cash_on_delivery'
+      : 'deposit_online');
+
+  const defaultMethod = effectivePaymentMode === 'cash_on_delivery' ? 'cash_on_delivery' : 'instapay';
+  const finalDepositMethod = depositMethod || defaultMethod;
 
   const now = new Date().toISOString();
   const remainingAmount = Math.max(0, Math.round((totalAmount - deposit) * 100) / 100);
@@ -1221,10 +1261,11 @@ router.post('/admin/orders', requireAuth, async (req: AuthenticatedRequest, res:
     customerName: String(customerName).trim(), customerPhone: String(customerPhone).trim(), customerAddress: customerAddress || '',
     city: city || 'القاهرة', district: district || '', subtotal, discountAmount: couponResult.discountAmount || 0,
     couponCode: couponResult.cleanCode, deliveryFee: fee, totalAmount, depositAmount: deposit, depositStatus: finalDepositStatus,
-    depositMethod: depositMethod || 'instapay', depositReference: depositReference || null, depositNotes: null,
+    depositMethod: finalDepositMethod, depositReference: depositReference || null, depositNotes: null,
     depositConfirmedAt: finalDepositStatus === 'confirmed' ? now : null,
     depositConfirmedBy: finalDepositStatus === 'confirmed' ? req.admin!.name : null,
     remainingAmount, status: 'pending', notes: notes || null,
+    paymentMode: effectivePaymentMode,
   };
 
   const { data: rpcData, error: rpcError } = await supabaseServer.rpc('create_order_atomic', {
@@ -1241,7 +1282,13 @@ router.post('/admin/orders', requireAuth, async (req: AuthenticatedRequest, res:
   if (!orderId) return res.status(503).json({ error: 'تم إنشاء الطلب لكن تعذر تحميل رقمه' });
 
   const createdOrder = await getOrderWithItems(orderId);
-  logAuditAction(req.admin, 'create_manual_order', 'order', orderId, null, { orderNumber: createdOrder?.orderNumber, totalAmount }, req.ip);
+  logAuditAction(req.admin, 'create_manual_order', 'order', orderId, null, {
+    orderNumber: createdOrder?.orderNumber,
+    totalAmount,
+    depositAmount: deposit,
+    depositStatus: finalDepositStatus,
+    paymentMode: effectivePaymentMode,
+  }, req.ip);
   broadcastRealtimeEvent('new_order', createdOrder);
   return res.status(201).json(createdOrder);
 });
@@ -1270,6 +1317,11 @@ router.put('/admin/orders/:id/deposit', requireAuth, requireRole(['super_admin',
   const allowed = ['confirmed', 'pending', 'not_required', 'rejected'];
   if (depositStatus !== undefined && (typeof depositStatus !== 'string' || !allowed.includes(depositStatus))) {
     return res.status(400).json({ error: 'حالة العربون غير صالحة. الحالات المسموحة: مؤكد (confirmed)، قيد التحصيل (pending)، غير مطلوب (not_required)، مرفوض (rejected)' });
+  }
+
+  const allowedMethods = ['instapay', 'vodafone_cash', 'orange_cash', 'etisalat_cash', 'bank_transfer', 'cash', 'card', 'cash_on_delivery', 'other'];
+  if (depositMethod !== undefined && depositMethod !== null && (typeof depositMethod !== 'string' || !allowedMethods.includes(depositMethod))) {
+    return res.status(400).json({ error: 'طريقة دفع العربون غير صالحة' });
   }
 
   let newDepositAmount = existing.depositAmount;
@@ -2032,15 +2084,25 @@ function normalizeIntegrationPhone(value: unknown): string {
 }
 
 function mapIntegrationOrder(order: Record<string, unknown>, items: Record<string, unknown>[]) {
+  const depositStatus = String(order.deposit_status || 'not_required');
+  const depositMethod = order.deposit_method as string | undefined;
+  const paymentMode: 'deposit_online' | 'cash_on_delivery' =
+    (order.payment_mode as 'deposit_online' | 'cash_on_delivery') ||
+    (depositStatus === 'not_required' || depositMethod === 'cash_on_delivery'
+      ? 'cash_on_delivery'
+      : 'deposit_online');
+
   return {
     id: order.id, orderNumber: order.order_number, customerId: order.customer_id || undefined,
     customerName: order.customer_name, customerPhone: order.customer_phone, customerAddress: order.customer_address,
     city: order.city || '', district: order.district || '', subtotal: Number(order.subtotal || 0),
     discountAmount: Number(order.discount_amount || 0), couponCode: order.coupon_code || undefined,
     deliveryFee: Number(order.delivery_fee || 0), totalAmount: Number(order.total_amount || 0),
-    depositAmount: Number(order.deposit_amount || 0), depositStatus: order.deposit_status,
-    depositMethod: order.deposit_method || undefined, depositReference: order.deposit_reference || undefined,
-    remainingAmount: Number(order.remaining_amount || 0), status: order.status, notes: order.notes || '',
+    depositAmount: Number(order.deposit_amount || 0), depositStatus,
+    depositMethod, depositReference: order.deposit_reference || undefined,
+    remainingAmount: Number(order.remaining_amount || 0),
+    paymentMode,
+    status: order.status, notes: order.notes || '',
     createdAt: order.created_at, updatedAt: order.updated_at,
     items: items.map((item) => ({
       id: item.id, productId: item.product_id, variantId: item.variant_id || undefined,
@@ -2153,7 +2215,7 @@ router.get('/settings', async (_req: Request, res: Response) => {
 });
 
 router.post('/orders', async (req: Request, res: Response) => {
-  const { customerName, customerPhone, customerAddress, city, district, deliveryRegionId, items, couponCode, depositMethod, depositReference, notes } = req.body;
+  const { customerName, customerPhone, customerAddress, city, district, deliveryRegionId, items, couponCode, depositMethod, depositReference, notes, paymentMode } = req.body;
   const clientIp = req.ip || 'unknown';
   const cleanPhone = customerPhone ? String(customerPhone).trim().replace(/[^0-9+]/g, '') : '';
   const rateLimitKeys = [`order:ip:${clientIp}`]; if (cleanPhone) rateLimitKeys.push(`order:phone:${cleanPhone}`);
@@ -2161,6 +2223,30 @@ router.post('/orders', async (req: Request, res: Response) => {
   if (!checkOrderRateLimit(rateLimitKeys)) return res.status(429).json({ error: 'تم تجاوز الحد الأقصى المسموح به لإنشاء الطلبات مؤقتاً. يرجى الانتظار بضع دقائق قبل المحاولة مجدداً.' });
   if (!customerName || !customerPhone || !Array.isArray(items) || items.length === 0) return res.status(400).json({ error: 'بيانات العميل والأصناف مطلوبة لإتمام الطلب' });
   if (String(customerPhone).trim().length < 8) return res.status(400).json({ error: 'رقم الهاتف غير صالح (يجب أن يتكون من 8 أرقام على الأقل)' });
+
+  if (paymentMode !== undefined && paymentMode !== 'deposit_online' && paymentMode !== 'cash_on_delivery') {
+    return res.status(400).json({
+      error: 'طريقة الدفع غير صالحة. الطرق المتاحة: عربون إلكتروني (deposit_online) أو دفع عند الاستلام (cash_on_delivery)',
+    });
+  }
+
+  const effectivePaymentMode: 'deposit_online' | 'cash_on_delivery' =
+    paymentMode || (depositMethod === 'cash_on_delivery' ? 'cash_on_delivery' : 'deposit_online');
+
+  const allowedOnlineMethods = ['card', 'vodafone_cash', 'instapay', 'orange_cash', 'etisalat_cash', 'bank_transfer', 'cash', 'other'];
+
+  if (paymentMode === 'deposit_online') {
+    if (!depositMethod) {
+      return res.status(400).json({ error: 'يرجى اختيار طريقة دفع العربون (الكارت البنكي، إنستاباي، فودافون كاش، ...)' });
+    }
+    if (depositMethod === 'cash_on_delivery') {
+      return res.status(400).json({ error: 'طريقة الدفع غير متوافقة مع اختيار العربون الإلكتروني' });
+    }
+    if (!allowedOnlineMethods.includes(depositMethod)) {
+      return res.status(400).json({ error: 'طريقة دفع العربون غير صالحة' });
+    }
+  }
+
   recordOrderAttempt(rateLimitKeys);
 
   const { data: settings, error: settingsError } = await supabaseServer.from('store_settings').select('*').eq('id', 1).maybeSingle();
@@ -2200,17 +2286,38 @@ router.post('/orders', async (req: Request, res: Response) => {
 
   const freeThreshold = Number(settings.free_delivery_threshold || 400); if (freeThreshold > 0 && subtotal >= freeThreshold) fee = 0;
   const totalAmount = Math.max(0, Math.round((subtotal - (couponResult.discountAmount || 0) + fee) * 100) / 100);
-  const depositPct = Number(settings.deposit_percentage || 20); const minDeposit = Number(settings.min_deposit_amount || 50);
+
   let depositAmount = 0;
-  if (depositPct > 0) depositAmount = Math.min(totalAmount, Math.max(minDeposit, Math.round((totalAmount * depositPct) / 100)));
-  const remainingAmount = Math.max(0, Math.round((totalAmount - depositAmount) * 100) / 100);
+  let depositStatus: 'pending' | 'not_required' = 'pending';
+  let remainingAmount = totalAmount;
+  let finalDepositMethod: string = 'instapay';
+  let finalDepositReference: string | null = null;
+
+  if (effectivePaymentMode === 'cash_on_delivery') {
+    depositAmount = 0;
+    depositStatus = 'not_required';
+    remainingAmount = totalAmount;
+    finalDepositMethod = 'cash_on_delivery';
+    finalDepositReference = null;
+  } else {
+    const depositPct = Number(settings.deposit_percentage || 20);
+    const minDeposit = Number(settings.min_deposit_amount || 50);
+    if (depositPct > 0) {
+      depositAmount = Math.min(totalAmount, Math.max(minDeposit, Math.round((totalAmount * depositPct) / 100)));
+    }
+    remainingAmount = Math.max(0, Math.round((totalAmount - depositAmount) * 100) / 100);
+    depositStatus = 'pending';
+    finalDepositMethod = depositMethod || 'instapay';
+    finalDepositReference = depositReference ? String(depositReference).trim() : null;
+  }
 
   const payload = {
     customerName: String(customerName).trim(), customerPhone: cleanPhone, customerAddress: customerAddress || '',
     city: city || 'القاهرة', district: district || '', subtotal, discountAmount: couponResult.discountAmount || 0,
-    couponCode: couponResult.cleanCode, deliveryFee: fee, totalAmount, depositAmount, depositStatus: 'pending',
-    depositMethod: depositMethod || 'instapay', depositReference: depositReference || null, depositNotes: null,
+    couponCode: couponResult.cleanCode, deliveryFee: fee, totalAmount, depositAmount, depositStatus,
+    depositMethod: finalDepositMethod, depositReference: finalDepositReference, depositNotes: null,
     depositConfirmedAt: null, depositConfirmedBy: null, remainingAmount, status: 'pending', notes: notes || null,
+    paymentMode: effectivePaymentMode,
   };
 
   const { data: rpcData, error: rpcError } = await supabaseServer.rpc('create_order_atomic', {
@@ -2227,7 +2334,19 @@ router.post('/orders', async (req: Request, res: Response) => {
   if (!orderId) return res.status(503).json({ error: 'تم إنشاء الطلب لكن تعذر تحميل بياناته' });
 
   const createdOrder = await getOrderWithItems(orderId);
-  logAuditAction(null, 'create_order', 'order', orderId, null, { orderNumber: createdOrder?.orderNumber, totalAmount, customerPhone: cleanPhone }, req.ip);
+  logAuditAction(null, 'create_order', 'order', orderId, null, {
+    orderNumber: createdOrder?.orderNumber,
+    totalAmount,
+    depositAmount,
+    depositStatus,
+    paymentMode: effectivePaymentMode,
+    customerPhone: cleanPhone,
+  }, req.ip);
   broadcastRealtimeEvent('new_order', createdOrder);
-  return res.status(201).json({ success: true, message: 'تم استلام طلبك بنجاح وجاري مراجعة العربون وتجهيز الصيد الطازج', order: createdOrder });
+
+  const successMessage = effectivePaymentMode === 'cash_on_delivery'
+    ? 'تم استلام طلبك بنجاح بنظام الدفع عند الاستلام وجاري تجهيز الصيد الطازج'
+    : 'تم استلام طلبك بنجاح وجاري مراجعة العربون وتجهيز الصيد الطازج';
+
+  return res.status(201).json({ success: true, message: successMessage, order: createdOrder });
 });

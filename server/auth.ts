@@ -151,16 +151,17 @@ export function recordOrderAttempt(keys: string[]): void {
  */
 export async function requireAuth(req: AuthenticatedRequest, res: Response, next: NextFunction) {
   const authHeader = req.headers.authorization;
-  if (!authHeader || !authHeader.startsWith('Bearer ')) {
-    return res.status(401).json({
-      error: 'غير مصرح: يجب تسجيل الدخول عبر حساب Supabase للوصول إلى لوحة التحكم',
-    });
+  let token: string | undefined;
+
+  if (authHeader && authHeader.startsWith('Bearer ')) {
+    token = authHeader.split(' ')[1]?.trim();
+  } else if (typeof req.query.token === 'string' && req.query.token.trim()) {
+    token = req.query.token.trim();
   }
 
-  const token = authHeader.split(' ')[1]?.trim();
   if (!token) {
     return res.status(401).json({
-      error: 'غير مصرح: رمز جلسة Supabase مفقود',
+      error: 'غير مصرح: يجب تسجيل الدخول عبر حساب Supabase للوصول إلى لوحة التحكم',
     });
   }
 

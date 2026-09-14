@@ -4,7 +4,18 @@ export type OrderStatus = 'pending' | 'preparing' | 'delivering' | 'completed' |
 
 export type DepositStatus = 'confirmed' | 'pending' | 'not_required' | 'rejected';
 
-export type DepositMethod = 'instapay' | 'vodafone_cash' | 'orange_cash' | 'etisalat_cash' | 'bank_transfer' | 'cash' | 'other';
+export type PaymentMode = 'deposit_online' | 'cash_on_delivery';
+
+export type DepositMethod =
+  | 'instapay'
+  | 'vodafone_cash'
+  | 'orange_cash'
+  | 'etisalat_cash'
+  | 'bank_transfer'
+  | 'cash'
+  | 'card'
+  | 'cash_on_delivery'
+  | 'other';
 
 export type DiscountType = 'percentage' | 'fixed';
 
@@ -87,6 +98,9 @@ export interface Order {
   status: OrderStatus;
   notes?: string;
   
+  // Payment mode (نظام الدفع: عربون إلكتروني أو كاش عند الاستلام)
+  paymentMode?: PaymentMode;
+
   // Deposit confirmation fields (تأكيد العربون)
   depositStatus: DepositStatus; // 'confirmed' | 'pending' | 'not_required' | 'rejected'
   depositAmount: number; // مبلغ العربون بالجنيه المصري

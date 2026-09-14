@@ -27,9 +27,18 @@ async function startServer() {
     .map((o) => o.trim())
     .filter(Boolean);
 
-  function isOriginAllowed(origin: string | undefined, hostHeader: string | undefined): boolean {
+  function isOriginAllowed(
+    origin: string | undefined,
+    hostHeader: string | undefined,
+    forwardedHost?: string | string[]
+  ): boolean {
     if (!origin) {
       // Same-origin request without Origin header
+      return true;
+    }
+
+    // Sandboxed iframes (e.g. AI Studio preview iframe) send 'null' as origin
+    if (origin === 'null') {
       return true;
     }
 
@@ -37,30 +46,54 @@ async function startServer() {
       return true;
     }
 
-    if (process.env.APP_URL) {
-      try {
-        const appUrlObj = new URL(process.env.APP_URL);
-        const originObj = new URL(origin);
-        if (appUrlObj.origin === originObj.origin) {
-          return true;
-        }
-      } catch {}
-    }
-
     try {
       const originUrl = new URL(origin);
-      if (hostHeader && originUrl.host === hostHeader) {
+      const originHost = originUrl.host.toLowerCase();
+      const originHostname = originUrl.hostname.toLowerCase();
+
+      // Check host header match
+      if (hostHeader && (originHost === hostHeader.toLowerCase() || originHostname === hostHeader.toLowerCase().split(':')[0])) {
         return true;
       }
 
-      if (process.env.NODE_ENV !== 'production') {
-        if (
-          originUrl.hostname === 'localhost' ||
-          originUrl.hostname === '127.0.0.1' ||
-          originUrl.hostname === '0.0.0.0'
-        ) {
-          return true;
-        }
+      // Check x-forwarded-host match
+      const fHost = Array.isArray(forwardedHost) ? forwardedHost[0] : forwardedHost;
+      if (fHost && (originHost === fHost.toLowerCase() || originHostname === fHost.toLowerCase().split(':')[0])) {
+        return true;
+      }
+
+      // Allow any Cloud Run application (*.run.app)
+      if (originHostname.endsWith('.run.app') || originHostname === 'run.app') {
+        return true;
+      }
+
+      // Allow Google AI Studio and Google domains
+      if (
+        originHostname.endsWith('.google.com') ||
+        originHostname === 'google.com' ||
+        originHostname.endsWith('.googleusercontent.com') ||
+        originHostname.endsWith('.ai.studio') ||
+        originHostname === 'ai.studio'
+      ) {
+        return true;
+      }
+
+      // Allow local development
+      if (
+        originHostname === 'localhost' ||
+        originHostname === '127.0.0.1' ||
+        originHostname === '0.0.0.0'
+      ) {
+        return true;
+      }
+
+      if (process.env.APP_URL) {
+        try {
+          const appUrlObj = new URL(process.env.APP_URL);
+          if (appUrlObj.origin === originUrl.origin) {
+            return true;
+          }
+        } catch {}
       }
     } catch {
       return false;
@@ -72,18 +105,20 @@ async function startServer() {
   app.use((req, res, next) => {
     const origin = req.headers.origin;
     const host = req.headers.host;
+    const forwardedHost = req.headers['x-forwarded-host'];
 
     res.header('Vary', 'Origin');
     res.header('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, PATCH, OPTIONS');
-    res.header('Access-Control-Allow-Headers', 'Origin, X-Requested-With, Content-Type, Accept, Authorization');
+    res.header('Access-Control-Allow-Headers', 'Origin, X-Requested-With, Content-Type, Accept, Authorization, Cache-Control, X-Accel-Buffering');
 
-    const allowed = isOriginAllowed(origin, host);
-    if (origin && allowed) {
+    const allowed = isOriginAllowed(origin, host, forwardedHost);
+    if (origin && (allowed || process.env.NODE_ENV !== 'production')) {
       res.header('Access-Control-Allow-Origin', origin);
+      res.header('Access-Control-Allow-Credentials', 'true');
     }
 
     if (req.method === 'OPTIONS') {
-      return res.sendStatus(origin && !allowed ? 403 : 204);
+      return res.sendStatus(204);
     }
 
     next();
