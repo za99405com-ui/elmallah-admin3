@@ -20,10 +20,12 @@ import {
   Sparkles,
   Smartphone,
   Globe,
+  Shield,
 } from 'lucide-react';
+import { CustomerIdentityModal } from './CustomerIdentityModal';
 
 export const CustomersTab: React.FC = () => {
-  const { customers, orders, addCustomer, updateCustomer, deleteCustomer, toggleCustomerStatus } = useApp();
+  const { customers, orders, addCustomer, updateCustomer, deleteCustomer, toggleCustomerStatus, refreshData } = useApp();
 
   const [searchQuery, setSearchQuery] = useState('');
   const [selectedStatus, setSelectedStatus] = useState<string>('all');
@@ -312,8 +314,13 @@ export const CustomersTab: React.FC = () => {
 
                     {/* Phone & WhatsApp */}
                     <td className="p-2.5 sm:p-3 whitespace-nowrap">
-                      <div className="flex items-center gap-2">
+                      <div className="flex items-center gap-1.5 flex-wrap">
                         <span className="font-mono text-slate-700 dark:text-slate-300 dir-ltr">{customer.phone}</span>
+                        {customer.accountsCount && customer.accountsCount > 1 ? (
+                          <span className="px-1.5 py-0.2 rounded text-[10px] font-bold bg-cyan-500/15 text-cyan-600 dark:text-cyan-400">
+                            {customer.accountsCount} أرقام
+                          </span>
+                        ) : null}
                         <a
                           href={`https://wa.me/20${customer.phone.replace(/^0+/, '')}`}
                           target="_blank"
@@ -342,16 +349,23 @@ export const CustomersTab: React.FC = () => {
 
                     {/* Status */}
                     <td className="p-2.5 sm:p-3 whitespace-nowrap">
-                      <button
-                        onClick={() => toggleCustomerStatus(customer.id)}
-                        className={`px-2 py-0.5 rounded-full text-[10px] font-bold cursor-pointer ${
-                          customer.status === 'active'
-                            ? 'bg-emerald-500/15 text-emerald-500'
-                            : 'bg-rose-500/15 text-rose-500'
-                        }`}
-                      >
-                        {customer.status === 'active' ? 'نشط' : 'محظور'}
-                      </button>
+                      <div>
+                        <button
+                          onClick={() => toggleCustomerStatus(customer.id)}
+                          className={`px-2 py-0.5 rounded-full text-[10px] font-bold cursor-pointer ${
+                            customer.status === 'active'
+                              ? 'bg-emerald-500/15 text-emerald-500'
+                              : 'bg-rose-500/15 text-rose-500'
+                          }`}
+                        >
+                          {customer.status === 'active' ? 'نشط' : 'محظور'}
+                        </button>
+                        {customer.hasCustomPolicy && (
+                          <span className="px-1.5 py-0.2 rounded text-[9px] font-bold bg-purple-500/15 text-purple-600 dark:text-purple-400 block mt-1 text-center">
+                            سياسة خاصة
+                          </span>
+                        )}
+                      </div>
                     </td>
 
                     {/* Actions */}
@@ -360,9 +374,16 @@ export const CustomersTab: React.FC = () => {
                         <button
                           onClick={() => setViewingCustomer(customer)}
                           className="p-1 rounded-lg text-slate-400 hover:text-cyan-500 cursor-pointer"
-                          title="عرض"
+                          title="عرض الهوية والطلبات والسياسات"
                         >
                           <Eye className="w-3.5 h-3.5" />
+                        </button>
+                        <button
+                          onClick={() => setViewingCustomer(customer)}
+                          className="p-1 rounded-lg text-slate-400 hover:text-cyan-500 cursor-pointer"
+                          title="إدارة الهوية والسياسات الموحدة"
+                        >
+                          <Shield className="w-3.5 h-3.5" />
                         </button>
                         <button
                           onClick={() => handleOpenEditModal(customer)}
@@ -388,62 +409,15 @@ export const CustomersTab: React.FC = () => {
         </div>
       </div>
 
-      {/* Customer Details Modal */}
+      {/* Customer Identity & Details Modal */}
       {viewingCustomer && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center p-3 sm:p-4 bg-slate-950/70 backdrop-blur-xs">
-          <div className="bg-white dark:bg-[#111827] rounded-2xl border border-slate-200 dark:border-slate-800 shadow-2xl max-w-lg w-full max-h-[90vh] overflow-y-auto p-4 sm:p-6 space-y-4 text-slate-900 dark:text-slate-100">
-            <div className="flex items-center justify-between pb-3 border-b border-slate-100 dark:border-slate-800">
-              <h3 className="text-base font-bold">{viewingCustomer.name}</h3>
-              <button
-                onClick={() => setViewingCustomer(null)}
-                className="p-1 rounded-lg text-slate-400 hover:text-slate-600 dark:hover:text-white"
-              >
-                <X className="w-4 h-4" />
-              </button>
-            </div>
-
-            <div className="grid grid-cols-2 gap-2.5 text-xs">
-              <div className="p-2.5 bg-slate-50 dark:bg-slate-800/50 rounded-xl">
-                <span className="text-slate-400 block mb-0.5">الهاتف</span>
-                <span className="font-bold dir-ltr block text-right">{viewingCustomer.phone}</span>
-              </div>
-              <div className="p-2.5 bg-slate-50 dark:bg-slate-800/50 rounded-xl">
-                <span className="text-slate-400 block mb-0.5">البريد</span>
-                <span className="font-medium truncate block">{viewingCustomer.email || 'غير مسجل'}</span>
-              </div>
-              <div className="p-2.5 bg-slate-50 dark:bg-slate-800/50 rounded-xl col-span-2">
-                <span className="text-slate-400 block mb-0.5">العنوان</span>
-                <span className="font-medium">{viewingCustomer.city} {viewingCustomer.district ? `- ${viewingCustomer.district}` : ''}: {viewingCustomer.address}</span>
-              </div>
-              <div className="p-2.5 bg-slate-50 dark:bg-slate-800/50 rounded-xl">
-                <span className="text-slate-400 block mb-0.5">عدد الطلبات</span>
-                <span className="font-bold text-cyan-600 dark:text-cyan-400">{viewingCustomer.totalOrders}</span>
-              </div>
-              <div className="p-2.5 bg-slate-50 dark:bg-slate-800/50 rounded-xl">
-                <span className="text-slate-400 block mb-0.5">إجمالي المشتريات</span>
-                <span className="font-bold text-emerald-500">{viewingCustomer.totalSpent} ج.م</span>
-              </div>
-            </div>
-
-            <div className="flex justify-end gap-2 pt-2 border-t border-slate-100 dark:border-slate-800">
-              <button
-                onClick={() => {
-                  setViewingCustomer(null);
-                  handleOpenEditModal(viewingCustomer);
-                }}
-                className="px-3 py-1.5 rounded-lg border border-slate-200 dark:border-slate-700 text-xs font-bold hover:bg-slate-100 dark:hover:bg-slate-800"
-              >
-                تعديل البيانات
-              </button>
-              <button
-                onClick={() => setViewingCustomer(null)}
-                className="px-4 py-1.5 rounded-lg bg-cyan-500 text-slate-950 text-xs font-bold hover:bg-cyan-400"
-              >
-                إغلاق
-              </button>
-            </div>
-          </div>
-        </div>
+        <CustomerIdentityModal
+          customer={viewingCustomer}
+          isOpen={Boolean(viewingCustomer)}
+          onClose={() => setViewingCustomer(null)}
+          onCustomerUpdated={refreshData}
+          allCustomers={customers}
+        />
       )}
 
       {/* Add / Edit Customer Modal */}

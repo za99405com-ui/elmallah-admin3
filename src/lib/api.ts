@@ -9,6 +9,11 @@ import {
   Coupon,
   StoreSettings,
   Customer,
+  CustomerAccount,
+  CustomerPolicy,
+  EffectiveCustomerPolicy,
+  CustomerDetails,
+  CustomerMergeResult,
   AuditLog,
   DashboardStats,
   DeliveryRegion,
@@ -215,6 +220,54 @@ export const api = {
   async deleteCustomer(id: string): Promise<{ message: string }> {
     return request<{ message: string }>(`/api/admin/customers/${id}`, {
       method: 'DELETE',
+    });
+  },
+
+  async getCustomerDetails(id: string): Promise<CustomerDetails> {
+    return request<CustomerDetails>(`/api/admin/customers/${id}`);
+  },
+
+  async linkCustomerAccount(
+    customerId: string,
+    data: { phone: string; isPrimary?: boolean; notes?: string }
+  ): Promise<CustomerAccount> {
+    return request<CustomerAccount>(`/api/admin/customers/${customerId}/accounts`, {
+      method: 'POST',
+      body: JSON.stringify(data),
+    });
+  },
+
+  async updateCustomerAccount(
+    customerId: string,
+    accountId: string,
+    updates: { isActive?: boolean; isPrimary?: boolean; notes?: string }
+  ): Promise<CustomerAccount> {
+    return request<CustomerAccount>(`/api/admin/customers/${customerId}/accounts/${accountId}`, {
+      method: 'PATCH',
+      body: JSON.stringify(updates),
+    });
+  },
+
+  async updateCustomerPolicy(
+    customerId: string,
+    policy: Partial<CustomerPolicy>
+  ): Promise<{ policy: CustomerPolicy; effectivePolicy: EffectiveCustomerPolicy }> {
+    return request<{ policy: CustomerPolicy; effectivePolicy: EffectiveCustomerPolicy }>(
+      `/api/admin/customers/${customerId}/policy`,
+      {
+        method: 'PUT',
+        body: JSON.stringify(policy),
+      }
+    );
+  },
+
+  async mergeCustomers(
+    targetCustomerId: string,
+    data: { sourceCustomerId: string; confirmBlockedSource?: boolean }
+  ): Promise<CustomerMergeResult> {
+    return request<CustomerMergeResult>(`/api/admin/customers/${targetCustomerId}/merge`, {
+      method: 'POST',
+      body: JSON.stringify(data),
     });
   },
 

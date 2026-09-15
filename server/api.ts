@@ -19,6 +19,14 @@ import { addRealtimeClient, broadcastRealtimeEvent } from './realtime.js';
 export const router = Router();
 
 import { supabaseAuthClient, supabaseServer } from './supabase.js';
+import {
+  normalizeEgyptianPhone,
+  calculateEffectivePolicy,
+  getEffectiveCustomerPolicy,
+  assertCustomerCanPlaceOrder,
+  RawCustomerPolicy,
+  EffectiveCustomerPolicy,
+} from './customerIdentity.js';
 
 // Safe numeric validation helper
 function parseAndValidateNumber(
@@ -1221,6 +1229,16 @@ router.post('/admin/orders', requireAuth, async (req: AuthenticatedRequest, res:
   const { customerName, customerPhone, customerAddress, city, district, items, depositAmount, depositMethod, depositReference, depositStatus, notes, deliveryFee, couponCode, paymentMode } = req.body;
   if (!customerName || !customerPhone || !Array.isArray(items) || items.length === 0) return res.status(400).json({ error: 'اسم العميل، الهاتف، وقائمة الأصناف مطلوبة' });
 
+  const cleanPhone = String(customerPhone).trim();
+  const customerEligibility = await assertCustomerCanPlaceOrder({ phone: cleanPhone });
+  if (!customerEligibility.allowed && !req.body.overrideCustomerBlock) {
+    return res.status(403).json({
+      error: `تنبيه: هذا العميل محظور حالياً (${customerEligibility.policy?.blockReason || 'بقرار إداري'}). يرجى رفع الحظر من ملف العميل أو تأكيد التجاوز.`,
+      blocked: true,
+      blockReason: customerEligibility.policy?.blockReason,
+    });
+  }
+
   if (paymentMode !== undefined && paymentMode !== 'deposit_online' && paymentMode !== 'cash_on_delivery') {
     return res.status(400).json({ error: 'طريقة الدفع غير صالحة. الطرق المتاحة: عربون إلكتروني (deposit_online) أو دفع عند الاستلام (cash_on_delivery)' });
   }
@@ -1414,34 +1432,739 @@ router.delete('/admin/orders/:id', requireAuth, requireRole(['super_admin']), as
 });
 
 // ==========================================
-// 7. CUSTOMERS
+// 7. CUSTOMERS & CANONICAL IDENTITY
 // ==========================================
-function mapCustomerRow(c: Record<string, unknown>) {
+function mapCustomerRow(c: Record<string, unknown>, accountsCount = 1, hasCustomPolicy = false) {
   return {
-    id: c.id, name: c.name, email: c.email || '', phone: c.phone, city: c.city || 'القاهرة',
-    district: c.district || '', address: c.address || '', totalOrders: Number(c.total_orders || 0),
-    totalSpent: Number(c.total_spent || 0), lastOrderDate: c.last_order_date, status: c.status || 'active',
-    notes: c.notes || '', registeredAt: c.created_at,
+    id: c.id,
+    name: c.name,
+    email: c.email || '',
+    phone: c.phone,
+    city: c.city || 'القاهرة',
+    district: c.district || '',
+    address: c.address || '',
+    totalOrders: Number(c.total_orders || 0),
+    totalSpent: Number(c.total_spent || 0),
+    lastOrderDate: c.last_order_date,
+    status: c.status || 'active',
+    notes: c.notes || '',
+    registeredAt: c.created_at,
+    accountsCount,
+    hasCustomPolicy,
+  };
+}
+
+function mapAccountRow(a: Record<string, unknown>) {
+  return {
+    id: String(a.id),
+    customerId: String(a.customer_id),
+    phone: String(a.phone),
+    isPrimary: Boolean(a.is_primary),
+    isActive: Boolean(a.is_active),
+    verifiedAt: a.verified_at ? String(a.verified_at) : null,
+    createdAt: String(a.created_at),
+    updatedAt: a.updated_at ? String(a.updated_at) : null,
+    lastLoginAt: a.last_login_at ? String(a.last_login_at) : null,
+    linkedByAdminId: a.linked_by_admin_id ? String(a.linked_by_admin_id) : null,
+    notes: a.notes ? String(a.notes) : null,
+  };
+}
+
+function mapPolicyRow(p: Record<string, unknown>) {
+  return {
+    customerId: String(p.customer_id),
+    isBlocked: Boolean(p.is_blocked),
+    blockReason: p.block_reason ? String(p.block_reason) : null,
+    blockedUntil: p.blocked_until ? String(p.blocked_until) : null,
+    personalDiscountEnabled: Boolean(p.personal_discount_enabled),
+    personalDiscountType: (p.personal_discount_type as 'percentage' | 'fixed') || null,
+    personalDiscountValue: p.personal_discount_value != null ? Number(p.personal_discount_value) : null,
+    personalDiscountMaxAmount: p.personal_discount_max_amount != null ? Number(p.personal_discount_max_amount) : null,
+    personalDiscountExpiresAt: p.personal_discount_expires_at ? String(p.personal_discount_expires_at) : null,
+    codOverride: (p.cod_override as 'inherit' | 'allow' | 'deny') || 'inherit',
+    codMaxOrderAmount: p.cod_max_order_amount != null ? Number(p.cod_max_order_amount) : null,
+    codExpiresAt: p.cod_expires_at ? String(p.cod_expires_at) : null,
+    adminNotes: p.admin_notes ? String(p.admin_notes) : null,
+    updatedBy: p.updated_by ? String(p.updated_by) : null,
+    updatedAt: String(p.updated_at || new Date().toISOString()),
   };
 }
 
 router.get('/admin/customers', requireAuth, async (_req: AuthenticatedRequest, res: Response) => {
-  const { data, error } = await supabaseServer.from('customers').select('*').order('total_orders', { ascending: false }).order('created_at', { ascending: false });
+  const { data: customers, error } = await supabaseServer
+    .from('customers')
+    .select('*')
+    .order('total_orders', { ascending: false })
+    .order('created_at', { ascending: false });
+
   if (error) return res.status(503).json({ error: 'تعذر تحميل العملاء' });
-  return res.json((data || []).map(mapCustomerRow));
+
+  // Enrich with account counts and policies if tables exist
+  let accountCountMap: Record<string, number> = {};
+  let customPolicySet = new Set<string>();
+
+  try {
+    const { data: accounts } = await supabaseServer
+      .from('customer_accounts')
+      .select('customer_id');
+    if (accounts) {
+      for (const acc of accounts) {
+        accountCountMap[acc.customer_id] = (accountCountMap[acc.customer_id] || 0) + 1;
+      }
+    }
+  } catch {
+    // Graceful fallback if table is not yet migrated
+  }
+
+  try {
+    const { data: policies } = await supabaseServer
+      .from('customer_policies')
+      .select('customer_id');
+    if (policies) {
+      for (const pol of policies) {
+        customPolicySet.add(pol.customer_id);
+      }
+    }
+  } catch {
+    // Graceful fallback if table is not yet migrated
+  }
+
+  const mapped = (customers || []).map((c) =>
+    mapCustomerRow(c, accountCountMap[c.id] || 1, customPolicySet.has(c.id))
+  );
+
+  return res.json(mapped);
+});
+
+router.get('/admin/customers/:id', requireAuth, async (req: AuthenticatedRequest, res: Response) => {
+  const customerId = req.params.id;
+
+  const { data: customer, error: custError } = await supabaseServer
+    .from('customers')
+    .select('*')
+    .eq('id', customerId)
+    .maybeSingle();
+
+  if (custError) return res.status(503).json({ error: 'تعذر تحميل بيانات العميل' });
+  if (!customer) return res.status(404).json({ error: 'العميل غير موجود' });
+
+  // Fetch linked phone accounts
+  let accounts: Array<ReturnType<typeof mapAccountRow>> = [];
+  try {
+    const { data: accountsData } = await supabaseServer
+      .from('customer_accounts')
+      .select('*')
+      .eq('customer_id', customerId)
+      .order('is_primary', { ascending: false })
+      .order('created_at', { ascending: true });
+
+    if (accountsData && accountsData.length > 0) {
+      accounts = accountsData.map(mapAccountRow);
+    }
+  } catch (accErr) {
+    console.warn('customer_accounts table query failed or table not migrated yet:', accErr);
+  }
+
+  // Graceful fallback: synthesize primary account from customer's phone if none exists
+  if (accounts.length === 0 && customer.phone) {
+    accounts = [
+      {
+        id: `legacy-${customer.id}`,
+        customerId: customer.id,
+        phone: customer.phone,
+        isPrimary: true,
+        isActive: true,
+        verifiedAt: customer.created_at,
+        createdAt: customer.created_at,
+        updatedAt: null,
+        lastLoginAt: null,
+        linkedByAdminId: null,
+        notes: 'الحساب الأساسي (من السجل الحالي)',
+      },
+    ];
+  }
+
+  // Fetch customer policy
+  let rawPolicy: Record<string, unknown> | null = null;
+  try {
+    const { data: policyData } = await supabaseServer
+      .from('customer_policies')
+      .select('*')
+      .eq('customer_id', customerId)
+      .maybeSingle();
+    rawPolicy = policyData;
+  } catch {
+    // Continue
+  }
+
+  const effectivePolicy = calculateEffectivePolicy(customerId, rawPolicy as Partial<RawCustomerPolicy>);
+
+  // Fetch stats and recent orders
+  const { data: customerOrders } = await supabaseServer
+    .from('orders')
+    .select('id, order_number, total_amount, status, payment_mode, created_at')
+    .eq('customer_id', customerId)
+    .order('created_at', { ascending: false })
+    .limit(10);
+
+  const totalOrders = customer.total_orders != null ? Number(customer.total_orders) : (customerOrders?.length || 0);
+  const totalSpent = Number(customer.total_spent || 0);
+  const lastOrderAt = customerOrders?.[0]?.created_at || customer.last_order_date || null;
+
+  const recentOrders = (customerOrders || []).map((o) => ({
+    id: String(o.id),
+    orderNumber: String(o.order_number),
+    totalAmount: Number(o.total_amount || 0),
+    status: String(o.status),
+    paymentMode: String(o.payment_mode || 'cash_on_delivery'),
+    createdAt: String(o.created_at),
+  }));
+
+  return res.json({
+    customer: mapCustomerRow(customer, accounts.length, rawPolicy != null),
+    accounts,
+    policy: rawPolicy ? mapPolicyRow(rawPolicy) : null,
+    effectivePolicy,
+    stats: {
+      totalOrders,
+      totalSpent,
+      lastOrderAt,
+    },
+    recentOrders,
+  });
+});
+
+router.post('/admin/customers/:customerId/accounts', requireAuth, async (req: AuthenticatedRequest, res: Response) => {
+  const customerId = req.params.customerId;
+  const { phone, isPrimary, notes } = req.body;
+
+  if (!phone) {
+    return res.status(400).json({ error: 'رقم الهاتف مطلوب' });
+  }
+
+  const { normalized, isValid } = normalizeEgyptianPhone(phone);
+  if (!isValid) {
+    return res.status(400).json({
+      error: 'رقم الهاتف المصري غير صالح (يجب أن يبدأ بـ 01 ويتكون من 11 رقماً)',
+    });
+  }
+
+  const { data: customer, error: custError } = await supabaseServer
+    .from('customers')
+    .select('id, name')
+    .eq('id', customerId)
+    .maybeSingle();
+
+  if (custError) return res.status(503).json({ error: 'تعذر التحقق من العميل' });
+  if (!customer) return res.status(404).json({ error: 'العميل غير موجود' });
+
+  // 1. Check if phone already exists in customer_accounts
+  try {
+    const { data: existingAccount } = await supabaseServer
+      .from('customer_accounts')
+      .select('*, customers(id, name)')
+      .eq('phone', normalized)
+      .maybeSingle();
+
+    if (existingAccount) {
+      if (existingAccount.customer_id === customerId) {
+        return res.json(mapAccountRow(existingAccount));
+      }
+      return res.status(409).json({
+        error: 'ACCOUNT_ALREADY_LINKED_TO_ANOTHER_CUSTOMER',
+        message: `رقم الهاتف مرتبط بالفعل بحساب العميل: ${existingAccount.customers?.name || existingAccount.customer_id}`,
+        existingCustomerId: existingAccount.customer_id,
+        existingCustomerName: existingAccount.customers?.name,
+      });
+    }
+  } catch {
+    // If table not yet present, check customers table below
+  }
+
+  // 2. Check if phone already exists in customers table for another customer
+  const { data: otherCustomer } = await supabaseServer
+    .from('customers')
+    .select('id, name')
+    .eq('phone', normalized)
+    .neq('id', customerId)
+    .maybeSingle();
+
+  if (otherCustomer) {
+    return res.status(409).json({
+      error: 'ACCOUNT_ALREADY_LINKED_TO_ANOTHER_CUSTOMER',
+      message: `رقم الهاتف مسجل بالفعل كحساب رئيسي للعميل: ${otherCustomer.name} (${otherCustomer.id})`,
+      existingCustomerId: otherCustomer.id,
+      existingCustomerName: otherCustomer.name,
+    });
+  }
+
+  // If isPrimary is true, unset other accounts' is_primary for this customer
+  const shouldBePrimary = Boolean(isPrimary);
+  if (shouldBePrimary) {
+    await supabaseServer
+      .from('customer_accounts')
+      .update({ is_primary: false })
+      .eq('customer_id', customerId);
+
+    // Sync customers.phone for backward compatibility
+    await supabaseServer
+      .from('customers')
+      .update({ phone: normalized })
+      .eq('id', customerId);
+  }
+
+  const now = new Date().toISOString();
+  const { data: newAccount, error: insertError } = await supabaseServer
+    .from('customer_accounts')
+    .insert({
+      customer_id: customerId,
+      phone: normalized,
+      is_primary: shouldBePrimary,
+      is_active: true,
+      verified_at: now,
+      created_at: now,
+      linked_by_admin_id: req.admin?.id || 'admin',
+      notes: notes ? String(notes).trim() : null,
+    })
+    .select('*')
+    .single();
+
+  if (insertError) {
+    return res.status(503).json({ error: 'تعذر ربط حساب الهاتف بالعميل' });
+  }
+
+  const mapped = mapAccountRow(newAccount);
+  logAuditAction(req.admin, 'link_customer_account', 'customer_account', mapped.id, null, mapped, req.ip);
+  broadcastRealtimeEvent('customer_account_linked', { customerId, account: mapped });
+
+  return res.status(201).json(mapped);
+});
+
+router.patch('/admin/customers/:customerId/accounts/:accountId', requireAuth, async (req: AuthenticatedRequest, res: Response) => {
+  const { customerId, accountId } = req.params;
+  const { isActive, isPrimary, notes } = req.body;
+
+  const { data: existingAccount, error: lookupError } = await supabaseServer
+    .from('customer_accounts')
+    .select('*')
+    .eq('id', accountId)
+    .eq('customer_id', customerId)
+    .maybeSingle();
+
+  if (lookupError) return res.status(503).json({ error: 'تعذر تحميل بيانات الحساب' });
+  if (!existingAccount) return res.status(404).json({ error: 'حساب الهاتف غير موجود' });
+
+  // Safeguard: Prevent deactivation of the last active account
+  if (isActive === false && existingAccount.is_active) {
+    const { data: activeAccounts } = await supabaseServer
+      .from('customer_accounts')
+      .select('id')
+      .eq('customer_id', customerId)
+      .eq('is_active', true);
+
+    if (!activeAccounts || activeAccounts.length <= 1) {
+      return res.status(400).json({
+        error: 'لا يمكن تعطيل الحساب النشط الوحيد للعميل. يجب أن يمتلك العميل حساباً نشطاً واحداً على الأقل.',
+      });
+    }
+  }
+
+  const updates: Record<string, unknown> = {
+    updated_at: new Date().toISOString(),
+  };
+
+  if (isActive !== undefined) updates.is_active = Boolean(isActive);
+  if (notes !== undefined) updates.notes = notes ? String(notes).trim() : null;
+
+  if (isPrimary === true) {
+    // Unset current primary accounts for this customer
+    await supabaseServer
+      .from('customer_accounts')
+      .update({ is_primary: false })
+      .eq('customer_id', customerId);
+
+    updates.is_primary = true;
+    updates.is_active = true; // Primary account must be active
+
+    // Sync backward compatibility phone in customers table
+    await supabaseServer
+      .from('customers')
+      .update({ phone: existingAccount.phone })
+      .eq('id', customerId);
+  }
+
+  const { data: updated, error: updateError } = await supabaseServer
+    .from('customer_accounts')
+    .update(updates)
+    .eq('id', accountId)
+    .select('*')
+    .single();
+
+  if (updateError) return res.status(503).json({ error: 'تعذر تعديل حساب العميل' });
+
+  const mapped = mapAccountRow(updated);
+  logAuditAction(req.admin, 'update_customer_account', 'customer_account', accountId, existingAccount, mapped, req.ip);
+  broadcastRealtimeEvent('customer_account_updated', { customerId, account: mapped });
+
+  return res.json(mapped);
+});
+
+router.put('/admin/customers/:customerId/policy', requireAuth, async (req: AuthenticatedRequest, res: Response) => {
+  const customerId = req.params.customerId;
+  const {
+    isBlocked,
+    blockReason,
+    blockedUntil,
+    personalDiscountEnabled,
+    personalDiscountType,
+    personalDiscountValue,
+    personalDiscountMaxAmount,
+    personalDiscountExpiresAt,
+    codOverride,
+    codMaxOrderAmount,
+    codExpiresAt,
+    adminNotes,
+  } = req.body;
+
+  const { data: customer, error: custError } = await supabaseServer
+    .from('customers')
+    .select('id, name, status')
+    .eq('id', customerId)
+    .maybeSingle();
+
+  if (custError) return res.status(503).json({ error: 'تعذر التحقق من العميل' });
+  if (!customer) return res.status(404).json({ error: 'العميل غير موجود' });
+
+  // Validations
+  const blockedBool = Boolean(isBlocked);
+  const discountEnabledBool = Boolean(personalDiscountEnabled);
+
+  if (discountEnabledBool) {
+    if (personalDiscountType && !['percentage', 'fixed'].includes(personalDiscountType)) {
+      return res.status(400).json({ error: 'نوع الخصم الشخصي يجب أن يكون percentage أو fixed' });
+    }
+    const val = Number(personalDiscountValue);
+    if (isNaN(val) || val <= 0) {
+      return res.status(400).json({ error: 'قيمة الخصم الشخصي يجب أن تكون أكبر من الصفر' });
+    }
+    if (personalDiscountType === 'percentage' && val > 100) {
+      return res.status(400).json({ error: 'نسبة الخصم لا يمكن أن تتجاوز 100%' });
+    }
+  }
+
+  const codMode = codOverride || 'inherit';
+  if (!['inherit', 'allow', 'deny'].includes(codMode)) {
+    return res.status(400).json({ error: 'خيار الدفع عند الاستلام غير صالح' });
+  }
+
+  if (codMaxOrderAmount != null && Number(codMaxOrderAmount) < 0) {
+    return res.status(400).json({ error: 'الحد الأقصى للدفع عند الاستلام لا يمكن أن يكون سالباً' });
+  }
+
+  // Get previous policy for audit log
+  const { data: oldPolicy } = await supabaseServer
+    .from('customer_policies')
+    .select('*')
+    .eq('customer_id', customerId)
+    .maybeSingle();
+
+  const now = new Date().toISOString();
+  const policyPayload = {
+    customer_id: customerId,
+    is_blocked: blockedBool,
+    block_reason: blockReason ? String(blockReason).trim() : null,
+    blocked_until: blockedUntil ? new Date(blockedUntil).toISOString() : null,
+    personal_discount_enabled: discountEnabledBool,
+    personal_discount_type: discountEnabledBool ? (personalDiscountType || 'percentage') : null,
+    personal_discount_value: discountEnabledBool && personalDiscountValue != null ? Number(personalDiscountValue) : null,
+    personal_discount_max_amount: discountEnabledBool && personalDiscountMaxAmount != null ? Number(personalDiscountMaxAmount) : null,
+    personal_discount_expires_at: discountEnabledBool && personalDiscountExpiresAt ? new Date(personalDiscountExpiresAt).toISOString() : null,
+    cod_override: codMode,
+    cod_max_order_amount: codMaxOrderAmount != null ? Number(codMaxOrderAmount) : null,
+    cod_expires_at: codExpiresAt ? new Date(codExpiresAt).toISOString() : null,
+    admin_notes: adminNotes ? String(adminNotes).trim() : null,
+    updated_by: req.admin?.name || 'admin',
+    updated_at: now,
+  };
+
+  const { data: savedPolicy, error: saveError } = await supabaseServer
+    .from('customer_policies')
+    .upsert(policyPayload)
+    .select('*')
+    .single();
+
+  if (saveError) {
+    console.error('Error saving customer policy:', saveError);
+    return res.status(503).json({ error: 'تعذر حفظ سياسة العميل في قاعدة البيانات' });
+  }
+
+  // Synchronize customers.status for backward compatibility with existing views
+  await supabaseServer
+    .from('customers')
+    .update({ status: blockedBool ? 'blocked' : 'active' })
+    .eq('id', customerId);
+
+  const effectivePolicy = calculateEffectivePolicy(customerId, savedPolicy as Partial<RawCustomerPolicy>);
+
+  logAuditAction(
+    req.admin,
+    'update_customer_policy',
+    'customer_policy',
+    customerId,
+    oldPolicy,
+    savedPolicy,
+    req.ip
+  );
+
+  broadcastRealtimeEvent('customer_policy_updated', {
+    customerId,
+    policy: mapPolicyRow(savedPolicy),
+    effectivePolicy,
+  });
+
+  return res.json({
+    policy: mapPolicyRow(savedPolicy),
+    effectivePolicy,
+  });
+});
+
+router.post('/admin/customers/:targetCustomerId/merge', requireAuth, requireRole(['super_admin', 'manager']), async (req: AuthenticatedRequest, res: Response) => {
+  const targetCustomerId = req.params.targetCustomerId;
+  const { sourceCustomerId, confirmBlockedSource } = req.body;
+
+  if (!sourceCustomerId || typeof sourceCustomerId !== 'string') {
+    return res.status(400).json({ error: 'معرّف العميل المُراد دمجه (sourceCustomerId) مطلوب' });
+  }
+
+  if (targetCustomerId === sourceCustomerId) {
+    return res.status(400).json({ error: 'لا يمكن دمج العميل في حسابه نفسه' });
+  }
+
+  // Fetch both customers
+  const [targetRes, sourceRes] = await Promise.all([
+    supabaseServer.from('customers').select('*').eq('id', targetCustomerId).maybeSingle(),
+    supabaseServer.from('customers').select('*').eq('id', sourceCustomerId).maybeSingle(),
+  ]);
+
+  if (targetRes.error || sourceRes.error) {
+    return res.status(503).json({ error: 'تعذر التحقق من بيانات العميلين' });
+  }
+
+  if (!targetRes.data) return res.status(404).json({ error: 'العميل الأساسي (Target) غير موجود' });
+  if (!sourceRes.data) return res.status(404).json({ error: 'العميل المُراد دمجه (Source) غير موجود' });
+
+  const targetCustomer = targetRes.data;
+  const sourceCustomer = sourceRes.data;
+
+  // Inspect policies: conservative security approach
+  const [targetPolicy, sourcePolicy] = await Promise.all([
+    getEffectiveCustomerPolicy(targetCustomerId),
+    getEffectiveCustomerPolicy(sourceCustomerId),
+  ]);
+
+  // If source is currently blocked and target is NOT blocked, do not silently erase risk signal
+  if (sourcePolicy.effectiveBlocked && !targetPolicy.effectiveBlocked && !confirmBlockedSource) {
+    return res.status(400).json({
+      error: 'SOURCE_CUSTOMER_IS_BLOCKED',
+      message: 'العميل المُراد دمجه محظور حالياً. تأكيد الدمج سينقل حالة الحظر إلى الحساب المدمج حفاظاً على الأمان. يرجى تفعيل تأكيد نقل الحظر لإتمام العملية.',
+      requiresConfirmation: true,
+      sourceBlockReason: sourcePolicy.blockReason,
+    });
+  }
+
+  // Fetch all source accounts and orders for snapshot audit
+  const [sourceAccountsRes, sourceOrdersRes] = await Promise.all([
+    supabaseServer.from('customer_accounts').select('*').eq('customer_id', sourceCustomerId),
+    supabaseServer.from('orders').select('id, order_number, total_amount, status, created_at').eq('customer_id', sourceCustomerId),
+  ]);
+
+  const sourceAccounts = sourceAccountsRes.data || [];
+  const sourceOrders = sourceOrdersRes.data || [];
+
+  // 1. Store comprehensive audit snapshot into customer_identity_merges
+  const snapshotJson = {
+    sourceCustomer,
+    targetCustomer,
+    sourceAccounts,
+    sourceOrders,
+    sourcePolicy,
+    targetPolicy,
+    mergedAt: new Date().toISOString(),
+    performedBy: req.admin?.name || 'admin',
+  };
+
+  try {
+    await supabaseServer.from('customer_identity_merges').insert({
+      source_customer_id: sourceCustomerId,
+      target_customer_id: targetCustomerId,
+      performed_by: req.admin?.name || 'admin',
+      snapshot_json: snapshotJson,
+      notes: `تم دمج العميل ${sourceCustomer.name} (${sourceCustomerId}) في ${targetCustomer.name} (${targetCustomerId})`,
+    });
+  } catch (mergeLogErr) {
+    console.warn('Failed to record customer_identity_merges row:', mergeLogErr);
+  }
+
+  // 2. Move linked phone accounts to target customer
+  // (Ensuring target customer's primary account stays authoritative)
+  let movedAccountsCount = 0;
+  if (sourceAccounts.length > 0) {
+    for (const acc of sourceAccounts) {
+      await supabaseServer
+        .from('customer_accounts')
+        .update({
+          customer_id: targetCustomerId,
+          is_primary: false, // Target customer keeps their primary account!
+          notes: `${acc.notes ? acc.notes + ' | ' : ''}مدمج من العميل ${sourceCustomerId}`,
+          updated_at: new Date().toISOString(),
+        })
+        .eq('id', acc.id);
+      movedAccountsCount++;
+    }
+  } else if (sourceCustomer.phone) {
+    // If source customer didn't have customer_accounts row yet, create one under target
+    try {
+      await supabaseServer.from('customer_accounts').insert({
+        customer_id: targetCustomerId,
+        phone: sourceCustomer.phone,
+        is_primary: false,
+        is_active: true,
+        verified_at: sourceCustomer.created_at,
+        created_at: new Date().toISOString(),
+        notes: `مدمج من العميل السابق ${sourceCustomer.name} (${sourceCustomerId})`,
+      });
+      movedAccountsCount++;
+    } catch {
+      // Ignore conflict if phone already linked
+    }
+  }
+
+  // 3. Re-assign orders from source to target customer
+  const { count: movedOrdersCount } = await supabaseServer
+    .from('orders')
+    .update({ customer_id: targetCustomerId })
+    .eq('customer_id', sourceCustomerId);
+
+  // 4. Recalculate target customer stats (orders & spent)
+  const { data: allTargetOrders } = await supabaseServer
+    .from('orders')
+    .select('total_amount, status, created_at')
+    .eq('customer_id', targetCustomerId);
+
+  const nonCancelledOrders = (allTargetOrders || []).filter((o) => o.status !== 'cancelled');
+  const newTotalOrders = nonCancelledOrders.length;
+  const newTotalSpent = nonCancelledOrders.reduce((sum, o) => sum + Number(o.total_amount || 0), 0);
+  const sortedOrders = [...(allTargetOrders || [])].sort((a, b) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime());
+  const newLastOrderDate = sortedOrders[0]?.created_at || targetCustomer.last_order_date;
+
+  const targetUpdates: Record<string, unknown> = {
+    total_orders: newTotalOrders,
+    total_spent: newTotalSpent,
+    last_order_date: newLastOrderDate,
+  };
+
+  // If source was blocked, enforce conservative security on target
+  if (sourcePolicy.effectiveBlocked) {
+    targetUpdates.status = 'blocked';
+    try {
+      await supabaseServer.from('customer_policies').upsert({
+        customer_id: targetCustomerId,
+        is_blocked: true,
+        block_reason: `تم الحظر نتيجة دمج حساب محظور: ${sourceCustomer.name} (${sourcePolicy.blockReason || 'أمني'})`,
+        updated_by: req.admin?.name || 'admin',
+        updated_at: new Date().toISOString(),
+      });
+    } catch {
+      // Continue
+    }
+  }
+
+  await supabaseServer
+    .from('customers')
+    .update(targetUpdates)
+    .eq('id', targetCustomerId);
+
+  // 5. Soft-retire the source customer row
+  await supabaseServer
+    .from('customers')
+    .update({
+      status: 'blocked',
+      notes: `${sourceCustomer.notes ? sourceCustomer.notes + ' | ' : ''}تم دمج هذا العميل في ${targetCustomerId} بواسطة ${req.admin?.name || 'admin'} في ${new Date().toLocaleDateString('ar-EG')}`,
+    })
+    .eq('id', sourceCustomerId);
+
+  logAuditAction(
+    req.admin,
+    'merge_customers',
+    'customer',
+    targetCustomerId,
+    { sourceCustomerId },
+    { movedAccountsCount, movedOrdersCount: movedOrdersCount || sourceOrders.length },
+    req.ip
+  );
+
+  broadcastRealtimeEvent('customer_merged', {
+    targetCustomerId,
+    sourceCustomerId,
+  });
+
+  return res.json({
+    success: true,
+    message: `تم دمج العميل بنجاح ونقل ${movedAccountsCount} حساب مرتبط و ${movedOrdersCount || sourceOrders.length} طلب إلى العميل الأساسي.`,
+    targetCustomerId,
+    sourceCustomerId,
+    accountsMovedCount: movedAccountsCount,
+    ordersMovedCount: movedOrdersCount || sourceOrders.length,
+  });
 });
 
 router.put('/admin/customers/:id', requireAuth, async (req: AuthenticatedRequest, res: Response) => {
-  const customerId = req.params.id; const { name, phone, city, district, address, status, notes } = req.body;
+  const customerId = req.params.id;
+  const { name, phone, city, district, address, status, notes } = req.body;
   const updates: Record<string, unknown> = {};
-  if (name !== undefined) updates.name = name; if (phone !== undefined) updates.phone = phone;
-  if (city !== undefined) updates.city = city; if (district !== undefined) updates.district = district;
-  if (address !== undefined) updates.address = address; if (status !== undefined) updates.status = status;
+  if (name !== undefined) updates.name = name;
+  if (city !== undefined) updates.city = city;
+  if (district !== undefined) updates.district = district;
+  if (address !== undefined) updates.address = address;
+  if (status !== undefined) updates.status = status;
   if (notes !== undefined) updates.notes = notes;
 
-  const { data: updated, error } = await supabaseServer.from('customers').update(updates).eq('id', customerId).select('*').maybeSingle();
-  if (error) return res.status(error.code === '23505' ? 409 : 503).json({ error: error.code === '23505' ? 'رقم الهاتف مستخدم لعميل آخر' : 'تعذر تحديث العميل' });
+  let normalizedPhone: string | undefined;
+  if (phone !== undefined) {
+    const { normalized, isValid } = normalizeEgyptianPhone(phone);
+    if (!isValid) {
+      return res.status(400).json({ error: 'رقم الهاتف المصري غير صالح' });
+    }
+    normalizedPhone = normalized;
+    updates.phone = normalized;
+  }
+
+  const { data: updated, error } = await supabaseServer
+    .from('customers')
+    .update(updates)
+    .eq('id', customerId)
+    .select('*')
+    .maybeSingle();
+
+  if (error) {
+    return res.status(error.code === '23505' ? 409 : 503).json({
+      error: error.code === '23505' ? 'رقم الهاتف مستخدم لعميل آخر' : 'تعذر تحديث العميل',
+    });
+  }
   if (!updated) return res.status(404).json({ error: 'العميل غير موجود' });
+
+  // If phone was updated, ensure primary account in customer_accounts matches
+  if (normalizedPhone) {
+    try {
+      await supabaseServer
+        .from('customer_accounts')
+        .update({ phone: normalizedPhone, updated_at: new Date().toISOString() })
+        .eq('customer_id', customerId)
+        .eq('is_primary', true);
+    } catch {
+      // Continue
+    }
+  }
 
   logAuditAction(req.admin, 'update_customer', 'customer', customerId, null, updated, req.ip);
   broadcastRealtimeEvent('customer_updated', updated);
@@ -1451,23 +2174,91 @@ router.put('/admin/customers/:id', requireAuth, async (req: AuthenticatedRequest
 router.post('/admin/customers', requireAuth, async (req: AuthenticatedRequest, res: Response) => {
   const { name, phone, email, city, district, address, notes, status } = req.body;
   if (!name || !phone) return res.status(400).json({ error: 'اسم العميل ورقم الهاتف مطلوبان' });
-  const cleanPhone = String(phone).trim();
 
-  const { data: existing, error: lookupError } = await supabaseServer.from('customers').select('id').eq('phone', cleanPhone).maybeSingle();
+  const { normalized: cleanPhone, isValid } = normalizeEgyptianPhone(phone);
+  if (!isValid) {
+    return res.status(400).json({ error: 'رقم الهاتف المصري غير صالح (يجب أن يبدأ بـ 01 ويتكون من 11 رقماً)' });
+  }
+
+  const { data: existing, error: lookupError } = await supabaseServer
+    .from('customers')
+    .select('id')
+    .eq('phone', cleanPhone)
+    .maybeSingle();
+
   if (lookupError) return res.status(503).json({ error: 'تعذر التحقق من العميل' });
   if (existing) return res.status(400).json({ error: 'يوجد عميل مسجل بالفعل بهذا الهاتف' });
 
-  const id = `cust-${Date.now()}-${crypto.randomBytes(2).toString('hex')}`; const now = new Date().toISOString();
-  const { error } = await supabaseServer.from('customers').insert({
-    id, name: String(name).trim(), email: email?.trim() || null, phone: cleanPhone,
-    city: city || 'القاهرة', district: district || '', address: address || '',
-    total_orders: 0, total_spent: 0, status: status || 'active', notes: notes || null, created_at: now,
-  });
-  if (error) return res.status(error.code === '23505' ? 409 : 503).json({ error: error.code === '23505' ? 'يوجد عميل مسجل بالفعل بهذا الهاتف' : 'تعذر إنشاء العميل' });
+  const id = `cust-${Date.now()}-${crypto.randomBytes(2).toString('hex')}`;
+  const now = new Date().toISOString();
 
-  const created = { id, name: String(name).trim(), email: email?.trim() || '', phone: cleanPhone, city: city || 'القاهرة',
-    district: district || '', address: address || '', totalOrders: 0, totalSpent: 0, status: status || 'active',
-    notes: notes || '', registeredAt: now };
+  const { error } = await supabaseServer.from('customers').insert({
+    id,
+    name: String(name).trim(),
+    email: email?.trim() || null,
+    phone: cleanPhone,
+    city: city || 'القاهرة',
+    district: district || '',
+    address: address || '',
+    total_orders: 0,
+    total_spent: 0,
+    status: status || 'active',
+    notes: notes || null,
+    created_at: now,
+  });
+
+  if (error) {
+    return res.status(error.code === '23505' ? 409 : 503).json({
+      error: error.code === '23505' ? 'يوجد عميل مسجل بالفعل بهذا الهاتف' : 'تعذر إنشاء العميل',
+    });
+  }
+
+  // Create initial primary account in customer_accounts table
+  try {
+    await supabaseServer.from('customer_accounts').insert({
+      customer_id: id,
+      phone: cleanPhone,
+      is_primary: true,
+      is_active: true,
+      verified_at: now,
+      created_at: now,
+      notes: 'الحساب الأساسي عند التسجيل',
+    });
+  } catch (accErr) {
+    console.warn('Initial customer_accounts row creation deferred or failed:', accErr);
+  }
+
+  // If created with status=blocked, seed policy row as well
+  if (status === 'blocked') {
+    try {
+      await supabaseServer.from('customer_policies').insert({
+        customer_id: id,
+        is_blocked: true,
+        block_reason: notes || 'محظور عند إنشاء الحساب',
+        updated_by: req.admin?.name || 'admin',
+        updated_at: now,
+      });
+    } catch {
+      // Continue
+    }
+  }
+
+  const created = {
+    id,
+    name: String(name).trim(),
+    email: email?.trim() || '',
+    phone: cleanPhone,
+    city: city || 'القاهرة',
+    district: district || '',
+    address: address || '',
+    totalOrders: 0,
+    totalSpent: 0,
+    status: status || 'active',
+    notes: notes || '',
+    registeredAt: now,
+    accountsCount: 1,
+  };
+
   logAuditAction(req.admin, 'create_customer', 'customer', id, null, created, req.ip);
   broadcastRealtimeEvent('customer_created', created);
   return res.status(201).json(created);
@@ -2257,6 +3048,14 @@ router.post('/orders', async (req: Request, res: Response) => {
   if (!customerName || !customerPhone || !Array.isArray(items) || items.length === 0) return res.status(400).json({ error: 'بيانات العميل والأصناف مطلوبة لإتمام الطلب' });
   if (String(customerPhone).trim().length < 8) return res.status(400).json({ error: 'رقم الهاتف غير صالح (يجب أن يتكون من 8 أرقام على الأقل)' });
 
+  // Enforce Canonical Customer Identity Policy Check
+  const customerEligibility = await assertCustomerCanPlaceOrder({ phone: cleanPhone });
+  if (!customerEligibility.allowed) {
+    return res.status(403).json({
+      error: customerEligibility.reason || 'نعتذر، لا يمكن تنفيذ الطلب من هذا الرقم حالياً. يرجى التواصل مع إدارة المتجر لمساعدتك.',
+    });
+  }
+
   if (paymentMode !== undefined && paymentMode !== 'deposit_online' && paymentMode !== 'cash_on_delivery') {
     return res.status(400).json({
       error: 'طريقة الدفع غير صالحة. الطرق المتاحة: عربون إلكتروني (deposit_online) أو دفع عند الاستلام (cash_on_delivery)',
@@ -2265,6 +3064,14 @@ router.post('/orders', async (req: Request, res: Response) => {
 
   const effectivePaymentMode: 'deposit_online' | 'cash_on_delivery' =
     paymentMode || (depositMethod === 'cash_on_delivery' ? 'cash_on_delivery' : 'deposit_online');
+
+  if (effectivePaymentMode === 'cash_on_delivery') {
+    if (customerEligibility.policy?.codOverride === 'deny') {
+      return res.status(403).json({
+        error: 'الدفع عند الاستلام غير متاح لهذا الحساب. يرجى اختيار الدفع الإلكتروني / سداد العربون لإتمام طلبك.',
+      });
+    }
+  }
 
   const allowedOnlineMethods = ['card', 'vodafone_cash', 'instapay', 'orange_cash', 'etisalat_cash', 'bank_transfer', 'cash', 'other'];
 
@@ -2319,6 +3126,14 @@ router.post('/orders', async (req: Request, res: Response) => {
 
   const freeThreshold = Number(settings.free_delivery_threshold || 400); if (freeThreshold > 0 && subtotal >= freeThreshold) fee = 0;
   const totalAmount = Math.max(0, Math.round((subtotal - (couponResult.discountAmount || 0) + fee) * 100) / 100);
+
+  if (effectivePaymentMode === 'cash_on_delivery' && customerEligibility.policy?.codMaxOrderAmount != null) {
+    if (totalAmount > customerEligibility.policy.codMaxOrderAmount) {
+      return res.status(403).json({
+        error: `الحد الأقصى المسموح به للدفع عند الاستلام لحسابك هو ${customerEligibility.policy.codMaxOrderAmount} ج.م. إجمالي طلبك هو ${totalAmount} ج.م. يرجى اختيار سداد العربون إلكترونياً.`,
+      });
+    }
+  }
 
   let depositAmount = 0;
   let depositStatus: 'pending' | 'not_required' = 'pending';

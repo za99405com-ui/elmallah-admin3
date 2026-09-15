@@ -200,6 +200,89 @@ export interface Customer {
   lastOrderDate?: string;
   status: 'active' | 'blocked';
   notes?: string;
+  accountsCount?: number;
+  hasCustomPolicy?: boolean;
+}
+
+export interface CustomerAccount {
+  id: string;
+  customerId: string;
+  phone: string;
+  isPrimary: boolean;
+  isActive: boolean;
+  verifiedAt?: string | null;
+  createdAt: string;
+  updatedAt?: string | null;
+  lastLoginAt?: string | null;
+  linkedByAdminId?: string | null;
+  notes?: string | null;
+}
+
+export interface CustomerPolicy {
+  customerId: string;
+  isBlocked: boolean;
+  blockReason?: string | null;
+  blockedUntil?: string | null;
+  personalDiscountEnabled: boolean;
+  personalDiscountType?: 'percentage' | 'fixed' | null;
+  personalDiscountValue?: number | null;
+  personalDiscountMaxAmount?: number | null;
+  personalDiscountExpiresAt?: string | null;
+  codOverride: 'inherit' | 'allow' | 'deny';
+  codMaxOrderAmount?: number | null;
+  codExpiresAt?: string | null;
+  adminNotes?: string | null;
+  updatedBy?: string | null;
+  updatedAt: string;
+}
+
+export interface EffectiveCustomerPolicy {
+  customerId: string;
+  isBlocked: boolean;
+  effectiveBlocked: boolean;
+  blockReason?: string | null;
+  blockedUntil?: string | null;
+  blockRemainingMinutes?: number | null;
+  personalDiscount: {
+    enabled: boolean;
+    type: 'percentage' | 'fixed';
+    value: number;
+    maxAmount?: number | null;
+    expiresAt?: string | null;
+  } | null;
+  codOverride: 'inherit' | 'allow' | 'deny';
+  codMaxOrderAmount?: number | null;
+  codExpiresAt?: string | null;
+  codAllowed: boolean;
+}
+
+export interface CustomerDetails {
+  customer: Customer;
+  accounts: CustomerAccount[];
+  policy: CustomerPolicy | null;
+  effectivePolicy: EffectiveCustomerPolicy;
+  stats: {
+    totalOrders: number;
+    totalSpent: number;
+    lastOrderAt?: string | null;
+  };
+  recentOrders?: Array<{
+    id: string;
+    orderNumber: string;
+    totalAmount: number;
+    status: string;
+    paymentMode: string;
+    createdAt: string;
+  }>;
+}
+
+export interface CustomerMergeResult {
+  success: boolean;
+  message: string;
+  targetCustomerId: string;
+  sourceCustomerId: string;
+  accountsMovedCount: number;
+  ordersMovedCount: number;
 }
 
 export interface AuditLog {
