@@ -89,6 +89,12 @@ async function adminRequest<T>(path: string, options: RequestInit = {}): Promise
   return data as T;
 }
 
+function generateProvisioningSecret(): string {
+  const bytes = new Uint8Array(32);
+  window.crypto.getRandomValues(bytes);
+  return Array.from(bytes, (byte) => byte.toString(16).padStart(2, '0')).join('');
+}
+
 const reasonLabels: Record<ReviewReason, string> = {
   no_match: 'No match',
   ambiguous: 'Ambiguous',
@@ -112,8 +118,10 @@ export const PaymentReviewTab: React.FC = () => {
   const [error, setError] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
   const [resolvingId, setResolvingId] = useState<string | null>(null);
+  const [reprovisioningId, setReprovisioningId] = useState<string | null>(null);
   const [showDeviceForm, setShowDeviceForm] = useState(false);
   const [provisioningSecret, setProvisioningSecret] = useState<string | null>(null);
+  const [provisioningDeviceName, setProvisioningDeviceName] = useState<string | null>(null);
 
   const [policy, setPolicy] = useState<PaymentSettings['defaultPaymentPolicy']>('cod_allowed');
   const [timeoutSeconds, setTimeoutSeconds] = useState(120);
@@ -181,6 +189,7 @@ export const PaymentReviewTab: React.FC = () => {
         }),
       });
       setProvisioningSecret(result.provisioningSecret);
+      setProvisioningDeviceName(deviceName);
       setShowDeviceForm(false);
       setDeviceId('');
       setDeviceName('');
@@ -188,6 +197,30 @@ export const PaymentReviewTab: React.FC = () => {
       await loadOverview();
     } catch (err) {
       setError(err instanceof Error ? err.message : 'تعذر تسجيل جهاز الدفع');
+    }
+  };
+
+  const reprovisionDevice = async (device: PaymentDevice) => {
+    const confirmed = window.confirm(
+      `سيتم إلغاء صلاحية المفتاح القديم لجهاز ${device.name} وإنشاء مفتاح جديد. هل تريد المتابعة؟`
+    );
+    if (!confirmed) return;
+
+    try {
+      setReprovisioningId(device.id);
+      setError(null);
+      const secret = generateProvisioningSecret();
+      await adminRequest(`/api/admin/payments/devices/${device.id}`, {
+        method: 'PATCH',
+        body: JSON.stringify({ provisioningSecret: secret }),
+      });
+      setProvisioningSecret(secret);
+      setProvisioningDeviceName(device.name);
+      window.requestAnimationFrame(() => window.scrollTo({ top: 0, behavior: 'smooth' }));
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'تعذر إعادة تهيئة مفتاح الجهاز');
+    } finally {
+      setReprovisioningId(null);
     }
   };
 
@@ -264,10 +297,24 @@ export const PaymentReviewTab: React.FC = () => {
           <div className="flex items-center gap-2 font-black text-amber-700 dark:text-amber-300">
             <ShieldCheck className="w-5 h-5" /> مفتاح HMAC — يظهر مرة واحدة
           </div>
+          {provisioningDeviceName && (
+            <div className="mt-1 text-xs text-amber-700/80 dark:text-amber-300/80">
+              الجهاز: {provisioningDeviceName}
+            </div>
+          )}
           <code dir="ltr" className="block bg-slate-950 text-emerald-300 rounded-lg p-3 mt-2 text-xs break-all select-all">
             {provisioningSecret}
           </code>
-          <button onClick={() => setProvisioningSecret(null)} className="mt-2 text-xs font-bold text-amber-700 dark:text-amber-300">
+          <div className="mt-2 text-[11px] font-bold text-amber-700 dark:text-amber-300">
+            انسخ المفتاح الآن وضعه في تطبيق Payment Bridge. بمجرد إخفائه لن يعرضه النظام مرة أخرى.
+          </div>
+          <button
+            onClick={() => {
+              setProvisioningSecret(null);
+              setProvisioningDeviceName(null);
+            }}
+            className="mt-2 text-xs font-bold text-amber-700 dark:text-amber-300"
+          >
             إخفاء المفتاح
           </button>
         </div>
@@ -328,26 +375,42 @@ export const PaymentReviewTab: React.FC = () => {
           <EmptyState text="لا توجد أجهزة دفع مسجلة بعد." />
         ) : (
           <div className="grid grid-cols-1 lg:grid-cols-2 gap-3">
-            {devices.map((device) => (
-              <div key={device.id} className="rounded-2xl bg-white dark:bg-[#111827] border border-slate-200 dark:border-slate-800 p-4">
-                <div className="flex items-start justify-between gap-2">
-                  <div><div className="font-black">{device.name}</div><div dir="ltr" className="text-[11px] text-slate-500">{device.deviceId}</div><div className="text-sm font-bold text-cyan-600 dark:text-cyan-400 mt-1">{device.paymentDestination}</div></div>
-                  <span className={`px-2 py-1 rounded-full text-[11px] font-black flex items-center gap-1 ${device.online ? 'bg-emerald-500/10 text-emerald-600' : 'bg-slate-500/10 text-slate-500'}`}>
-                    {device.online ? <Wifi className="w-3.5 h-3.5" /> : <WifiOff className="w-3.5 h-3.5" />}{device.online ? 'Online' : 'Offline'}
-                  </span>
+            {devices.map((device) => {
+              const reprovisioning = reprovisioningId === device.id;
+              return (
+                <div key={device.id} className="rounded-2xl bg-white dark:bg-[#111827] border border-slate-200 dark:border-slate-800 p-4">
+                  <div className="flex items-start justify-between gap-2">
+                    <div>
+                      <div className="font-black">{device.name}</div>
+                      <div dir="ltr" className="text-[11px] text-slate-500">{device.deviceId}</div>
+                      <div className="text-sm font-bold text-cyan-600 dark:text-cyan-400 mt-1">{device.paymentDestination}</div>
+                    </div>
+                    <span className={`px-2 py-1 rounded-full text-[11px] font-black flex items-center gap-1 ${device.online ? 'bg-emerald-500/10 text-emerald-600' : 'bg-slate-500/10 text-slate-500'}`}>
+                      {device.online ? <Wifi className="w-3.5 h-3.5" /> : <WifiOff className="w-3.5 h-3.5" />}{device.online ? 'Online' : 'Offline'}
+                    </span>
+                  </div>
+                  <div className="grid grid-cols-2 gap-2 mt-3 text-[11px]">
+                    <Status ok={device.internetConnected} label="Internet" />
+                    <Status ok={device.appRunning} label="App/Service" />
+                    <Status ok={device.notificationListenerEnabled} label="Listener" />
+                    <Status ok={!device.busy} label={device.busy ? 'Busy' : 'Available'} />
+                  </div>
+                  <div className="flex gap-2 mt-3 text-[10px] font-black">
+                    <span className={device.vfCashEnabled ? 'text-emerald-600' : 'text-slate-400'}>VF-Cash {device.vfCashEnabled ? 'ON' : 'OFF'}</span>
+                    <span className={device.bankAlAhlyEnabled ? 'text-emerald-600' : 'text-slate-400'}>Bank-AlAhly {device.bankAlAhlyEnabled ? 'ON' : 'OFF'}</span>
+                  </div>
+                  <button
+                    type="button"
+                    disabled={reprovisioning}
+                    onClick={() => void reprovisionDevice(device)}
+                    className="mt-4 w-full rounded-xl border border-amber-500/40 bg-amber-500/10 text-amber-700 dark:text-amber-300 px-3 py-2 text-xs font-black flex items-center justify-center gap-2 disabled:opacity-50"
+                  >
+                    {reprovisioning ? <Loader2 className="w-4 h-4 animate-spin" /> : <ShieldCheck className="w-4 h-4" />}
+                    إعادة تهيئة المفتاح
+                  </button>
                 </div>
-                <div className="grid grid-cols-2 gap-2 mt-3 text-[11px]">
-                  <Status ok={device.internetConnected} label="Internet" />
-                  <Status ok={device.appRunning} label="App/Service" />
-                  <Status ok={device.notificationListenerEnabled} label="Listener" />
-                  <Status ok={!device.busy} label={device.busy ? 'Busy' : 'Available'} />
-                </div>
-                <div className="flex gap-2 mt-3 text-[10px] font-black">
-                  <span className={device.vfCashEnabled ? 'text-emerald-600' : 'text-slate-400'}>VF-Cash {device.vfCashEnabled ? 'ON' : 'OFF'}</span>
-                  <span className={device.bankAlAhlyEnabled ? 'text-emerald-600' : 'text-slate-400'}>Bank-AlAhly {device.bankAlAhlyEnabled ? 'ON' : 'OFF'}</span>
-                </div>
-              </div>
-            ))}
+              );
+            })}
           </div>
         )}
       </section>
