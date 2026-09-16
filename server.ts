@@ -2,6 +2,7 @@ import express from 'express';
 import path from 'node:path';
 import { createServer as createViteServer } from 'vite';
 import { router as apiRouter } from './server/api';
+import { paymentRouter } from './server/paymentOrchestration';
 
 function getValidPort(): number {
   if (process.env.PORT) {
@@ -109,7 +110,10 @@ async function startServer() {
 
     res.header('Vary', 'Origin');
     res.header('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, PATCH, OPTIONS');
-    res.header('Access-Control-Allow-Headers', 'Origin, X-Requested-With, Content-Type, Accept, Authorization, Cache-Control, X-Accel-Buffering');
+    res.header(
+      'Access-Control-Allow-Headers',
+      'Origin, X-Requested-With, Content-Type, Accept, Authorization, Cache-Control, X-Accel-Buffering, X-Integration-Key, X-Payment-Session-Token, X-Device-Id, X-Timestamp, X-Nonce, X-Body-Hash, X-Signature'
+    );
 
     const allowed = isOriginAllowed(origin, host, forwardedHost);
     if (origin && (allowed || process.env.NODE_ENV !== 'production')) {
@@ -124,7 +128,17 @@ async function startServer() {
     next();
   });
 
-  app.use(express.json({ limit: '2mb' }));
+  // Payment Bridge HMAC signs the exact serialized JSON. Preserve the original
+  // bytes before Express parses them, otherwise re-stringifying may invalidate a
+  // valid signature.
+  app.use(
+    express.json({
+      limit: '2mb',
+      verify: (req, _res, buf) => {
+        (req as express.Request & { rawBody?: string }).rawBody = buf.toString('utf8');
+      },
+    })
+  );
   app.use(express.urlencoded({ extended: true, limit: '2mb' }));
 
   // Health check endpoint
@@ -136,8 +150,9 @@ async function startServer() {
     });
   });
 
-  // Mount API router FIRST
+  // Mount existing API and the isolated Payment Orchestration module.
   app.use('/api', apiRouter);
+  app.use('/api', paymentRouter);
 
   // Mount Vite middleware in development or serve static in production
   if (process.env.NODE_ENV !== 'production') {
