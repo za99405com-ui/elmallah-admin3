@@ -100,8 +100,6 @@ async function startServer() {
     next();
   });
 
-  // Payment Bridge HMAC signs the exact serialized JSON. Preserve the original
-  // bytes before Express parses them.
   app.use(
     express.json({
       limit: '2mb',
@@ -120,8 +118,9 @@ async function startServer() {
     });
   });
 
-  app.use('/api', apiRouter);
+  // Payment policy guard must run before the existing public /orders route.
   app.use('/api', paymentIntegrationConfigRouter);
+  app.use('/api', apiRouter);
   app.use('/api', paymentRouter);
 
   if (process.env.NODE_ENV !== 'production') {
