@@ -2,6 +2,9 @@ import express from 'express';
 import path from 'node:path';
 import { createServer as createViteServer } from 'vite';
 import { router as apiRouter } from './server/api';
+import { paymentRouter } from './server/paymentOrchestration';
+import { paymentIntegrationConfigRouter } from './server/paymentIntegrationConfig';
+import { paymentBridgeControlRouter } from './server/paymentBridgeControl';
 
 function getValidPort(): number {
   if (process.env.PORT) {
@@ -18,10 +21,8 @@ async function startServer() {
   const app = express();
   const PORT = getValidPort();
 
-  // Configure reverse proxy trust for canonical req.ip derivation
   app.set('trust proxy', 1);
 
-  // CORS Hardening
   const configuredOrigins = (process.env.ALLOWED_ORIGINS || '')
     .split(',')
     .map((o) => o.trim())
@@ -32,67 +33,43 @@ async function startServer() {
     hostHeader: string | undefined,
     forwardedHost?: string | string[]
   ): boolean {
-    if (!origin) {
-      // Same-origin request without Origin header
-      return true;
-    }
-
-    // Sandboxed iframes (e.g. AI Studio preview iframe) send 'null' as origin
-    if (origin === 'null') {
-      return true;
-    }
-
-    if (configuredOrigins.includes(origin)) {
-      return true;
-    }
+    if (!origin) return true;
+    if (origin === 'null') return true;
+    if (configuredOrigins.includes(origin)) return true;
 
     try {
       const originUrl = new URL(origin);
       const originHost = originUrl.host.toLowerCase();
       const originHostname = originUrl.hostname.toLowerCase();
 
-      // Check host header match
       if (hostHeader && (originHost === hostHeader.toLowerCase() || originHostname === hostHeader.toLowerCase().split(':')[0])) {
         return true;
       }
 
-      // Check x-forwarded-host match
       const fHost = Array.isArray(forwardedHost) ? forwardedHost[0] : forwardedHost;
       if (fHost && (originHost === fHost.toLowerCase() || originHostname === fHost.toLowerCase().split(':')[0])) {
         return true;
       }
 
-      // Allow any Cloud Run application (*.run.app)
-      if (originHostname.endsWith('.run.app') || originHostname === 'run.app') {
-        return true;
-      }
-
-      // Allow Google AI Studio and Google domains
+      if (originHostname.endsWith('.run.app') || originHostname === 'run.app') return true;
       if (
         originHostname.endsWith('.google.com') ||
         originHostname === 'google.com' ||
         originHostname.endsWith('.googleusercontent.com') ||
         originHostname.endsWith('.ai.studio') ||
         originHostname === 'ai.studio'
-      ) {
-        return true;
-      }
+      ) return true;
 
-      // Allow local development
       if (
         originHostname === 'localhost' ||
         originHostname === '127.0.0.1' ||
         originHostname === '0.0.0.0'
-      ) {
-        return true;
-      }
+      ) return true;
 
       if (process.env.APP_URL) {
         try {
           const appUrlObj = new URL(process.env.APP_URL);
-          if (appUrlObj.origin === originUrl.origin) {
-            return true;
-          }
+          if (appUrlObj.origin === originUrl.origin) return true;
         } catch {}
       }
     } catch {
@@ -109,7 +86,10 @@ async function startServer() {
 
     res.header('Vary', 'Origin');
     res.header('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, PATCH, OPTIONS');
-    res.header('Access-Control-Allow-Headers', 'Origin, X-Requested-With, Content-Type, Accept, Authorization, Cache-Control, X-Accel-Buffering');
+    res.header(
+      'Access-Control-Allow-Headers',
+      'Origin, X-Requested-With, Content-Type, Accept, Authorization, Cache-Control, X-Accel-Buffering, X-Integration-Key, X-Payment-Session-Token, X-Device-Id, X-Timestamp, X-Nonce, X-Body-Hash, X-Signature'
+    );
 
     const allowed = isOriginAllowed(origin, host, forwardedHost);
     if (origin && (allowed || process.env.NODE_ENV !== 'production')) {
@@ -117,17 +97,20 @@ async function startServer() {
       res.header('Access-Control-Allow-Credentials', 'true');
     }
 
-    if (req.method === 'OPTIONS') {
-      return res.sendStatus(204);
-    }
-
+    if (req.method === 'OPTIONS') return res.sendStatus(204);
     next();
   });
 
-  app.use(express.json({ limit: '2mb' }));
+  app.use(
+    express.json({
+      limit: '2mb',
+      verify: (req, _res, buf) => {
+        (req as express.Request & { rawBody?: string }).rawBody = buf.toString('utf8');
+      },
+    })
+  );
   app.use(express.urlencoded({ extended: true, limit: '2mb' }));
 
-  // Health check endpoint
   app.get('/api/health', (_req, res) => {
     res.json({
       status: 'ok',
@@ -136,10 +119,15 @@ async function startServer() {
     });
   });
 
-  // Mount API router FIRST
+  // Payment policy guard must run before the existing public /orders route.
+  app.use('/api', paymentIntegrationConfigRouter);
   app.use('/api', apiRouter);
 
-  // Mount Vite middleware in development or serve static in production
+  // Bridge control is mounted before the broader orchestration router so its
+  // heartbeat/config handlers remain authoritative for per-device settings.
+  app.use('/api', paymentBridgeControlRouter);
+  app.use('/api', paymentRouter);
+
   if (process.env.NODE_ENV !== 'production') {
     const vite = await createViteServer({
       server: { middlewareMode: true },
@@ -160,9 +148,7 @@ async function startServer() {
   });
 
   const shutdown = () => {
-    server.close(() => {
-      process.exit(0);
-    });
+    server.close(() => process.exit(0));
   };
 
   process.on('SIGTERM', shutdown);

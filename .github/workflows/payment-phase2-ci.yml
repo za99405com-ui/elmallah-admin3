@@ -1,0 +1,35 @@
+name: Payment Phase 2 CI
+
+on:
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  typecheck-and-build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: package.json
+
+      - name: Install dependencies
+        run: npm install --no-audit --no-fund
+
+      - name: Typecheck
+        run: npm run lint
+
+      - name: Production build
+        env:
+          SUPABASE_URL: https://example.supabase.co
+          SUPABASE_SERVICE_ROLE_KEY: test-service-role-key
+          SUPABASE_ANON_KEY: test-anon-key
+          CUSTOMER_APP_INTEGRATION_KEY: ci-only-integration-key-not-for-production
+        run: npm run build
