@@ -4,6 +4,7 @@ import { createServer as createViteServer } from 'vite';
 import { router as apiRouter } from './server/api';
 import { paymentRouter } from './server/paymentOrchestration';
 import { paymentIntegrationConfigRouter } from './server/paymentIntegrationConfig';
+import { paymentBridgeControlRouter } from './server/paymentBridgeControl';
 
 function getValidPort(): number {
   if (process.env.PORT) {
@@ -121,6 +122,10 @@ async function startServer() {
   // Payment policy guard must run before the existing public /orders route.
   app.use('/api', paymentIntegrationConfigRouter);
   app.use('/api', apiRouter);
+
+  // Bridge control is mounted before the broader orchestration router so its
+  // heartbeat/config handlers remain authoritative for per-device settings.
+  app.use('/api', paymentBridgeControlRouter);
   app.use('/api', paymentRouter);
 
   if (process.env.NODE_ENV !== 'production') {
