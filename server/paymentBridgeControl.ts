@@ -5,7 +5,7 @@ import { supabaseServer } from './supabase.js';
 
 export const paymentBridgeControlRouter = Router();
 
-type RawBodyRequest = Request & { rawBody?: string };
+export type RawBridgeRequest = Request & { rawBody?: string };
 const MAX_SKEW_MS = 5 * 60_000;
 const nonceCache = new Map<string, number>();
 
@@ -21,7 +21,7 @@ function pruneNonces(now = Date.now()) {
   }
 }
 
-async function verifyBridge(req: RawBodyRequest, res: Response, next: NextFunction) {
+export async function verifyPaymentBridge(req: RawBridgeRequest, res: Response, next: NextFunction) {
   const deviceId = req.header('X-Device-Id')?.trim();
   const timestampRaw = req.header('X-Timestamp')?.trim();
   const nonce = req.header('X-Nonce')?.trim();
@@ -62,12 +62,14 @@ async function verifyBridge(req: RawBodyRequest, res: Response, next: NextFuncti
 
   nonceCache.set(nonceKey, Date.now());
   (req as any).paymentDevice = device;
+  (req as any).bridgeNonce = nonce;
+  (req as any).bridgeBodyHash = bodyHash;
   next();
 }
 
 // Mounted before paymentOrchestration.ts so this route is authoritative.
 // Provider enablement is read from admin3, never overwritten by routine heartbeat.
-paymentBridgeControlRouter.post('/payment-bridge/heartbeat', verifyBridge, async (req: RawBodyRequest, res: Response) => {
+paymentBridgeControlRouter.post('/payment-bridge/heartbeat', verifyPaymentBridge, async (req: RawBridgeRequest, res: Response) => {
   const device = (req as any).paymentDevice;
   const now = new Date().toISOString();
 
@@ -103,7 +105,7 @@ paymentBridgeControlRouter.post('/payment-bridge/heartbeat', verifyBridge, async
 
 // Explicit signed config mutation. admin3 persists the requested change first and
 // returns the authoritative state; subsequent heartbeats only read this state.
-paymentBridgeControlRouter.post('/payment-bridge/config', verifyBridge, async (req: RawBodyRequest, res: Response) => {
+paymentBridgeControlRouter.post('/payment-bridge/config', verifyPaymentBridge, async (req: RawBridgeRequest, res: Response) => {
   const device = (req as any).paymentDevice;
   const updates: Record<string, unknown> = { updated_at: new Date().toISOString() };
 
