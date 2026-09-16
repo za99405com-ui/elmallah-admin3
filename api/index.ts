@@ -1,5 +1,8 @@
 import express from 'express';
 import { router as apiRouter } from '../server/api.js';
+import { paymentRouter } from '../server/paymentOrchestration.js';
+import { paymentIntegrationConfigRouter } from '../server/paymentIntegrationConfig.js';
+import { paymentBridgeControlRouter } from '../server/paymentBridgeControl.js';
 
 const app = express();
 
@@ -71,11 +74,12 @@ app.use((req, res, next) => {
   );
   res.header(
     'Access-Control-Allow-Headers',
-    'Origin, X-Requested-With, Content-Type, Accept, Authorization, X-Integration-Key'
+    'Origin, X-Requested-With, Content-Type, Accept, Authorization, Cache-Control, X-Accel-Buffering, X-Integration-Key, X-Payment-Session-Token, X-Device-Id, X-Timestamp, X-Nonce, X-Body-Hash, X-Signature'
   );
 
   if (origin && allowed) {
     res.header('Access-Control-Allow-Origin', origin);
+    res.header('Access-Control-Allow-Credentials', 'true');
   }
 
   if (req.method === 'OPTIONS') {
@@ -85,7 +89,14 @@ app.use((req, res, next) => {
   next();
 });
 
-app.use(express.json({ limit: '2mb' }));
+app.use(
+  express.json({
+    limit: '2mb',
+    verify: (req, _res, buf) => {
+      (req as express.Request & { rawBody?: string }).rawBody = buf.toString('utf8');
+    },
+  })
+);
 app.use(express.urlencoded({ extended: true, limit: '2mb' }));
 
 app.get('/api/health', (_req, res) => {
@@ -97,6 +108,14 @@ app.get('/api/health', (_req, res) => {
   });
 });
 
+// Keep the same authoritative route order as server.ts.
+// Global payment policy must run before the legacy order API.
+app.use('/api', paymentIntegrationConfigRouter);
 app.use('/api', apiRouter);
+
+// Bridge control must run before the broader payment router so heartbeat/config
+// remain authoritative, while payment events still share the same HMAC verifier.
+app.use('/api', paymentBridgeControlRouter);
+app.use('/api', paymentRouter);
 
 export default app;
