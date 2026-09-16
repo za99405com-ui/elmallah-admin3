@@ -3,6 +3,7 @@ import path from 'node:path';
 import { createServer as createViteServer } from 'vite';
 import { router as apiRouter } from './server/api';
 import { paymentRouter } from './server/paymentOrchestration';
+import { paymentIntegrationConfigRouter } from './server/paymentIntegrationConfig';
 
 function getValidPort(): number {
   if (process.env.PORT) {
@@ -19,10 +20,8 @@ async function startServer() {
   const app = express();
   const PORT = getValidPort();
 
-  // Configure reverse proxy trust for canonical req.ip derivation
   app.set('trust proxy', 1);
 
-  // CORS Hardening
   const configuredOrigins = (process.env.ALLOWED_ORIGINS || '')
     .split(',')
     .map((o) => o.trim())
@@ -33,67 +32,43 @@ async function startServer() {
     hostHeader: string | undefined,
     forwardedHost?: string | string[]
   ): boolean {
-    if (!origin) {
-      // Same-origin request without Origin header
-      return true;
-    }
-
-    // Sandboxed iframes (e.g. AI Studio preview iframe) send 'null' as origin
-    if (origin === 'null') {
-      return true;
-    }
-
-    if (configuredOrigins.includes(origin)) {
-      return true;
-    }
+    if (!origin) return true;
+    if (origin === 'null') return true;
+    if (configuredOrigins.includes(origin)) return true;
 
     try {
       const originUrl = new URL(origin);
       const originHost = originUrl.host.toLowerCase();
       const originHostname = originUrl.hostname.toLowerCase();
 
-      // Check host header match
       if (hostHeader && (originHost === hostHeader.toLowerCase() || originHostname === hostHeader.toLowerCase().split(':')[0])) {
         return true;
       }
 
-      // Check x-forwarded-host match
       const fHost = Array.isArray(forwardedHost) ? forwardedHost[0] : forwardedHost;
       if (fHost && (originHost === fHost.toLowerCase() || originHostname === fHost.toLowerCase().split(':')[0])) {
         return true;
       }
 
-      // Allow any Cloud Run application (*.run.app)
-      if (originHostname.endsWith('.run.app') || originHostname === 'run.app') {
-        return true;
-      }
-
-      // Allow Google AI Studio and Google domains
+      if (originHostname.endsWith('.run.app') || originHostname === 'run.app') return true;
       if (
         originHostname.endsWith('.google.com') ||
         originHostname === 'google.com' ||
         originHostname.endsWith('.googleusercontent.com') ||
         originHostname.endsWith('.ai.studio') ||
         originHostname === 'ai.studio'
-      ) {
-        return true;
-      }
+      ) return true;
 
-      // Allow local development
       if (
         originHostname === 'localhost' ||
         originHostname === '127.0.0.1' ||
         originHostname === '0.0.0.0'
-      ) {
-        return true;
-      }
+      ) return true;
 
       if (process.env.APP_URL) {
         try {
           const appUrlObj = new URL(process.env.APP_URL);
-          if (appUrlObj.origin === originUrl.origin) {
-            return true;
-          }
+          if (appUrlObj.origin === originUrl.origin) return true;
         } catch {}
       }
     } catch {
@@ -121,16 +96,12 @@ async function startServer() {
       res.header('Access-Control-Allow-Credentials', 'true');
     }
 
-    if (req.method === 'OPTIONS') {
-      return res.sendStatus(204);
-    }
-
+    if (req.method === 'OPTIONS') return res.sendStatus(204);
     next();
   });
 
   // Payment Bridge HMAC signs the exact serialized JSON. Preserve the original
-  // bytes before Express parses them, otherwise re-stringifying may invalidate a
-  // valid signature.
+  // bytes before Express parses them.
   app.use(
     express.json({
       limit: '2mb',
@@ -141,7 +112,6 @@ async function startServer() {
   );
   app.use(express.urlencoded({ extended: true, limit: '2mb' }));
 
-  // Health check endpoint
   app.get('/api/health', (_req, res) => {
     res.json({
       status: 'ok',
@@ -150,11 +120,10 @@ async function startServer() {
     });
   });
 
-  // Mount existing API and the isolated Payment Orchestration module.
   app.use('/api', apiRouter);
+  app.use('/api', paymentIntegrationConfigRouter);
   app.use('/api', paymentRouter);
 
-  // Mount Vite middleware in development or serve static in production
   if (process.env.NODE_ENV !== 'production') {
     const vite = await createViteServer({
       server: { middlewareMode: true },
@@ -175,9 +144,7 @@ async function startServer() {
   });
 
   const shutdown = () => {
-    server.close(() => {
-      process.exit(0);
-    });
+    server.close(() => process.exit(0));
   };
 
   process.on('SIGTERM', shutdown);
