@@ -1,6 +1,7 @@
 import crypto from 'node:crypto';
 import { NextFunction, Request, Response, Router } from 'express';
 import { supabaseServer } from './supabase.js';
+import { normalizeEgyptianPhone } from './customerIdentity.js';
 
 export const paymentIntegrationConfigRouter = Router();
 
@@ -21,25 +22,66 @@ function requireIntegrationKey(req: Request, res: Response, next: NextFunction) 
 }
 
 /**
- * Source-of-truth checkout guard. This router is mounted before the legacy/public
- * order API so the global policy cannot be bypassed by calling admin3 directly.
- * Individual customer COD overrides remain handled by the existing customer
- * policy layer inside the order API.
+ * Source-of-truth checkout guard. The global policy is a default for accounts
+ * that inherit policy; a live per-customer allow/deny override takes priority.
  */
 paymentIntegrationConfigRouter.post('/orders', async (req: Request, res: Response, next: NextFunction) => {
-  const requestedMode = req.body?.paymentMode;
-  if (requestedMode !== 'cash_on_delivery') return next();
+  if (req.body?.paymentMode !== 'cash_on_delivery') return next();
 
   const { data: settings, error } = await supabaseServer
     .from('store_settings')
     .select('default_payment_policy')
     .eq('id', 1)
     .maybeSingle();
-
   if (error) return res.status(503).json({ error: 'Payment policy service unavailable' });
-  if (settings?.default_payment_policy === 'deposit_required') {
+
+  let effectiveOverride: 'inherit' | 'allow' | 'deny' = 'inherit';
+  const normalizedPhone = normalizeEgyptianPhone(req.body?.customerPhone);
+
+  if (normalizedPhone.isValid) {
+    let customerId: string | null = null;
+
+    const { data: account } = await supabaseServer
+      .from('customer_accounts')
+      .select('customer_id')
+      .eq('phone', normalizedPhone.normalized)
+      .eq('is_active', true)
+      .limit(1)
+      .maybeSingle();
+
+    customerId = account?.customer_id ? String(account.customer_id) : null;
+
+    if (!customerId) {
+      const { data: customer } = await supabaseServer
+        .from('customers')
+        .select('id')
+        .eq('phone', normalizedPhone.normalized)
+        .limit(1)
+        .maybeSingle();
+      customerId = customer?.id ? String(customer.id) : null;
+    }
+
+    if (customerId) {
+      const { data: policy } = await supabaseServer
+        .from('customer_policies')
+        .select('cod_override,cod_expires_at')
+        .eq('customer_id', customerId)
+        .maybeSingle();
+
+      if (policy?.cod_override === 'allow' || policy?.cod_override === 'deny') {
+        const expiresAt = policy.cod_expires_at ? new Date(policy.cod_expires_at).getTime() : null;
+        if (expiresAt === null || expiresAt > Date.now()) {
+          effectiveOverride = policy.cod_override;
+        }
+      }
+    }
+  }
+
+  if (effectiveOverride === 'allow') return next();
+
+  if (effectiveOverride === 'deny' || settings?.default_payment_policy === 'deposit_required') {
     return res.status(403).json({
-      error: 'العربون الإلكتروني مطلوب حالياً ولا يمكن إنشاء طلب دفع عند الاستلام.',
+      error: 'العربون الإلكتروني مطلوب لهذا الطلب ولا يمكن استخدام الدفع عند الاستلام.',
       code: 'deposit_required',
     });
   }
