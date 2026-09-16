@@ -20,6 +20,33 @@ function requireIntegrationKey(req: Request, res: Response, next: NextFunction) 
   next();
 }
 
+/**
+ * Source-of-truth checkout guard. This router is mounted before the legacy/public
+ * order API so the global policy cannot be bypassed by calling admin3 directly.
+ * Individual customer COD overrides remain handled by the existing customer
+ * policy layer inside the order API.
+ */
+paymentIntegrationConfigRouter.post('/orders', async (req: Request, res: Response, next: NextFunction) => {
+  const requestedMode = req.body?.paymentMode;
+  if (requestedMode !== 'cash_on_delivery') return next();
+
+  const { data: settings, error } = await supabaseServer
+    .from('store_settings')
+    .select('default_payment_policy')
+    .eq('id', 1)
+    .maybeSingle();
+
+  if (error) return res.status(503).json({ error: 'Payment policy service unavailable' });
+  if (settings?.default_payment_policy === 'deposit_required') {
+    return res.status(403).json({
+      error: 'العربون الإلكتروني مطلوب حالياً ولا يمكن إنشاء طلب دفع عند الاستلام.',
+      code: 'deposit_required',
+    });
+  }
+
+  return next();
+});
+
 paymentIntegrationConfigRouter.get('/payments/config', requireIntegrationKey, async (_req: Request, res: Response) => {
   const { data: settings, error } = await supabaseServer
     .from('store_settings')
