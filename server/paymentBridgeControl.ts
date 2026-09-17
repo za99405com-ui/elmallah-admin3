@@ -50,7 +50,10 @@ export async function verifyPaymentBridge(req: RawBridgeRequest, res: Response, 
   if (error) return res.status(503).json({ error: 'Payment device service unavailable' });
   if (!device || !device.is_enabled) return res.status(401).json({ error: 'Unknown or disabled payment device' });
 
-  const rawBody = req.rawBody ?? JSON.stringify(req.body ?? {});
+  const rawBody =
+    req.method === 'GET'
+      ? (req.rawBody ?? '')
+      : (req.rawBody ?? (req.body && Object.keys(req.body).length > 0 ? JSON.stringify(req.body) : ''));
   const expectedHash = crypto.createHash('sha256').update(rawBody, 'utf8').digest('hex');
   if (!safeCompare(expectedHash, bodyHash)) return res.status(401).json({ error: 'Invalid bridge body hash' });
 
@@ -66,6 +69,73 @@ export async function verifyPaymentBridge(req: RawBridgeRequest, res: Response, 
   (req as any).bridgeBodyHash = bodyHash;
   next();
 }
+
+export async function fetchDeviceRules(deviceRowId: string, device: any) {
+  // Query assigned sources from payment_device_sources
+  const { data: assignments, error } = await supabaseServer
+    .from('payment_device_sources')
+    .select(`
+      enabled,
+      payment_source:payment_sources(*)
+    `)
+    .eq('device_id', deviceRowId)
+    .eq('enabled', true);
+
+  let sources: any[] = [];
+  if (!error && assignments && assignments.length > 0) {
+    sources = assignments
+      .map((a: any) => a.payment_source)
+      .filter((s: any) => s && s.enabled);
+  } else {
+    // Legacy fallback based on boolean flags on device
+    const codes: string[] = [];
+    if (device.vf_cash_enabled) codes.push('vf_cash');
+    if (device.bank_alahly_enabled) codes.push('bank_alahly');
+    if (codes.length > 0) {
+      const { data: fallbackSources } = await supabaseServer
+        .from('payment_sources')
+        .select('*')
+        .in('code', codes)
+        .eq('enabled', true);
+      sources = fallbackSources || [];
+    }
+  }
+
+  // Sort by priority descending, then code ascending
+  sources.sort((a, b) => (b.priority ?? 100) - (a.priority ?? 100));
+
+  const fingerprint = sources.map((s) => `${s.id}:${s.updated_at || s.code}`).join('|');
+  const rulesVersion = crypto.createHash('sha256').update(fingerprint || 'empty').digest('hex').substring(0, 16);
+
+  const rules = sources.map((s) => ({
+    id: s.id,
+    code: s.code,
+    name: s.display_name,
+    enabled: Boolean(s.enabled),
+    channel: s.channel,
+    packageNames: s.source_package ? [s.source_package] : [],
+    sourceSender: s.source_sender || undefined,
+    titleContains: s.title_contains || undefined,
+    bodyContains: s.body_contains || undefined,
+    amountRegex: s.amount_regex || undefined,
+    payerPhoneRegex: s.payer_phone_regex || undefined,
+    accountIdentifierRegex: s.account_identifier_regex || undefined,
+    priority: Number(s.priority ?? 100),
+    parserType: s.parser_type || 'regex',
+  }));
+
+  return { rulesVersion, rules };
+}
+
+// GET /payment-bridge/rules - HMAC-protected rules assigned to this device
+paymentBridgeControlRouter.get('/payment-bridge/rules', verifyPaymentBridge, async (req: RawBridgeRequest, res: Response) => {
+  const device = (req as any).paymentDevice;
+  const { rulesVersion, rules } = await fetchDeviceRules(device.id, device);
+  return res.json({
+    rulesVersion,
+    rules,
+  });
+});
 
 // Mounted before paymentOrchestration.ts so this route is authoritative.
 // Provider enablement is read from admin3, never overwritten by routine heartbeat.
@@ -90,6 +160,8 @@ paymentBridgeControlRouter.post('/payment-bridge/heartbeat', verifyPaymentBridge
 
   if (error) return res.status(503).json({ error: 'Heartbeat could not be stored' });
 
+  const { rulesVersion, rules } = await fetchDeviceRules(device.id, data);
+
   const result = {
     status: 'ok',
     online: true,
@@ -97,6 +169,8 @@ paymentBridgeControlRouter.post('/payment-bridge/heartbeat', verifyPaymentBridge
     busySessionId: data.busy_session_id || null,
     vfCashEnabled: Boolean(data.vf_cash_enabled),
     bankAlAhlyEnabled: Boolean(data.bank_alahly_enabled),
+    activeRulesCount: rules.length,
+    rulesVersion,
     serverTime: Date.now(),
   };
   broadcastRealtimeEvent('payment_device_heartbeat', { deviceId: data.device_id, ...result });

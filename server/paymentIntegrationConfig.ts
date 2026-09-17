@@ -92,22 +92,33 @@ paymentIntegrationConfigRouter.post('/orders', async (req: Request, res: Respons
 paymentIntegrationConfigRouter.get('/payments/config', requireIntegrationKey, async (_req: Request, res: Response) => {
   const { data: settings, error } = await supabaseServer
     .from('store_settings')
-    .select('default_payment_policy,payment_session_timeout_seconds,payment_amount_tolerance')
+    .select('default_payment_policy,payment_session_timeout_seconds,payment_amount_tolerance,deposit_required,deposit_type,deposit_value,minimum_deposit')
     .eq('id', 1)
     .maybeSingle();
 
   if (error) return res.status(503).json({ error: 'Payment settings unavailable' });
   if (!settings) return res.status(404).json({ error: 'Payment settings not found' });
 
-  const { data: devices, error: deviceError } = await supabaseServer
-    .from('payment_devices')
-    .select('vf_cash_enabled,bank_alahly_enabled,is_enabled,online,internet_connected,app_running,notification_listener_enabled,is_busy,last_heartbeat_at')
-    .eq('is_enabled', true);
-
-  if (deviceError) return res.status(503).json({ error: 'Payment device service unavailable' });
+  const [devicesRes, methodsRes, methodSourcesRes, deviceSourcesRes] = await Promise.all([
+    supabaseServer
+      .from('payment_devices')
+      .select('id,device_id,vf_cash_enabled,bank_alahly_enabled,is_enabled,online,internet_connected,app_running,notification_listener_enabled,is_busy,last_heartbeat_at')
+      .eq('is_enabled', true),
+    supabaseServer
+      .from('customer_payment_methods')
+      .select('*')
+      .order('sort_order', { ascending: true }),
+    supabaseServer
+      .from('customer_payment_method_sources')
+      .select('customer_payment_method_id,payment_source_id,is_primary,payment_sources(*)'),
+    supabaseServer
+      .from('payment_device_sources')
+      .select('device_id,payment_source_id,enabled')
+      .eq('enabled', true),
+  ]);
 
   const freshAfter = Date.now() - 45_000;
-  const eligible = (devices || []).filter((device: any) => {
+  const eligibleDevices = (devicesRes.data || []).filter((device: any) => {
     const heartbeat = device.last_heartbeat_at ? new Date(device.last_heartbeat_at).getTime() : 0;
     return Boolean(
       device.online &&
@@ -119,13 +130,162 @@ paymentIntegrationConfigRouter.get('/payments/config', requireIntegrationKey, as
     );
   });
 
+  // Map which payment source IDs have at least one eligible device
+  const eligibleSourceIds = new Set<string>();
+  for (const d of eligibleDevices) {
+    const assigned = (deviceSourcesRes.data || []).filter((ds: any) => ds.device_id === d.id);
+    for (const a of assigned) {
+      eligibleSourceIds.add(a.payment_source_id);
+    }
+    // Also include legacy boolean flags
+    if (d.vf_cash_enabled) eligibleSourceIds.add('vf_cash_legacy');
+    if (d.bank_alahly_enabled) eligibleSourceIds.add('bank_alahly_legacy');
+  }
+
+  // Build customer payment methods
+  const methods = (methodsRes.data || []).map((method: any) => {
+    const mappedSources = (methodSourcesRes.data || [])
+      .filter((ms: any) => ms.customer_payment_method_id === method.id)
+      .map((ms: any) => ms.payment_sources)
+      .filter(Boolean);
+
+    let isAvailable = false;
+    if (method.channel === 'cash_on_delivery') {
+      isAvailable = Boolean(method.enabled);
+    } else {
+      // Available if at least one mapped source has an eligible device or legacy provider matches
+      isAvailable = mappedSources.some((src: any) => {
+        if (!src.enabled) return false;
+        if (eligibleSourceIds.has(src.id)) return true;
+        if (src.code === 'vf_cash' && eligibleSourceIds.has('vf_cash_legacy')) return true;
+        if (src.code === 'bank_alahly' && eligibleSourceIds.has('bank_alahly_legacy')) return true;
+        return false;
+      });
+      // Fallback: if no mapped sources yet, check by method code
+      if (!isAvailable && mappedSources.length === 0) {
+        if (method.code === 'vodafone_cash' && eligibleDevices.some((d: any) => d.vf_cash_enabled)) isAvailable = true;
+        if (method.code === 'bank_transfer' && eligibleDevices.some((d: any) => d.bank_alahly_enabled)) isAvailable = true;
+      }
+    }
+
+    return {
+      id: method.id,
+      code: method.code,
+      name: method.display_name,
+      enabled: Boolean(method.enabled),
+      available: Boolean(method.enabled && isAvailable),
+      channel: method.channel,
+      instructions: method.instructions || undefined,
+      sortOrder: Number(method.sort_order || 0),
+    };
+  });
+
+  const isDepositRequired = Boolean(settings.deposit_required || settings.default_payment_policy === 'deposit_required');
+
   return res.json({
-    defaultPaymentPolicy: settings.default_payment_policy || 'cod_allowed',
+    depositPolicy: {
+      required: isDepositRequired,
+      type: settings.deposit_type || 'fixed',
+      value: Number(settings.deposit_value || 100),
+      minimumDeposit: Number(settings.minimum_deposit || 50),
+    },
+    paymentMethods: methods,
     sessionTimeoutSeconds: Number(settings.payment_session_timeout_seconds || 120),
     amountTolerance: Number(settings.payment_amount_tolerance || 10),
+    defaultPaymentPolicy: settings.default_payment_policy || 'cod_allowed',
     providers: {
-      vfCashAvailable: eligible.some((device: any) => Boolean(device.vf_cash_enabled)),
-      bankAlAhlyAvailable: eligible.some((device: any) => Boolean(device.bank_alahly_enabled)),
+      vfCashAvailable: eligibleDevices.some((device: any) => Boolean(device.vf_cash_enabled)),
+      bankAlAhlyAvailable: eligibleDevices.some((device: any) => Boolean(device.bank_alahly_enabled)),
     },
+  });
+});
+
+paymentIntegrationConfigRouter.post('/payments/calculate-deposit', requireIntegrationKey, async (req: Request, res: Response) => {
+  const totalAmount = Math.max(0, Number(req.body?.totalAmount || 0));
+  const customerPhone = req.body?.customerPhone;
+  const customerId = req.body?.customerId;
+
+  const { data: settings } = await supabaseServer
+    .from('store_settings')
+    .select('default_payment_policy,deposit_required,deposit_type,deposit_value,minimum_deposit')
+    .eq('id', 1)
+    .maybeSingle();
+
+  let effectiveOverride: 'inherit' | 'allow' | 'deny' = 'inherit';
+
+  // Check customer override if customer identifier is provided
+  if (customerPhone || customerId) {
+    let resolvedCustomerId = customerId;
+    if (!resolvedCustomerId && customerPhone) {
+      const normalized = normalizeEgyptianPhone(customerPhone);
+      if (normalized.isValid) {
+        const { data: customer } = await supabaseServer
+          .from('customers')
+          .select('id')
+          .eq('phone', normalized.normalized)
+          .limit(1)
+          .maybeSingle();
+        resolvedCustomerId = customer?.id;
+      }
+    }
+
+    if (resolvedCustomerId) {
+      const { data: policy } = await supabaseServer
+        .from('customer_policies')
+        .select('cod_override,cod_expires_at')
+        .eq('customer_id', resolvedCustomerId)
+        .maybeSingle();
+
+      if (policy?.cod_override === 'allow' || policy?.cod_override === 'deny') {
+        const expiresAt = policy.cod_expires_at ? new Date(policy.cod_expires_at).getTime() : null;
+        if (expiresAt === null || expiresAt > Date.now()) {
+          effectiveOverride = policy.cod_override;
+        }
+      }
+    }
+  }
+
+  // Precedence: customer allow => no deposit; customer deny => deposit required; otherwise global settings
+  let depositRequired = false;
+  if (effectiveOverride === 'allow') {
+    depositRequired = false;
+  } else if (effectiveOverride === 'deny') {
+    depositRequired = true;
+  } else {
+    depositRequired = Boolean(settings?.deposit_required || settings?.default_payment_policy === 'deposit_required');
+  }
+
+  if (!depositRequired || totalAmount === 0) {
+    return res.json({
+      depositRequired: false,
+      depositType: settings?.deposit_type || 'fixed',
+      depositAmount: 0,
+      remainingAmount: totalAmount,
+      totalAmount,
+    });
+  }
+
+  const depositType = settings?.deposit_type === 'percentage' ? 'percentage' : 'fixed';
+  const depositValue = Number(settings?.deposit_value || 100);
+  const minimumDeposit = Number(settings?.minimum_deposit || 50);
+
+  let depositAmount = 0;
+  if (depositType === 'percentage') {
+    const raw = (totalAmount * depositValue) / 100;
+    depositAmount = Math.max(minimumDeposit, Math.round(raw));
+  } else {
+    depositAmount = Math.max(minimumDeposit, depositValue);
+  }
+
+  // Deposit amount cannot exceed total order amount
+  depositAmount = Math.min(totalAmount, Math.round(depositAmount * 100) / 100);
+  const remainingAmount = Math.max(0, Math.round((totalAmount - depositAmount) * 100) / 100);
+
+  return res.json({
+    depositRequired: true,
+    depositType,
+    depositAmount,
+    remainingAmount,
+    totalAmount,
   });
 });

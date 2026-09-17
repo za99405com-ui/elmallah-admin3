@@ -6,7 +6,7 @@ import { supabaseServer } from './supabase.js';
 
 export const paymentRouter = Router();
 
-type PaymentProvider = 'vf_cash' | 'bank_alahly';
+type PaymentProvider = string;
 type PaymentSessionStatus =
   | 'waiting'
   | 'paid'
@@ -49,7 +49,7 @@ function normalizePhone(value: unknown): string | null {
   return digits;
 }
 
-function normalizeProvider(value: unknown): PaymentProvider | null {
+function normalizeProvider(value: unknown): string {
   const provider = String(value || '').trim().toLowerCase();
   if (provider === 'vf_cash' || provider === 'vodafone_cash') return 'vf_cash';
   if (
@@ -58,7 +58,7 @@ function normalizeProvider(value: unknown): PaymentProvider | null {
     provider === 'nbe_incoming_transfer' ||
     provider === 'bank_al_ahly'
   ) return 'bank_alahly';
-  return null;
+  return provider;
 }
 
 function numberOrNull(value: unknown): number | null {
@@ -349,7 +349,7 @@ async function markSessionPaid(
 paymentRouter.get('/admin/payments/settings', requireAuth, async (_req: AuthenticatedRequest, res: Response) => {
   const { data, error } = await supabaseServer
     .from('store_settings')
-    .select('default_payment_policy,payment_session_timeout_seconds,payment_amount_tolerance')
+    .select('default_payment_policy,payment_session_timeout_seconds,payment_amount_tolerance,deposit_required,deposit_type,deposit_value,minimum_deposit')
     .eq('id', 1)
     .maybeSingle();
   if (error) return res.status(503).json({ error: 'تعذر تحميل إعدادات الدفع' });
@@ -358,6 +358,10 @@ paymentRouter.get('/admin/payments/settings', requireAuth, async (_req: Authenti
     defaultPaymentPolicy: data.default_payment_policy || 'cod_allowed',
     sessionTimeoutSeconds: Number(data.payment_session_timeout_seconds || 120),
     amountTolerance: Number(data.payment_amount_tolerance || 10),
+    depositRequired: Boolean(data.deposit_required || data.default_payment_policy === 'deposit_required'),
+    depositType: data.deposit_type || 'fixed',
+    depositValue: Number(data.deposit_value || 100),
+    minimumDeposit: Number(data.minimum_deposit || 50),
   });
 });
 
@@ -369,27 +373,50 @@ paymentRouter.put(
     const policy = req.body?.defaultPaymentPolicy;
     const timeout = Number(req.body?.sessionTimeoutSeconds);
     const tolerance = Number(req.body?.amountTolerance);
-    if (!['cod_allowed', 'deposit_required'].includes(policy)) {
+    const depositRequired = req.body?.depositRequired !== undefined ? Boolean(req.body.depositRequired) : undefined;
+    const depositType = req.body?.depositType;
+    const depositValue = req.body?.depositValue !== undefined ? Number(req.body.depositValue) : undefined;
+    const minimumDeposit = req.body?.minimumDeposit !== undefined ? Number(req.body.minimumDeposit) : undefined;
+
+    if (policy && !['cod_allowed', 'deposit_required'].includes(policy)) {
       return res.status(400).json({ error: 'سياسة الدفع الافتراضية غير صالحة' });
     }
-    if (!Number.isInteger(timeout) || timeout < 30 || timeout > 600) {
+    if (depositType && !['fixed', 'percentage'].includes(depositType)) {
+      return res.status(400).json({ error: 'نوع العربون يجب أن يكون ثابت أو نسبة مئوية' });
+    }
+    if (timeout !== undefined && (!Number.isInteger(timeout) || timeout < 30 || timeout > 600)) {
       return res.status(400).json({ error: 'مهلة جلسة الدفع يجب أن تكون بين 30 و600 ثانية' });
     }
-    if (!Number.isFinite(tolerance) || tolerance < 0) {
+    if (tolerance !== undefined && (!Number.isFinite(tolerance) || tolerance < 0)) {
       return res.status(400).json({ error: 'هامش مطابقة المبلغ غير صالح' });
     }
+    if (depositValue !== undefined && (!Number.isFinite(depositValue) || depositValue < 0)) {
+      return res.status(400).json({ error: 'قيمة العربون غير صالحة' });
+    }
+    if (minimumDeposit !== undefined && (!Number.isFinite(minimumDeposit) || minimumDeposit < 0)) {
+      return res.status(400).json({ error: 'الحد الأدنى للعربون غير صالح' });
+    }
+
+    const updates: Record<string, unknown> = {
+      updated_at: new Date().toISOString(),
+    };
+    if (policy) updates.default_payment_policy = policy;
+    if (timeout) updates.payment_session_timeout_seconds = timeout;
+    if (tolerance !== undefined) updates.payment_amount_tolerance = tolerance;
+    if (depositRequired !== undefined) {
+      updates.deposit_required = depositRequired;
+      if (depositRequired && !policy) updates.default_payment_policy = 'deposit_required';
+    }
+    if (depositType) updates.deposit_type = depositType;
+    if (depositValue !== undefined) updates.deposit_value = depositValue;
+    if (minimumDeposit !== undefined) updates.minimum_deposit = minimumDeposit;
 
     const { data: existing } = await supabaseServer.from('store_settings').select('*').eq('id', 1).maybeSingle();
     const { data, error } = await supabaseServer
       .from('store_settings')
-      .update({
-        default_payment_policy: policy,
-        payment_session_timeout_seconds: timeout,
-        payment_amount_tolerance: tolerance,
-        updated_at: new Date().toISOString(),
-      })
+      .update(updates)
       .eq('id', 1)
-      .select('default_payment_policy,payment_session_timeout_seconds,payment_amount_tolerance')
+      .select('default_payment_policy,payment_session_timeout_seconds,payment_amount_tolerance,deposit_required,deposit_type,deposit_value,minimum_deposit')
       .single();
     if (error) return res.status(503).json({ error: 'تعذر حفظ إعدادات الدفع' });
 
@@ -398,23 +425,467 @@ paymentRouter.put(
       defaultPaymentPolicy: data.default_payment_policy,
       sessionTimeoutSeconds: Number(data.payment_session_timeout_seconds),
       amountTolerance: Number(data.payment_amount_tolerance),
+      depositRequired: Boolean(data.deposit_required),
+      depositType: data.deposit_type,
+      depositValue: Number(data.deposit_value),
+      minimumDeposit: Number(data.minimum_deposit),
     };
     broadcastRealtimeEvent('payment_settings_updated', result);
     return res.json(result);
   }
 );
 
+// ------------------------------------------------------------------------------
+// Payment Sources CRUD
+// ------------------------------------------------------------------------------
+paymentRouter.get('/admin/payments/sources', requireAuth, async (_req: AuthenticatedRequest, res: Response) => {
+  const [sourcesRes, deviceSourcesRes] = await Promise.all([
+    supabaseServer
+      .from('payment_sources')
+      .select('*')
+      .order('priority', { ascending: false })
+      .order('created_at', { ascending: true }),
+    supabaseServer
+      .from('payment_device_sources')
+      .select('payment_source_id,enabled'),
+  ]);
+
+  if (sourcesRes.error) return res.status(503).json({ error: 'تعذر تحميل مصادر الدفع' });
+
+  const deviceCounts = new Map<string, number>();
+  for (const ds of deviceSourcesRes.data || []) {
+    if (ds.enabled) {
+      deviceCounts.set(ds.payment_source_id, (deviceCounts.get(ds.payment_source_id) || 0) + 1);
+    }
+  }
+
+  const sources = (sourcesRes.data || []).map((s: any) => ({
+    id: s.id,
+    code: s.code,
+    displayName: s.display_name,
+    enabled: Boolean(s.enabled),
+    channel: s.channel,
+    destination: s.destination || null,
+    parserType: s.parser_type || 'regex',
+    sourcePackage: s.source_package || null,
+    sourceSender: s.source_sender || null,
+    titleContains: s.title_contains || null,
+    bodyContains: s.body_contains || null,
+    amountRegex: s.amount_regex || null,
+    payerPhoneRegex: s.payer_phone_regex || null,
+    accountIdentifierRegex: s.account_identifier_regex || null,
+    priority: Number(s.priority ?? 100),
+    notes: s.notes || null,
+    activeDevicesCount: deviceCounts.get(s.id) || 0,
+    createdAt: s.created_at,
+    updatedAt: s.updated_at,
+  }));
+
+  return res.json(sources);
+});
+
+paymentRouter.post(
+  '/admin/payments/sources',
+  requireAuth,
+  requireRole(['super_admin', 'manager']),
+  async (req: AuthenticatedRequest, res: Response) => {
+    const code = String(req.body?.code || '').trim().toLowerCase().replace(/[^a-z0-9_]/g, '_');
+    const displayName = String(req.body?.displayName || '').trim();
+    const channel = String(req.body?.channel || 'wallet').trim();
+
+    if (!code || !displayName) {
+      return res.status(400).json({ error: 'كود المصدر والاسم المعروض مطلوبان' });
+    }
+
+    const row = {
+      code,
+      display_name: displayName,
+      channel,
+      destination: req.body?.destination ? String(req.body.destination).trim() : null,
+      enabled: req.body?.enabled !== false,
+      parser_type: String(req.body?.parserType || 'regex').trim(),
+      source_package: req.body?.sourcePackage ? String(req.body.sourcePackage).trim() : null,
+      source_sender: req.body?.sourceSender ? String(req.body.sourceSender).trim() : null,
+      title_contains: req.body?.titleContains ? String(req.body.titleContains).trim() : null,
+      body_contains: req.body?.bodyContains ? String(req.body.bodyContains).trim() : null,
+      amount_regex: req.body?.amountRegex ? String(req.body.amountRegex).trim() : null,
+      payer_phone_regex: req.body?.payerPhoneRegex ? String(req.body.payerPhoneRegex).trim() : null,
+      account_identifier_regex: req.body?.accountIdentifierRegex ? String(req.body.accountIdentifierRegex).trim() : null,
+      priority: Number(req.body?.priority ?? 100),
+      notes: req.body?.notes ? String(req.body.notes).trim() : null,
+      updated_at: new Date().toISOString(),
+    };
+
+    const { data, error } = await supabaseServer.from('payment_sources').insert(row).select('*').single();
+    if (error?.code === '23505') return res.status(409).json({ error: 'كود المصدر مستخدم بالفعل' });
+    if (error) return res.status(503).json({ error: 'تعذر إنشاء مصدر الدفع' });
+
+    logAuditAction(req.admin, 'create_payment_source', 'payment_source', data.id, null, row, req.ip);
+    broadcastRealtimeEvent('payment_source_created', data);
+    return res.status(201).json({
+      id: data.id,
+      code: data.code,
+      displayName: data.display_name,
+      enabled: Boolean(data.enabled),
+      channel: data.channel,
+      destination: data.destination,
+      parserType: data.parser_type,
+      priority: Number(data.priority),
+    });
+  }
+);
+
+paymentRouter.patch(
+  '/admin/payments/sources/:id',
+  requireAuth,
+  requireRole(['super_admin', 'manager']),
+  async (req: AuthenticatedRequest, res: Response) => {
+    const updates: Record<string, unknown> = { updated_at: new Date().toISOString() };
+    if (req.body?.displayName !== undefined) updates.display_name = String(req.body.displayName).trim();
+    if (req.body?.enabled !== undefined) updates.enabled = Boolean(req.body.enabled);
+    if (req.body?.channel !== undefined) updates.channel = String(req.body.channel).trim();
+    if (req.body?.destination !== undefined) updates.destination = req.body.destination ? String(req.body.destination).trim() : null;
+    if (req.body?.parserType !== undefined) updates.parser_type = String(req.body.parserType).trim();
+    if (req.body?.sourcePackage !== undefined) updates.source_package = req.body.sourcePackage ? String(req.body.sourcePackage).trim() : null;
+    if (req.body?.sourceSender !== undefined) updates.source_sender = req.body.sourceSender ? String(req.body.sourceSender).trim() : null;
+    if (req.body?.titleContains !== undefined) updates.title_contains = req.body.titleContains ? String(req.body.titleContains).trim() : null;
+    if (req.body?.bodyContains !== undefined) updates.body_contains = req.body.bodyContains ? String(req.body.bodyContains).trim() : null;
+    if (req.body?.amountRegex !== undefined) updates.amount_regex = req.body.amountRegex ? String(req.body.amountRegex).trim() : null;
+    if (req.body?.payerPhoneRegex !== undefined) updates.payer_phone_regex = req.body.payerPhoneRegex ? String(req.body.payerPhoneRegex).trim() : null;
+    if (req.body?.accountIdentifierRegex !== undefined) updates.account_identifier_regex = req.body.accountIdentifierRegex ? String(req.body.accountIdentifierRegex).trim() : null;
+    if (req.body?.priority !== undefined) updates.priority = Number(req.body.priority);
+    if (req.body?.notes !== undefined) updates.notes = req.body.notes ? String(req.body.notes).trim() : null;
+
+    const { data: existing, error: findError } = await supabaseServer
+      .from('payment_sources')
+      .select('*')
+      .eq('id', req.params.id)
+      .maybeSingle();
+    if (findError) return res.status(503).json({ error: 'تعذر فحص مصدر الدفع' });
+    if (!existing) return res.status(404).json({ error: 'مصدر الدفع غير موجود' });
+
+    const { data, error } = await supabaseServer
+      .from('payment_sources')
+      .update(updates)
+      .eq('id', req.params.id)
+      .select('*')
+      .single();
+    if (error) return res.status(503).json({ error: 'تعذر تحديث مصدر الدفع' });
+
+    logAuditAction(req.admin, 'update_payment_source', 'payment_source', req.params.id, existing, updates, req.ip);
+    broadcastRealtimeEvent('payment_source_updated', data);
+    return res.json(data);
+  }
+);
+
+paymentRouter.delete(
+  '/admin/payments/sources/:id',
+  requireAuth,
+  requireRole(['super_admin']),
+  async (req: AuthenticatedRequest, res: Response) => {
+    const { data: existing } = await supabaseServer.from('payment_sources').select('*').eq('id', req.params.id).maybeSingle();
+    if (!existing) return res.status(404).json({ error: 'مصدر الدفع غير موجود' });
+
+    // Protect legacy sources from hard deletion; soft-disable them instead
+    if (['vf_cash', 'bank_alahly'].includes(existing.code)) {
+      await supabaseServer.from('payment_sources').update({ enabled: false, updated_at: new Date().toISOString() }).eq('id', req.params.id);
+      return res.json({ success: true, message: 'تم تعطيل المصدر الأساسي للحفاظ على التوافق التاريخي' });
+    }
+
+    const { error } = await supabaseServer.from('payment_sources').delete().eq('id', req.params.id);
+    if (error) return res.status(503).json({ error: 'تعذر حذف مصدر الدفع' });
+
+    logAuditAction(req.admin, 'delete_payment_source', 'payment_source', req.params.id, existing, null, req.ip);
+    return res.json({ success: true });
+  }
+);
+
+// ------------------------------------------------------------------------------
+// Device ↔ Payment Source Assignments
+// ------------------------------------------------------------------------------
+paymentRouter.get('/admin/payments/devices/:id/sources', requireAuth, async (req: AuthenticatedRequest, res: Response) => {
+  const { data, error } = await supabaseServer
+    .from('payment_device_sources')
+    .select('id,device_id,payment_source_id,enabled,created_at,payment_sources(*)')
+    .eq('device_id', req.params.id);
+  if (error) return res.status(503).json({ error: 'تعذر تحميل مصادر الجهاز' });
+  return res.json(data || []);
+});
+
+paymentRouter.put(
+  '/admin/payments/devices/:id/sources',
+  requireAuth,
+  requireRole(['super_admin', 'manager']),
+  async (req: AuthenticatedRequest, res: Response) => {
+    const deviceId = req.params.id;
+    const sourceIds: string[] = Array.isArray(req.body?.sourceIds) ? req.body.sourceIds : [];
+
+    const { data: device } = await supabaseServer.from('payment_devices').select('*').eq('id', deviceId).maybeSingle();
+    if (!device) return res.status(404).json({ error: 'الجهاز غير موجود' });
+
+    // Clear existing assignments and set new ones
+    await supabaseServer.from('payment_device_sources').delete().eq('device_id', deviceId);
+
+    if (sourceIds.length > 0) {
+      const rows = sourceIds.map((sid) => ({
+        device_id: deviceId,
+        payment_source_id: sid,
+        enabled: true,
+      }));
+      await supabaseServer.from('payment_device_sources').insert(rows);
+    }
+
+    // Keep legacy boolean flags in sync
+    const { data: sources } = await supabaseServer.from('payment_sources').select('id,code').in('id', sourceIds);
+    const codes = new Set((sources || []).map((s: any) => s.code));
+    const vfCashEnabled = codes.has('vf_cash');
+    const bankAlAhlyEnabled = codes.has('bank_alahly');
+
+    await supabaseServer
+      .from('payment_devices')
+      .update({
+        vf_cash_enabled: vfCashEnabled,
+        bank_alahly_enabled: bankAlAhlyEnabled,
+        updated_at: new Date().toISOString(),
+      })
+      .eq('id', deviceId);
+
+    logAuditAction(req.admin, 'assign_device_sources', 'payment_device', deviceId, null, { sourceIds, vfCashEnabled, bankAlAhlyEnabled }, req.ip);
+    return res.json({ success: true, assignedCount: sourceIds.length, vfCashEnabled, bankAlAhlyEnabled });
+  }
+);
+
+// ------------------------------------------------------------------------------
+// Customer Payment Methods Management
+// ------------------------------------------------------------------------------
+paymentRouter.get('/admin/payments/customer-methods', requireAuth, async (_req: AuthenticatedRequest, res: Response) => {
+  const [methodsRes, methodSourcesRes] = await Promise.all([
+    supabaseServer.from('customer_payment_methods').select('*').order('sort_order', { ascending: true }),
+    supabaseServer.from('customer_payment_method_sources').select('customer_payment_method_id,payment_source_id,is_primary,payment_sources(*)'),
+  ]);
+  if (methodsRes.error) return res.status(503).json({ error: 'تعذر تحميل طرق الدفع للعملاء' });
+
+  const methods = (methodsRes.data || []).map((m: any) => {
+    const assignedSources = (methodSourcesRes.data || [])
+      .filter((ms: any) => ms.customer_payment_method_id === m.id)
+      .map((ms: any) => ({
+        ...ms.payment_sources,
+        isPrimary: ms.is_primary,
+      }));
+    return {
+      id: m.id,
+      code: m.code,
+      displayName: m.display_name,
+      enabled: Boolean(m.enabled),
+      channel: m.channel,
+      instructions: m.instructions || null,
+      sortOrder: Number(m.sort_order || 0),
+      sources: assignedSources,
+      sourceIds: assignedSources.map((s: any) => s.id),
+      createdAt: m.created_at,
+      updatedAt: m.updated_at,
+    };
+  });
+
+  return res.json(methods);
+});
+
+paymentRouter.post(
+  '/admin/payments/customer-methods',
+  requireAuth,
+  requireRole(['super_admin', 'manager']),
+  async (req: AuthenticatedRequest, res: Response) => {
+    const code = String(req.body?.code || '').trim().toLowerCase().replace(/[^a-z0-9_]/g, '_');
+    const displayName = String(req.body?.displayName || '').trim();
+    const channel = String(req.body?.channel || 'other').trim();
+    if (!code || !displayName) return res.status(400).json({ error: 'كود الطريقة والاسم مطلوبان' });
+
+    const row = {
+      code,
+      display_name: displayName,
+      enabled: req.body?.enabled !== false,
+      channel,
+      instructions: req.body?.instructions ? String(req.body.instructions).trim() : null,
+      sort_order: Number(req.body?.sortOrder || 0),
+      updated_at: new Date().toISOString(),
+    };
+
+    const { data, error } = await supabaseServer.from('customer_payment_methods').insert(row).select('*').single();
+    if (error?.code === '23505') return res.status(409).json({ error: 'كود طريقة الدفع مستخدم بالفعل' });
+    if (error) return res.status(503).json({ error: 'تعذر إنشاء طريقة الدفع' });
+
+    const sourceIds: string[] = Array.isArray(req.body?.sourceIds) ? req.body.sourceIds : [];
+    if (sourceIds.length > 0) {
+      await supabaseServer.from('customer_payment_method_sources').insert(
+        sourceIds.map((sid, idx) => ({
+          customer_payment_method_id: data.id,
+          payment_source_id: sid,
+          is_primary: idx === 0,
+        }))
+      );
+    }
+
+    logAuditAction(req.admin, 'create_customer_payment_method', 'customer_payment_method', data.id, null, { ...row, sourceIds }, req.ip);
+    return res.status(201).json(data);
+  }
+);
+
+paymentRouter.patch(
+  '/admin/payments/customer-methods/:id',
+  requireAuth,
+  requireRole(['super_admin', 'manager']),
+  async (req: AuthenticatedRequest, res: Response) => {
+    const updates: Record<string, unknown> = { updated_at: new Date().toISOString() };
+    if (req.body?.displayName !== undefined) updates.display_name = String(req.body.displayName).trim();
+    if (req.body?.enabled !== undefined) updates.enabled = Boolean(req.body.enabled);
+    if (req.body?.channel !== undefined) updates.channel = String(req.body.channel).trim();
+    if (req.body?.instructions !== undefined) updates.instructions = req.body.instructions ? String(req.body.instructions).trim() : null;
+    if (req.body?.sortOrder !== undefined) updates.sort_order = Number(req.body.sortOrder);
+
+    const { data, error } = await supabaseServer
+      .from('customer_payment_methods')
+      .update(updates)
+      .eq('id', req.params.id)
+      .select('*')
+      .single();
+    if (error) return res.status(503).json({ error: 'تعذر تحديث طريقة الدفع' });
+
+    if (Array.isArray(req.body?.sourceIds)) {
+      await supabaseServer.from('customer_payment_method_sources').delete().eq('customer_payment_method_id', req.params.id);
+      if (req.body.sourceIds.length > 0) {
+        await supabaseServer.from('customer_payment_method_sources').insert(
+          req.body.sourceIds.map((sid: string, idx: number) => ({
+            customer_payment_method_id: req.params.id,
+            payment_source_id: sid,
+            is_primary: idx === 0,
+          }))
+        );
+      }
+    }
+
+    return res.json(data);
+  }
+);
+
+// ------------------------------------------------------------------------------
+// Problem Orders Endpoint (طلبات تحتاج مراجعة)
+// ------------------------------------------------------------------------------
+paymentRouter.get('/admin/payments/problem-orders', requireAuth, async (_req: AuthenticatedRequest, res: Response) => {
+  // Query orders with pending deposits or linked to problematic payment reviews / sessions
+  const [ordersRes, reviewsRes, sessionsRes] = await Promise.all([
+    supabaseServer
+      .from('orders')
+      .select('id,order_number,status,deposit_status,deposit_amount,deposit_paid,total_amount,payment_mode,deposit_method,customer_name,customer_phone,created_at')
+      .or('deposit_status.eq.pending,deposit_status.eq.rejected')
+      .order('created_at', { ascending: false })
+      .limit(150),
+    supabaseServer
+      .from('payment_review_items')
+      .select('*')
+      .eq('status', 'open')
+      .order('created_at', { ascending: false }),
+    supabaseServer
+      .from('payment_sessions')
+      .select('*')
+      .in('status', ['needs_review', 'expired_needs_review'])
+      .order('created_at', { ascending: false }),
+  ]);
+
+  const openReviews = reviewsRes.data || [];
+  const problematicSessions = sessionsRes.data || [];
+  const reviewMapByOrder = new Map<string, any>();
+  const reviewMapBySession = new Map<string, any>();
+  for (const r of openReviews) {
+    if (r.order_id) reviewMapByOrder.set(r.order_id, r);
+    if (r.session_id) reviewMapBySession.set(r.session_id, r);
+  }
+
+  // Combine and deduplicate problematic orders
+  const problemMap = new Map<string, any>();
+
+  // 1. Orders with deposit status pending or rejected
+  for (const ord of ordersRes.data || []) {
+    const linkedReview = reviewMapByOrder.get(ord.id);
+    problemMap.set(ord.id, {
+      id: ord.id,
+      orderNumber: ord.order_number || ord.id,
+      customerName: ord.customer_name || 'عميل غير مسجل',
+      customerPhone: ord.customer_phone || '-',
+      totalAmount: Number(ord.total_amount || 0),
+      depositExpected: Number(ord.deposit_amount || 0),
+      depositPaid: Number(ord.deposit_paid || 0),
+      difference: Number(ord.deposit_paid || 0) - Number(ord.deposit_amount || 0),
+      orderStatus: ord.status,
+      depositStatus: ord.deposit_status,
+      paymentMode: ord.payment_mode || 'deposit_online',
+      paymentMethod: ord.deposit_method || 'electronic',
+      problemReason: linkedReview ? linkedReview.reason : (ord.deposit_status === 'pending' ? 'بانتظار تأكيد العربون' : 'عربون مرفوض'),
+      reviewId: linkedReview?.id || null,
+      createdAt: ord.created_at,
+    });
+  }
+
+  // 2. Open reviews with an orderId not already included
+  for (const r of openReviews) {
+    if (r.order_id && !problemMap.has(r.order_id)) {
+      problemMap.set(r.order_id, {
+        id: r.order_id,
+        orderNumber: r.order_id,
+        customerName: r.customer_name || 'عميل غير مسجل',
+        customerPhone: r.customer_phone || '-',
+        totalAmount: Number(r.expected_amount || 0),
+        depositExpected: Number(r.expected_amount || 0),
+        depositPaid: Number(r.received_amount || 0),
+        difference: Number(r.amount_difference || 0),
+        orderStatus: 'pending',
+        depositStatus: 'pending',
+        paymentMode: 'deposit_online',
+        paymentMethod: 'electronic',
+        problemReason: r.reason,
+        reviewId: r.id,
+        sessionId: r.session_id || null,
+        createdAt: r.created_at,
+      });
+    }
+  }
+
+  const problemOrders = Array.from(problemMap.values());
+  return res.json(problemOrders);
+});
+
+// ------------------------------------------------------------------------------
+// Comprehensive Overview Endpoint
+// ------------------------------------------------------------------------------
 paymentRouter.get('/admin/payments/overview', requireAuth, async (_req: AuthenticatedRequest, res: Response) => {
   await expireSessions();
-  const [devicesResult, reviewsResult, sessionsResult, settingsResult] = await Promise.all([
+  const [
+    devicesResult,
+    deviceSourcesResult,
+    sourcesResult,
+    customerMethodsResult,
+    reviewsResult,
+    sessionsResult,
+    settingsResult,
+    problemOrdersRes,
+  ] = await Promise.all([
     supabaseServer
       .from('payment_devices')
       .select('id,device_id,name,payment_destination,is_enabled,vf_cash_enabled,bank_alahly_enabled,online,internet_connected,app_running,notification_listener_enabled,is_busy,busy_session_id,last_heartbeat_at,last_event_at,app_version,created_at,updated_at')
       .order('created_at', { ascending: true }),
     supabaseServer
+      .from('payment_device_sources')
+      .select('device_id,payment_source_id,enabled,payment_sources(*)'),
+    supabaseServer
+      .from('payment_sources')
+      .select('*')
+      .order('priority', { ascending: false }),
+    supabaseServer
+      .from('customer_payment_methods')
+      .select('*')
+      .order('sort_order', { ascending: true }),
+    supabaseServer
       .from('payment_review_items')
       .select('*')
-      .eq('status', 'open')
       .order('created_at', { ascending: false })
       .limit(100),
     supabaseServer
@@ -424,17 +895,35 @@ paymentRouter.get('/admin/payments/overview', requireAuth, async (_req: Authenti
       .limit(100),
     supabaseServer
       .from('store_settings')
-      .select('default_payment_policy,payment_session_timeout_seconds,payment_amount_tolerance')
+      .select('default_payment_policy,payment_session_timeout_seconds,payment_amount_tolerance,deposit_required,deposit_type,deposit_value,minimum_deposit')
       .eq('id', 1)
       .maybeSingle(),
+    supabaseServer
+      .from('orders')
+      .select('id,order_number,status,deposit_status,deposit_amount,deposit_paid,total_amount,payment_mode,deposit_method,customer_name,customer_phone,created_at')
+      .or('deposit_status.eq.pending,deposit_status.eq.rejected')
+      .order('created_at', { ascending: false })
+      .limit(50),
   ]);
 
   const failed = [devicesResult, reviewsResult, sessionsResult, settingsResult].find((r) => r.error);
   if (failed?.error) return res.status(503).json({ error: 'تعذر تحميل مركز مراجعة المدفوعات' });
 
   const now = Date.now();
-  return res.json({
-    devices: (devicesResult.data || []).map((d: any) => ({
+
+  // Attach sources to devices
+  const deviceSourcesMap = new Map<string, any[]>();
+  for (const ds of deviceSourcesResult.data || []) {
+    if (ds.enabled && ds.payment_sources) {
+      const list = deviceSourcesMap.get(ds.device_id) || [];
+      list.push(ds.payment_sources);
+      deviceSourcesMap.set(ds.device_id, list);
+    }
+  }
+
+  const devices = (devicesResult.data || []).map((d: any) => {
+    const assignedSources = deviceSourcesMap.get(d.id) || [];
+    return {
       id: d.id,
       deviceId: d.device_id,
       name: d.name,
@@ -451,13 +940,72 @@ paymentRouter.get('/admin/payments/overview', requireAuth, async (_req: Authenti
       lastHeartbeatAt: d.last_heartbeat_at || undefined,
       lastEventAt: d.last_event_at || undefined,
       appVersion: d.app_version || undefined,
-    })),
+      sources: assignedSources,
+      assignedSourceIds: assignedSources.map((s: any) => s.id),
+    };
+  });
+
+  const sources = (sourcesResult.data || []).map((s: any) => ({
+    id: s.id,
+    code: s.code,
+    displayName: s.display_name,
+    enabled: Boolean(s.enabled),
+    channel: s.channel,
+    destination: s.destination || null,
+    priority: Number(s.priority ?? 100),
+    parserType: s.parser_type || 'regex',
+    sourceSender: s.source_sender || null,
+    sourcePackage: s.source_package || null,
+    titleContains: s.title_contains || null,
+    bodyContains: s.body_contains || null,
+    amountRegex: s.amount_regex || null,
+    payerPhoneRegex: s.payer_phone_regex || null,
+    accountIdentifierRegex: s.account_identifier_regex || null,
+    notes: s.notes || null,
+  }));
+
+  const customerMethods = (customerMethodsResult.data || []).map((m: any) => ({
+    id: m.id,
+    code: m.code,
+    displayName: m.display_name,
+    enabled: Boolean(m.enabled),
+    channel: m.channel,
+    instructions: m.instructions || null,
+    sortOrder: Number(m.sort_order || 0),
+  }));
+
+  const problemOrders = (problemOrdersRes.data || []).map((ord: any) => ({
+    id: ord.id,
+    orderNumber: ord.order_number || ord.id,
+    customerName: ord.customer_name || 'عميل غير مسجل',
+    customerPhone: ord.customer_phone || '-',
+    totalAmount: Number(ord.total_amount || 0),
+    depositExpected: Number(ord.deposit_amount || 0),
+    depositPaid: Number(ord.deposit_paid || 0),
+    difference: Number(ord.deposit_paid || 0) - Number(ord.deposit_amount || 0),
+    orderStatus: ord.status,
+    depositStatus: ord.deposit_status,
+    paymentMode: ord.payment_mode || 'deposit_online',
+    paymentMethod: ord.deposit_method || 'electronic',
+    problemReason: ord.deposit_status === 'pending' ? 'بانتظار تأكيد العربون' : 'عربون مرفوض',
+    createdAt: ord.created_at,
+  }));
+
+  return res.json({
+    devices,
+    sources,
+    customerMethods,
     reviews: reviewsResult.data || [],
     sessions: (sessionsResult.data || []).map((s: any) => mapSession(s)),
+    problemOrders,
     settings: {
       defaultPaymentPolicy: settingsResult.data?.default_payment_policy || 'cod_allowed',
       sessionTimeoutSeconds: Number(settingsResult.data?.payment_session_timeout_seconds || 120),
       amountTolerance: Number(settingsResult.data?.payment_amount_tolerance || 10),
+      depositRequired: Boolean(settingsResult.data?.deposit_required || settingsResult.data?.default_payment_policy === 'deposit_required'),
+      depositType: settingsResult.data?.deposit_type || 'fixed',
+      depositValue: Number(settingsResult.data?.deposit_value || 100),
+      minimumDeposit: Number(settingsResult.data?.minimum_deposit || 50),
     },
   });
 });
@@ -626,7 +1174,21 @@ paymentRouter.post('/payments/sessions', requireIntegrationKey, async (req: Requ
   await expireSessions();
 
   const orderId = String(req.body?.orderId || '').trim();
-  const provider = normalizeProvider(req.body?.provider);
+  const sourceId = req.body?.paymentSourceId ? String(req.body.paymentSourceId).trim() : null;
+  const rawProvider = String(req.body?.provider || '').trim();
+  let provider = normalizeProvider(rawProvider);
+
+  // Resolve dynamic payment source
+  let resolvedSource: any = null;
+  if (sourceId) {
+    const { data: src } = await supabaseServer.from('payment_sources').select('*').eq('id', sourceId).maybeSingle();
+    resolvedSource = src;
+    if (src) provider = src.code;
+  } else if (provider) {
+    const { data: src } = await supabaseServer.from('payment_sources').select('*').eq('code', provider).maybeSingle();
+    resolvedSource = src;
+  }
+
   const expectedAmount = Number(req.body?.expectedAmount);
   const customerId = req.body?.customerId ? String(req.body.customerId) : null;
   const customerPhone = normalizePhone(req.body?.customerPhone);
@@ -682,6 +1244,7 @@ paymentRouter.post('/payments/sessions', requireIntegrationKey, async (req: Requ
       customer_id: customerId || order.customer_id || null,
       customer_phone: customerPhone || normalizePhone(order.customer_phone),
       provider,
+      payment_source_id: resolvedSource?.id || null,
       expected_amount: Math.round(expectedAmount * 100) / 100,
       amount_tolerance: tolerance,
       status: 'waiting',
@@ -695,7 +1258,7 @@ paymentRouter.post('/payments/sessions', requireIntegrationKey, async (req: Requ
 
   const { data: reserved, error: reserveError } = await supabaseServer.rpc('reserve_payment_device', {
     p_session_id: sessionId,
-    p_provider: provider,
+    p_provider: resolvedSource?.id || provider,
   });
 
   if (reserveError || !reserved || reserved.length === 0) {
@@ -920,12 +1483,32 @@ paymentRouter.post('/payment-bridge/events', verifyBridgeRequest, async (req: Ra
   const receivedAmount = Math.round((amountMinor / 100) * 100) / 100;
   const payerPhone = normalizePhone(req.body?.payerPhone);
 
+  // Resolve payment source if provided or by provider code
+  let resolvedSource: any = null;
+  if (req.body?.paymentSourceId) {
+    const { data: src } = await supabaseServer
+      .from('payment_sources')
+      .select('*')
+      .eq('id', req.body.paymentSourceId)
+      .maybeSingle();
+    resolvedSource = src;
+  }
+  if (!resolvedSource && provider) {
+    const { data: src } = await supabaseServer
+      .from('payment_sources')
+      .select('*')
+      .eq('code', provider)
+      .maybeSingle();
+    resolvedSource = src;
+  }
+
   const eventInsert = {
     event_id: eventId,
     device_id: device.id,
     reported_device_id: reportedDeviceId,
     provider,
-    payment_channel: String(req.body?.paymentChannel || provider),
+    payment_source_id: resolvedSource?.id || null,
+    payment_channel: String(req.body?.paymentChannel || resolvedSource?.channel || provider),
     amount_minor: amountMinor,
     currency: String(req.body?.currency || 'EGP'),
     payer_phone: payerPhone,
@@ -956,41 +1539,57 @@ paymentRouter.post('/payment-bridge/events', verifyBridgeRequest, async (req: Ra
     .update({ last_event_at: new Date().toISOString(), updated_at: new Date().toISOString() })
     .eq('id', device.id);
 
-  // Prefer the authoritative active reservation. Historical search is only used
-  // for delayed notifications after a session/device was already released.
+  // Authoritative active reservation check
   let candidates: Record<string, any>[] = [];
+  let activeMatches = false;
+
   if (device.busy_session_id) {
-    const { data } = await supabaseServer
+    const { data: activeSession } = await supabaseServer
       .from('payment_sessions')
       .select('*')
       .eq('id', device.busy_session_id)
       .in('status', ['waiting', 'expired', 'expired_needs_review', 'needs_review'])
       .maybeSingle();
-    if (data) candidates = [data];
+
+    if (activeSession) {
+      const created = new Date(activeSession.created_at).getTime();
+      const expires = new Date(activeSession.expires_at).getTime();
+      const providerMatches =
+        normalizeProvider(activeSession.provider) === provider ||
+        (resolvedSource && activeSession.payment_source_id === resolvedSource.id);
+
+      if (providerMatches && capturedAtMs >= created - 15_000 && capturedAtMs <= expires + LATE_MATCH_WINDOW_MS) {
+        candidates = [activeSession];
+        activeMatches = true;
+      }
+    }
   }
 
-  if (candidates.length === 0) {
+  // Fallback: search recent historical sessions for this device
+  if (!activeMatches) {
     const lowerBound = new Date(capturedAt.getTime() - LATE_MATCH_WINDOW_MS).toISOString();
     const { data, error } = await supabaseServer
       .from('payment_sessions')
       .select('*')
       .eq('device_id', device.id)
-      .eq('provider', provider)
       .in('status', ['waiting', 'expired', 'expired_needs_review', 'needs_review'])
-      .lte('created_at', capturedAt.toISOString())
+      .lte('created_at', new Date(capturedAt.getTime() + 15_000).toISOString())
       .gte('expires_at', lowerBound)
       .order('created_at', { ascending: false })
       .limit(10);
-    if (error) return res.status(503).json({ error: 'Payment matching service unavailable' });
-    candidates = (data || []) as Record<string, any>[];
-  }
 
-  candidates = candidates.filter((session) => {
-    if (normalizeProvider(session.provider) !== provider) return false;
-    const created = new Date(session.created_at).getTime();
-    const expires = new Date(session.expires_at).getTime();
-    return capturedAtMs >= created - 15_000 && capturedAtMs <= expires + LATE_MATCH_WINDOW_MS;
-  });
+    if (error) return res.status(503).json({ error: 'Payment matching service unavailable' });
+
+    candidates = (data || []).filter((session: any) => {
+      const providerMatches =
+        normalizeProvider(session.provider) === provider ||
+        (resolvedSource && session.payment_source_id === resolvedSource.id);
+      if (!providerMatches) return false;
+      const created = new Date(session.created_at).getTime();
+      const expires = new Date(session.expires_at).getTime();
+      return capturedAtMs >= created - 15_000 && capturedAtMs <= expires + LATE_MATCH_WINDOW_MS;
+    });
+  }
 
   if (candidates.length === 0) {
     await supabaseServer

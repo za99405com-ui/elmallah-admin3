@@ -23,6 +23,7 @@ import {
   XCircle,
   ExternalLink,
   Store,
+  CreditCard,
 } from 'lucide-react';
 
 export const TopNavbar: React.FC = () => {
@@ -89,9 +90,9 @@ export const TopNavbar: React.FC = () => {
       badgeVariant: 'warning',
     },
     {
-      id: 'deposits',
-      label: 'العربونات',
-      icon: <Banknote className="w-3.5 h-3.5 sm:w-4 sm:h-4 shrink-0" />,
+      id: 'payments',
+      label: 'المدفوعات والمراجعة',
+      icon: <CreditCard className="w-3.5 h-3.5 sm:w-4 sm:h-4 shrink-0" />,
       badge: pendingDeposits.length > 0 ? pendingDeposits.length : undefined,
       badgeVariant: 'danger',
     },

@@ -72,31 +72,6 @@ const MainDashboardContent: React.FC = () => {
     );
   }
 
-  const isPaymentReviewRoute =
-    typeof window !== 'undefined' && window.location.pathname.startsWith('/payments-review');
-
-  if (isPaymentReviewRoute) {
-    return (
-      <div
-        dir="rtl"
-        className={`min-h-screen w-full flex flex-col font-sans antialiased selection:bg-cyan-500/30 selection:text-cyan-600 dark:selection:text-cyan-200 ${
-          darkMode ? 'bg-[#090e1a] text-slate-100' : 'bg-slate-100/90 text-slate-900'
-        }`}
-      >
-        <TopNavbar />
-        <main className="flex-1 w-full max-w-7xl mx-auto px-2.5 sm:px-4 md:px-6 py-3 sm:py-5">
-          <div className="mb-3">
-            <a href="/" className="text-xs font-bold text-cyan-600 dark:text-cyan-400 hover:underline">
-              ← العودة إلى لوحة الإدارة
-            </a>
-          </div>
-          <PaymentReviewTab />
-        </main>
-        <ToastContainer />
-      </div>
-    );
-  }
-
   return (
     <div
       dir="rtl"
@@ -104,25 +79,15 @@ const MainDashboardContent: React.FC = () => {
         darkMode ? 'bg-[#090e1a] text-slate-100' : 'bg-slate-100/90 text-slate-900'
       }`}
     >
-      {/* 1. Unified Compact Top Control Panel (بدون قائمة جانبية - الخيارات مصفوفة فوق جمب بعض) */}
+      {/* 1. Unified Compact Top Control Panel */}
       <TopNavbar />
-
-      {/* Dedicated payment review center shortcut */}
-      <div className="w-full max-w-7xl mx-auto px-2.5 sm:px-4 md:px-6 pt-3">
-        <a
-          href="/payments-review"
-          className="inline-flex items-center gap-2 rounded-xl border border-cyan-500/30 bg-cyan-500/10 px-3 py-2 text-xs font-black text-cyan-700 dark:text-cyan-300 hover:bg-cyan-500/15 transition-colors"
-        >
-          <CreditCard className="w-4 h-4" />
-          مركز الدفع والمراجعة
-        </a>
-      </div>
 
       {/* 2. Main Scrollable Dashboard Content */}
       <main className="flex-1 w-full max-w-7xl mx-auto px-2.5 sm:px-4 md:px-6 py-3 sm:py-5">
         {activeTab === 'overview' && <OverviewTab />}
         {activeTab === 'orders' && <OrdersTab />}
-        {activeTab === 'deposits' && <OrdersTab defaultFilter="deposit_pending" />}
+        {activeTab === 'payments' && <PaymentReviewTab />}
+        {activeTab === 'deposits' && <PaymentReviewTab initialTab="problems" />}
         {activeTab === 'order_demand' && <OrderDemandTab />}
         {activeTab === 'customers' && <CustomersTab />}
         {activeTab === 'products' && <ProductsTab />}

@@ -359,6 +359,7 @@ export type PrepCycleFilter = 'today' | 'tomorrow' | 'all' | 'custom';
 export type ActiveTab =
   | 'overview'
   | 'orders'
+  | 'payments'
   | 'deposits'
   | 'order_demand'
   | 'customers'
@@ -367,3 +368,135 @@ export type ActiveTab =
   | 'categories'
   | 'delivery_regions'
   | 'settings';
+
+export interface PaymentSource {
+  id: string;
+  code: string;
+  displayName: string;
+  enabled: boolean;
+  channel: 'wallet' | 'bank_transfer' | 'instapay' | 'other';
+  destination?: string | null;
+  parserType: 'regex' | 'json' | 'keyword' | 'smart';
+  sourcePackage?: string | null;
+  sourceSender?: string | null;
+  titleContains?: string | null;
+  bodyContains?: string | null;
+  amountRegex?: string | null;
+  payerPhoneRegex?: string | null;
+  accountIdentifierRegex?: string | null;
+  priority: number;
+  notes?: string | null;
+  createdAt?: string;
+  updatedAt?: string;
+}
+
+export interface PaymentDeviceSource {
+  id: string;
+  deviceId: string;
+  paymentSourceId: string;
+  enabled: boolean;
+  source?: PaymentSource;
+}
+
+export interface CustomerPaymentMethod {
+  id: string;
+  code: string;
+  displayName: string;
+  nameAr?: string;
+  nameEn?: string;
+  descriptionAr?: string;
+  enabled: boolean;
+  channel: 'cash_on_delivery' | 'wallet' | 'instapay' | 'bank_transfer' | 'card' | 'other';
+  instructions?: string | null;
+  instructionsAr?: string | null;
+  sortOrder: number;
+  sources?: PaymentSource[];
+  sourceIds?: string[];
+  primarySourceId?: string | null;
+  secondarySourceIds?: string[];
+  requiresDeposit?: boolean;
+  createdAt?: string;
+  updatedAt?: string;
+}
+
+export interface PaymentDeviceItem {
+  id: string;
+  deviceId: string;
+  name: string;
+  paymentDestination: string;
+  isEnabled: boolean;
+  vfCashEnabled: boolean;
+  bankAlAhlyEnabled: boolean;
+  online: boolean;
+  internetConnected: boolean;
+  appRunning: boolean;
+  notificationListenerEnabled: boolean;
+  busy: boolean;
+  busySessionId?: string | null;
+  lastHeartbeatAt?: string;
+  lastEventAt?: string;
+  appVersion?: string;
+  sources?: PaymentSource[];
+  assignedSourceIds?: string[];
+}
+
+export interface PaymentSessionItem {
+  id: string;
+  clientToken: string;
+  orderId: string;
+  customerId?: string;
+  customerPhone?: string;
+  customerName?: string;
+  provider: string;
+  paymentSourceId?: string;
+  paymentSourceName?: string;
+  expectedAmount: number;
+  amountTolerance: number;
+  currency: string;
+  deviceId?: string;
+  devicePublicId?: string;
+  paymentDestination?: string;
+  status: 'waiting' | 'paid' | 'expired' | 'expired_needs_review' | 'needs_review' | 'cancelled';
+  expiresAt: string;
+  contactedSupportAt?: string;
+  matchedEventId?: string;
+  matchedAmount?: number;
+  amountDifference?: number;
+  payerPhone?: string;
+  paidAt?: string;
+  cancelledAt?: string;
+  cancellationReason?: string;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface PaymentReviewItemDetail {
+  id: string;
+  reason: 'underpaid' | 'late_payment' | 'ambiguous' | 'no_match' | 'customer_contacted_support';
+  status: 'open' | 'resolved';
+  sessionId?: string;
+  eventId?: string;
+  orderId?: string;
+  customerName?: string;
+  customerPhone?: string;
+  expectedAmount?: number;
+  receivedAmount?: number;
+  amountDifference?: number;
+  details?: Record<string, any>;
+  resolutionNotes?: string;
+  resolvedAt?: string;
+  resolvedBy?: string;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface DepositPolicySettings {
+  defaultPaymentPolicy: 'cod_allowed' | 'deposit_required';
+  sessionTimeoutSeconds: number;
+  amountTolerance: number;
+  depositRequired: boolean;
+  depositType: 'fixed' | 'percentage';
+  depositValue: number;
+  minimumDeposit: number;
+}
+

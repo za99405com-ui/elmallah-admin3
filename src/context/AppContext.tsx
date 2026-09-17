@@ -202,7 +202,40 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
       return next;
     });
   }, []);
-  const [activeTab, setActiveTab] = useState<ActiveTab>('overview');
+  const [activeTab, setActiveTabState] = useState<ActiveTab>(() => {
+    if (typeof window !== 'undefined') {
+      const path = window.location.pathname;
+      if (path.startsWith('/payments-review') || path.startsWith('/payments')) {
+        return 'payments';
+      }
+    }
+    return 'overview';
+  });
+
+  const setActiveTab = useCallback((tab: ActiveTab) => {
+    setActiveTabState(tab);
+    if (typeof window !== 'undefined') {
+      const targetPath = tab === 'payments' ? '/payments-review' : '/';
+      if (window.location.pathname !== targetPath) {
+        window.history.pushState({ tab }, '', targetPath);
+      }
+    }
+  }, []);
+
+  useEffect(() => {
+    const handlePopState = () => {
+      if (typeof window !== 'undefined') {
+        const path = window.location.pathname;
+        if (path.startsWith('/payments-review') || path.startsWith('/payments')) {
+          setActiveTabState('payments');
+        } else {
+          setActiveTabState('overview');
+        }
+      }
+    };
+    window.addEventListener('popstate', handlePopState);
+    return () => window.removeEventListener('popstate', handlePopState);
+  }, []);
   const [isSidebarOpen, setIsSidebarOpen] = useState<boolean>(false);
   const [soundEnabled, setSoundEnabled] = useState<boolean>(true);
   const toggleSound = () => setSoundEnabled((prev) => !prev);

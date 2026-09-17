@@ -34,6 +34,7 @@ import {
   Edit2,
   X,
   FileText,
+  CreditCard,
 } from 'lucide-react';
 
 export const SettingsTab: React.FC = () => {
@@ -43,6 +44,7 @@ export const SettingsTab: React.FC = () => {
     toggleStoreStatus,
     adminUser,
     updateAdminProfile,
+    setActiveTab,
     authCredentials,
     updateCredentials,
     phoneNotificationsEnabled,
@@ -69,6 +71,15 @@ export const SettingsTab: React.FC = () => {
   const [freeDeliveryThreshold, setFreeDeliveryThreshold] = useState(settings.freeDeliveryThreshold);
   const [workingHours, setWorkingHours] = useState(settings.workingHours);
   const [closedReason, setClosedReason] = useState(settings.closedReason || '');
+
+  // Deposit policy state
+  const [depositRequired, setDepositRequired] = useState(Boolean(settings.depositRequired));
+  const [depositType, setDepositType] = useState<'fixed' | 'percentage'>(settings.depositType || 'fixed');
+  const [depositValue, setDepositValue] = useState<number>(settings.depositValue ?? 50);
+  const [minDeposit, setMinDeposit] = useState<number>(settings.minDeposit ?? 20);
+  const [defaultPaymentPolicy, setDefaultPaymentPolicy] = useState<'cod_allowed' | 'deposit_required'>(settings.defaultPaymentPolicy || 'cod_allowed');
+  const [paymentSessionTimeoutSeconds, setPaymentSessionTimeoutSeconds] = useState<number>(settings.paymentSessionTimeoutSeconds ?? 120);
+  const [paymentAmountTolerance, setPaymentAmountTolerance] = useState<number>(settings.paymentAmountTolerance ?? 10);
 
   // Admin Profile form state
   const [adminName, setAdminName] = useState(adminUser.name);
@@ -124,6 +135,13 @@ export const SettingsTab: React.FC = () => {
       freeDeliveryThreshold: Number(freeDeliveryThreshold),
       workingHours,
       closedReason,
+      depositRequired,
+      depositType,
+      depositValue: Number(depositValue),
+      minDeposit: Number(minDeposit),
+      defaultPaymentPolicy,
+      paymentSessionTimeoutSeconds: Number(paymentSessionTimeoutSeconds),
+      paymentAmountTolerance: Number(paymentAmountTolerance),
     });
   };
 
@@ -458,6 +476,143 @@ export const SettingsTab: React.FC = () => {
             </button>
           </div>
         </form>
+      </div>
+
+      {/* 4.1. Deposit Policy & Digital Payment Configuration */}
+      <div className="bg-white dark:bg-[#111827] rounded-2xl p-4 sm:p-5 border border-slate-200 dark:border-slate-800 shadow-xs transition-colors space-y-4">
+        <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 pb-3 border-b border-slate-100 dark:border-slate-800">
+          <div className="flex items-center gap-2">
+            <CreditCard className="w-5 h-5 text-cyan-500" />
+            <div>
+              <h3 className="text-sm sm:text-base font-bold text-slate-900 dark:text-white">
+                سياسة دفع العربون والمدفوعات الإلكترونية (Deposit Policy)
+              </h3>
+              <p className="text-[11px] text-slate-500 dark:text-slate-400">
+                التحكم في إلزامية العربون، نوع القيمة، مهلة الجلسات، وهامش التفاوت المالي
+              </p>
+            </div>
+          </div>
+          <button
+            type="button"
+            onClick={() => setActiveTab('payments')}
+            className="px-3 py-1.5 rounded-xl border border-cyan-500/40 text-cyan-600 dark:text-cyan-400 hover:bg-cyan-50 dark:hover:bg-cyan-950/40 text-xs font-bold flex items-center gap-1.5 self-start sm:self-auto cursor-pointer transition-colors"
+          >
+            <span>مركز الدفع والأجهزة</span>
+          </button>
+        </div>
+
+        <div className="space-y-4">
+          <div className="p-3 bg-slate-50 dark:bg-slate-800/40 rounded-xl border border-slate-200 dark:border-slate-700/60 flex items-center justify-between">
+            <div>
+              <p className="text-xs font-bold text-slate-800 dark:text-slate-200">
+                تفعيل متطلب دفع العربون مسبقاً
+              </p>
+              <p className="text-[11px] text-slate-500">
+                إلزام العملاء بسداد عربون تأكيدي قبل تجهيز وشحن طلب الأسماك والبحريات
+              </p>
+            </div>
+            <label className="relative inline-flex items-center cursor-pointer">
+              <input
+                type="checkbox"
+                checked={depositRequired}
+                onChange={(e) => setDepositRequired(e.target.checked)}
+                className="sr-only peer"
+              />
+              <div className="w-11 h-6 bg-slate-200 peer-focus:outline-none rounded-full peer dark:bg-slate-700 peer-checked:after:translate-x-full rtl:peer-checked:after:-translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:start-[2px] after:bg-white after:border-slate-300 after:border after:rounded-full after:h-5 after:w-5 after:transition-all peer-checked:bg-cyan-500"></div>
+            </label>
+          </div>
+
+          <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3">
+            <div>
+              <label className="block text-xs font-bold text-slate-700 dark:text-slate-300 mb-1">
+                السياسة الافتراضية
+              </label>
+              <select
+                value={defaultPaymentPolicy}
+                onChange={(e) =>
+                  setDefaultPaymentPolicy(e.target.value as 'cod_allowed' | 'deposit_required')
+                }
+                className="w-full px-3 py-2 rounded-xl border border-slate-300 dark:border-slate-700 bg-slate-50 dark:bg-slate-800 text-slate-900 dark:text-white text-xs focus:outline-none focus:border-cyan-500"
+              >
+                <option value="cod_allowed">الدفع عند الاستلام مسموح (COD)</option>
+                <option value="deposit_required">العربون إلزامي لجميع الطلبات</option>
+              </select>
+            </div>
+
+            <div>
+              <label className="block text-xs font-bold text-slate-700 dark:text-slate-300 mb-1">
+                نوع العربون
+              </label>
+              <select
+                value={depositType}
+                onChange={(e) => setDepositType(e.target.value as 'fixed' | 'percentage')}
+                className="w-full px-3 py-2 rounded-xl border border-slate-300 dark:border-slate-700 bg-slate-50 dark:bg-slate-800 text-slate-900 dark:text-white text-xs focus:outline-none focus:border-cyan-500"
+              >
+                <option value="fixed">مبلغ ثابت (ج.م)</option>
+                <option value="percentage">نسبة مئوية (%)</option>
+              </select>
+            </div>
+
+            <div>
+              <label className="block text-xs font-bold text-slate-700 dark:text-slate-300 mb-1">
+                قيمة العربون {depositType === 'fixed' ? '(ج.م)' : '(%)'}
+              </label>
+              <input
+                type="number"
+                min="1"
+                step={depositType === 'percentage' ? '1' : '5'}
+                value={depositValue}
+                onChange={(e) => setDepositValue(Number(e.target.value))}
+                className="w-full px-3 py-2 rounded-xl border border-slate-300 dark:border-slate-700 bg-slate-50 dark:bg-slate-800 text-slate-900 dark:text-white text-xs focus:outline-none focus:border-cyan-500"
+              />
+            </div>
+
+            <div>
+              <label className="block text-xs font-bold text-slate-700 dark:text-slate-300 mb-1">
+                الحد الأدنى للعربون (ج.م)
+              </label>
+              <input
+                type="number"
+                min="0"
+                value={minDeposit}
+                onChange={(e) => setMinDeposit(Number(e.target.value))}
+                className="w-full px-3 py-2 rounded-xl border border-slate-300 dark:border-slate-700 bg-slate-50 dark:bg-slate-800 text-slate-900 dark:text-white text-xs focus:outline-none focus:border-cyan-500"
+              />
+            </div>
+          </div>
+
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 pt-2">
+            <div>
+              <label className="block text-xs font-bold text-slate-700 dark:text-slate-300 mb-1">
+                مهلة جلسة الدفع (ثواني)
+              </label>
+              <input
+                type="number"
+                min="30"
+                max="600"
+                value={paymentSessionTimeoutSeconds}
+                onChange={(e) => setPaymentSessionTimeoutSeconds(Number(e.target.value))}
+                className="w-full px-3 py-2 rounded-xl border border-slate-300 dark:border-slate-700 bg-slate-50 dark:bg-slate-800 text-slate-900 dark:text-white text-xs focus:outline-none focus:border-cyan-500"
+              />
+              <p className="text-[10px] text-slate-500 mt-1">الافتراضي 120 ثانية (دقيقتان) لمنع حجز الأجهزة لفترات طويلة</p>
+            </div>
+
+            <div>
+              <label className="block text-xs font-bold text-slate-700 dark:text-slate-300 mb-1">
+                هامش التفاوت المالي المسموح (ج.م)
+              </label>
+              <input
+                type="number"
+                min="0"
+                step="0.5"
+                value={paymentAmountTolerance}
+                onChange={(e) => setPaymentAmountTolerance(Number(e.target.value))}
+                className="w-full px-3 py-2 rounded-xl border border-slate-300 dark:border-slate-700 bg-slate-50 dark:bg-slate-800 text-slate-900 dark:text-white text-xs focus:outline-none focus:border-cyan-500"
+              />
+              <p className="text-[10px] text-slate-500 mt-1">الحد الأقصى للفرق المالي المسموح به للمطابقة الآلية دون تعليق للطلب</p>
+            </div>
+          </div>
+        </div>
       </div>
 
       {/* 4.5. Delivery Regions Management Card */}
