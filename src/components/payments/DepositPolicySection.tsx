@@ -7,6 +7,7 @@ export interface DepositPolicySettings {
   depositType?: 'fixed' | 'percentage';
   depositValue?: number;
   minDeposit?: number;
+  minimumDeposit?: number;
   sessionTimeoutSeconds: number;
   amountTolerance: number;
 }
@@ -26,7 +27,7 @@ export const DepositPolicySection: React.FC<DepositPolicySectionProps> = ({
   const [depositRequired, setDepositRequired] = useState(Boolean(settings.depositRequired));
   const [depositType, setDepositType] = useState<'fixed' | 'percentage'>(settings.depositType || 'fixed');
   const [depositValue, setDepositValue] = useState(settings.depositValue ?? 50);
-  const [minDeposit, setMinDeposit] = useState(settings.minDeposit ?? 20);
+  const [minDeposit, setMinDeposit] = useState(settings.minimumDeposit ?? settings.minDeposit ?? 20);
   const [sessionTimeoutSeconds, setSessionTimeoutSeconds] = useState(settings.sessionTimeoutSeconds || 120);
   const [amountTolerance, setAmountTolerance] = useState(settings.amountTolerance || 10);
 
@@ -49,6 +50,7 @@ export const DepositPolicySection: React.FC<DepositPolicySectionProps> = ({
           depositType,
           depositValue: Number(depositValue),
           minDeposit: Number(minDeposit),
+          minimumDeposit: Number(minDeposit),
           sessionTimeoutSeconds: Number(sessionTimeoutSeconds),
           amountTolerance: Number(amountTolerance),
         }),

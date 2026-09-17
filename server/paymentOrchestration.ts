@@ -137,7 +137,14 @@ async function verifyBridgeRequest(req: RawBodyRequest, res: Response, next: Nex
   if (error) return res.status(503).json({ error: 'Payment device service unavailable' });
   if (!device || !device.is_enabled) return res.status(401).json({ error: 'Unknown or disabled payment device' });
 
-  const rawBody = req.rawBody ?? JSON.stringify(req.body ?? {});
+  // Standard Bridge HMAC contract: For GET requests (and requests without body),
+  // rawBody is defined as "" (empty string). Body hash is sha256("").
+  const rawBody =
+    req.method === 'GET'
+      ? ''
+      : (typeof req.rawBody === 'string'
+          ? req.rawBody
+          : (req.body && Object.keys(req.body).length > 0 ? JSON.stringify(req.body) : ''));
   const calculatedBodyHash = crypto.createHash('sha256').update(rawBody, 'utf8').digest('hex');
   if (!safeCompare(calculatedBodyHash, bodyHash)) {
     return res.status(401).json({ error: 'Invalid bridge body hash' });
@@ -268,7 +275,8 @@ async function confirmOrderPayment(
   session: Record<string, any>,
   receivedAmount: number,
   provider: PaymentProvider,
-  eventId: string
+  eventId: string,
+  confirmedBy: string = 'payment-orchestration'
 ) {
   const { data: order, error: orderError } = await supabaseServer
     .from('orders')
@@ -282,16 +290,32 @@ async function confirmOrderPayment(
   const total = Number(order.total_amount || 0);
   const remaining = Math.max(0, Math.round((total - receivedAmount) * 100) / 100);
   const previousNotes = String(order.deposit_notes || '').trim();
-  const auditNote = `تأكيد آلي من Payment Orchestration / event ${eventId} / فرق ${Number(session.amount_difference || 0).toFixed(2)} ج.م`;
+  const isManual = confirmedBy !== 'payment-orchestration';
+  const auditNote = isManual
+    ? `تأكيد يدوي من لوحة الإدارة بواسطة ${confirmedBy} / event ${eventId} / فرق ${Number(session.amount_difference || 0).toFixed(2)} ج.م`
+    : `تأكيد آلي من Payment Orchestration / event ${eventId} / فرق ${Number(session.amount_difference || 0).toFixed(2)} ج.م`;
+
+  // FIX 22: Derive deposit_method generically from payment source / channel rather than hardcoded vf_cash
+  let depositMethod = provider === 'vf_cash' ? 'vodafone_cash' : provider === 'bank_alahly' ? 'bank_transfer' : String(provider);
+  if (session.payment_source_id) {
+    const { data: src } = await supabaseServer
+      .from('payment_sources')
+      .select('code,channel')
+      .eq('id', session.payment_source_id)
+      .maybeSingle();
+    if (src) {
+      depositMethod = src.code || src.channel || depositMethod;
+    }
+  }
 
   const { error } = await supabaseServer
     .from('orders')
     .update({
       deposit_status: 'confirmed',
       deposit_amount: receivedAmount,
-      deposit_method: provider === 'vf_cash' ? 'vodafone_cash' : 'bank_transfer',
+      deposit_method: depositMethod,
       deposit_confirmed_at: new Date().toISOString(),
-      deposit_confirmed_by: 'payment-orchestration',
+      deposit_confirmed_by: confirmedBy,
       deposit_notes: previousNotes ? `${previousNotes}\n${auditNote}` : auditNote,
       remaining_amount: remaining,
       updated_at: new Date().toISOString(),
@@ -304,6 +328,7 @@ async function confirmOrderPayment(
     sessionId: session.id,
     receivedAmount,
     provider,
+    confirmedBy,
   });
 }
 
@@ -376,7 +401,9 @@ paymentRouter.put(
     const depositRequired = req.body?.depositRequired !== undefined ? Boolean(req.body.depositRequired) : undefined;
     const depositType = req.body?.depositType;
     const depositValue = req.body?.depositValue !== undefined ? Number(req.body.depositValue) : undefined;
-    const minimumDeposit = req.body?.minimumDeposit !== undefined ? Number(req.body.minimumDeposit) : undefined;
+    const minimumDeposit = req.body?.minimumDeposit !== undefined
+      ? Number(req.body.minimumDeposit)
+      : (req.body?.minDeposit !== undefined ? Number(req.body.minDeposit) : undefined);
 
     if (policy && !['cod_allowed', 'deposit_required'].includes(policy)) {
       return res.status(400).json({ error: 'سياسة الدفع الافتراضية غير صالحة' });
@@ -484,6 +511,19 @@ paymentRouter.get('/admin/payments/sources', requireAuth, async (_req: Authentic
   return res.json(sources);
 });
 
+const ALLOWED_SOURCE_CHANNELS = ['wallet', 'bank_transfer', 'instapay', 'other'];
+const ALLOWED_PARSER_TYPES = ['regex', 'json', 'keyword', 'smart', 'vf_cash_v1', 'bank_alahly_v1', 'generic_sms', 'generic_notification'];
+const ALLOWED_CUSTOMER_METHOD_CHANNELS = ['cash_on_delivery', 'wallet', 'instapay', 'bank_transfer', 'card', 'other'];
+
+function isValidRegex(pattern: string): boolean {
+  try {
+    new RegExp(pattern);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 paymentRouter.post(
   '/admin/payments/sources',
   requireAuth,
@@ -492,9 +532,33 @@ paymentRouter.post(
     const code = String(req.body?.code || '').trim().toLowerCase().replace(/[^a-z0-9_]/g, '_');
     const displayName = String(req.body?.displayName || '').trim();
     const channel = String(req.body?.channel || 'wallet').trim();
+    const parserType = String(req.body?.parserType || 'regex').trim();
+    const priority = Number(req.body?.priority ?? 100);
 
     if (!code || !displayName) {
       return res.status(400).json({ error: 'كود المصدر والاسم المعروض مطلوبان' });
+    }
+
+    if (!ALLOWED_SOURCE_CHANNELS.includes(channel)) {
+      return res.status(400).json({ error: `قناة المصدر غير صالحة. القنوات المسموحة: ${ALLOWED_SOURCE_CHANNELS.join(', ')}` });
+    }
+
+    if (!ALLOWED_PARSER_TYPES.includes(parserType)) {
+      return res.status(400).json({ error: `نوع المعالج غير صالح. الأنواع المسموحة: ${ALLOWED_PARSER_TYPES.join(', ')}` });
+    }
+
+    if (!Number.isInteger(priority) || priority < 1 || priority > 10000) {
+      return res.status(400).json({ error: 'الأولوية يجب أن تكون رقماً صحيحاً بين 1 و 10000' });
+    }
+
+    if (req.body?.amountRegex && !isValidRegex(String(req.body.amountRegex))) {
+      return res.status(400).json({ error: 'التعبير النمطي لاستخراج المبلغ غير صالح' });
+    }
+    if (req.body?.payerPhoneRegex && !isValidRegex(String(req.body.payerPhoneRegex))) {
+      return res.status(400).json({ error: 'التعبير النمطي لاستخراج رقم المحول غير صالح' });
+    }
+    if (req.body?.accountIdentifierRegex && !isValidRegex(String(req.body.accountIdentifierRegex))) {
+      return res.status(400).json({ error: 'التعبير النمطي لمعرف الحساب غير صالح' });
     }
 
     const row = {
@@ -503,7 +567,7 @@ paymentRouter.post(
       channel,
       destination: req.body?.destination ? String(req.body.destination).trim() : null,
       enabled: req.body?.enabled !== false,
-      parser_type: String(req.body?.parserType || 'regex').trim(),
+      parser_type: parserType,
       source_package: req.body?.sourcePackage ? String(req.body.sourcePackage).trim() : null,
       source_sender: req.body?.sourceSender ? String(req.body.sourceSender).trim() : null,
       title_contains: req.body?.titleContains ? String(req.body.titleContains).trim() : null,
@@ -511,7 +575,7 @@ paymentRouter.post(
       amount_regex: req.body?.amountRegex ? String(req.body.amountRegex).trim() : null,
       payer_phone_regex: req.body?.payerPhoneRegex ? String(req.body.payerPhoneRegex).trim() : null,
       account_identifier_regex: req.body?.accountIdentifierRegex ? String(req.body.accountIdentifierRegex).trim() : null,
-      priority: Number(req.body?.priority ?? 100),
+      priority,
       notes: req.body?.notes ? String(req.body.notes).trim() : null,
       updated_at: new Date().toISOString(),
     };
@@ -543,17 +607,47 @@ paymentRouter.patch(
     const updates: Record<string, unknown> = { updated_at: new Date().toISOString() };
     if (req.body?.displayName !== undefined) updates.display_name = String(req.body.displayName).trim();
     if (req.body?.enabled !== undefined) updates.enabled = Boolean(req.body.enabled);
-    if (req.body?.channel !== undefined) updates.channel = String(req.body.channel).trim();
+    if (req.body?.channel !== undefined) {
+      const ch = String(req.body.channel).trim();
+      if (!ALLOWED_SOURCE_CHANNELS.includes(ch)) {
+        return res.status(400).json({ error: `قناة المصدر غير صالحة. القنوات المسموحة: ${ALLOWED_SOURCE_CHANNELS.join(', ')}` });
+      }
+      updates.channel = ch;
+    }
     if (req.body?.destination !== undefined) updates.destination = req.body.destination ? String(req.body.destination).trim() : null;
-    if (req.body?.parserType !== undefined) updates.parser_type = String(req.body.parserType).trim();
+    if (req.body?.parserType !== undefined) {
+      const pt = String(req.body.parserType).trim();
+      if (!ALLOWED_PARSER_TYPES.includes(pt)) {
+        return res.status(400).json({ error: `نوع المعالج غير صالح. الأنواع المسموحة: ${ALLOWED_PARSER_TYPES.join(', ')}` });
+      }
+      updates.parser_type = pt;
+    }
     if (req.body?.sourcePackage !== undefined) updates.source_package = req.body.sourcePackage ? String(req.body.sourcePackage).trim() : null;
     if (req.body?.sourceSender !== undefined) updates.source_sender = req.body.sourceSender ? String(req.body.sourceSender).trim() : null;
     if (req.body?.titleContains !== undefined) updates.title_contains = req.body.titleContains ? String(req.body.titleContains).trim() : null;
     if (req.body?.bodyContains !== undefined) updates.body_contains = req.body.bodyContains ? String(req.body.bodyContains).trim() : null;
-    if (req.body?.amountRegex !== undefined) updates.amount_regex = req.body.amountRegex ? String(req.body.amountRegex).trim() : null;
-    if (req.body?.payerPhoneRegex !== undefined) updates.payer_phone_regex = req.body.payerPhoneRegex ? String(req.body.payerPhoneRegex).trim() : null;
-    if (req.body?.accountIdentifierRegex !== undefined) updates.account_identifier_regex = req.body.accountIdentifierRegex ? String(req.body.accountIdentifierRegex).trim() : null;
-    if (req.body?.priority !== undefined) updates.priority = Number(req.body.priority);
+    if (req.body?.amountRegex !== undefined) {
+      const r = req.body.amountRegex ? String(req.body.amountRegex).trim() : null;
+      if (r && !isValidRegex(r)) return res.status(400).json({ error: 'التعبير النمطي لاستخراج المبلغ غير صالح' });
+      updates.amount_regex = r;
+    }
+    if (req.body?.payerPhoneRegex !== undefined) {
+      const r = req.body.payerPhoneRegex ? String(req.body.payerPhoneRegex).trim() : null;
+      if (r && !isValidRegex(r)) return res.status(400).json({ error: 'التعبير النمطي لاستخراج رقم المحول غير صالح' });
+      updates.payer_phone_regex = r;
+    }
+    if (req.body?.accountIdentifierRegex !== undefined) {
+      const r = req.body.accountIdentifierRegex ? String(req.body.accountIdentifierRegex).trim() : null;
+      if (r && !isValidRegex(r)) return res.status(400).json({ error: 'التعبير النمطي لمعرف الحساب غير صالح' });
+      updates.account_identifier_regex = r;
+    }
+    if (req.body?.priority !== undefined) {
+      const pri = Number(req.body.priority);
+      if (!Number.isInteger(pri) || pri < 1 || pri > 10000) {
+        return res.status(400).json({ error: 'الأولوية يجب أن تكون رقماً صحيحاً بين 1 و 10000' });
+      }
+      updates.priority = pri;
+    }
     if (req.body?.notes !== undefined) updates.notes = req.body.notes ? String(req.body.notes).trim() : null;
 
     const { data: existing, error: findError } = await supabaseServer
@@ -601,7 +695,7 @@ paymentRouter.delete(
 );
 
 // ------------------------------------------------------------------------------
-// Device ↔ Payment Source Assignments
+// Device ↔ Payment Source Assignments (FIX 2: Safe Upsert & Prune)
 // ------------------------------------------------------------------------------
 paymentRouter.get('/admin/payments/devices/:id/sources', requireAuth, async (req: AuthenticatedRequest, res: Response) => {
   const { data, error } = await supabaseServer
@@ -620,26 +714,61 @@ paymentRouter.put(
     const deviceId = req.params.id;
     const sourceIds: string[] = Array.isArray(req.body?.sourceIds) ? req.body.sourceIds : [];
 
-    const { data: device } = await supabaseServer.from('payment_devices').select('*').eq('id', deviceId).maybeSingle();
+    // 1. Validate that device exists
+    const { data: device, error: devError } = await supabaseServer
+      .from('payment_devices')
+      .select('*')
+      .eq('id', deviceId)
+      .maybeSingle();
+    if (devError) return res.status(503).json({ error: 'تعذر فحص الجهاز' });
     if (!device) return res.status(404).json({ error: 'الجهاز غير موجود' });
 
-    // Clear existing assignments and set new ones
-    await supabaseServer.from('payment_device_sources').delete().eq('device_id', deviceId);
-
+    // 2. Validate that all sourceIds exist in payment_sources
     if (sourceIds.length > 0) {
-      const rows = sourceIds.map((sid) => ({
+      const { data: validSources, error: srcError } = await supabaseServer
+        .from('payment_sources')
+        .select('id,code')
+        .in('id', sourceIds);
+      if (srcError) return res.status(503).json({ error: 'تعذر التحقق من مصادر الدفع' });
+      const validIdSet = new Set((validSources || []).map((s: any) => s.id));
+      const invalidIds = sourceIds.filter((id) => !validIdSet.has(id));
+      if (invalidIds.length > 0) {
+        return res.status(400).json({ error: `بعض مصادر الدفع المحددة غير موجودة: ${invalidIds.join(', ')}` });
+      }
+    }
+
+    // 3. Upsert desired assignments
+    if (sourceIds.length > 0) {
+      const upsertRows = sourceIds.map((sid) => ({
         device_id: deviceId,
         payment_source_id: sid,
         enabled: true,
       }));
-      await supabaseServer.from('payment_device_sources').insert(rows);
+      await supabaseServer
+        .from('payment_device_sources')
+        .upsert(upsertRows, { onConflict: 'device_id,payment_source_id' });
     }
 
-    // Keep legacy boolean flags in sync
-    const { data: sources } = await supabaseServer.from('payment_sources').select('id,code').in('id', sourceIds);
-    const codes = new Set((sources || []).map((s: any) => s.code));
-    const vfCashEnabled = codes.has('vf_cash');
-    const bankAlAhlyEnabled = codes.has('bank_alahly');
+    // 4. Remove ONLY assignments that are no longer in sourceIds
+    if (sourceIds.length === 0) {
+      await supabaseServer.from('payment_device_sources').delete().eq('device_id', deviceId);
+    } else {
+      await supabaseServer
+        .from('payment_device_sources')
+        .delete()
+        .eq('device_id', deviceId)
+        .not('payment_source_id', 'in', `(${sourceIds.join(',')})`);
+    }
+
+    // 5. Update legacy boolean flags on payment_devices
+    let vfCashEnabled = false;
+    let bankAlAhlyEnabled = false;
+    if (sourceIds.length > 0) {
+      const { data: sources } = await supabaseServer.from('payment_sources').select('id,code').in('id', sourceIds);
+      const codes = new Set((sources || []).map((s: any) => s.code));
+      vfCashEnabled = codes.has('vf_cash');
+      bankAlAhlyEnabled = codes.has('bank_alahly');
+    }
 
     await supabaseServer
       .from('payment_devices')
@@ -656,14 +785,17 @@ paymentRouter.put(
 );
 
 // ------------------------------------------------------------------------------
-// Customer Payment Methods Management
+// Customer Payment Methods Management (FIX 17: Validation & Channel check)
 // ------------------------------------------------------------------------------
 paymentRouter.get('/admin/payments/customer-methods', requireAuth, async (_req: AuthenticatedRequest, res: Response) => {
   const [methodsRes, methodSourcesRes] = await Promise.all([
     supabaseServer.from('customer_payment_methods').select('*').order('sort_order', { ascending: true }),
     supabaseServer.from('customer_payment_method_sources').select('customer_payment_method_id,payment_source_id,is_primary,payment_sources(*)'),
   ]);
-  if (methodsRes.error) return res.status(503).json({ error: 'تعذر تحميل طرق الدفع للعملاء' });
+  if (methodsRes.error) {
+    if (methodsRes.error.code === '42P01') return res.json([]);
+    return res.status(503).json({ error: 'تعذر تحميل طرق الدفع للعملاء' });
+  }
 
   const methods = (methodsRes.data || []).map((m: any) => {
     const assignedSources = (methodSourcesRes.data || [])
@@ -700,6 +832,24 @@ paymentRouter.post(
     const channel = String(req.body?.channel || 'other').trim();
     if (!code || !displayName) return res.status(400).json({ error: 'كود الطريقة والاسم مطلوبان' });
 
+    if (!ALLOWED_CUSTOMER_METHOD_CHANNELS.includes(channel)) {
+      return res.status(400).json({ error: `قناة طريقة الدفع غير صالحة. القنوات المسموحة: ${ALLOWED_CUSTOMER_METHOD_CHANNELS.join(', ')}` });
+    }
+
+    const sourceIds: string[] = Array.isArray(req.body?.sourceIds) ? req.body.sourceIds : [];
+    if (sourceIds.length > 0) {
+      const { data: validSources, error: srcError } = await supabaseServer
+        .from('payment_sources')
+        .select('id')
+        .in('id', sourceIds);
+      if (srcError) return res.status(503).json({ error: 'تعذر التحقق من مصادر الدفع' });
+      const validSet = new Set((validSources || []).map((s: any) => s.id));
+      const invalidIds = sourceIds.filter((id) => !validSet.has(id));
+      if (invalidIds.length > 0) {
+        return res.status(400).json({ error: `مصادر الدفع التالية غير موجودة: ${invalidIds.join(', ')}` });
+      }
+    }
+
     const row = {
       code,
       display_name: displayName,
@@ -714,7 +864,6 @@ paymentRouter.post(
     if (error?.code === '23505') return res.status(409).json({ error: 'كود طريقة الدفع مستخدم بالفعل' });
     if (error) return res.status(503).json({ error: 'تعذر إنشاء طريقة الدفع' });
 
-    const sourceIds: string[] = Array.isArray(req.body?.sourceIds) ? req.body.sourceIds : [];
     if (sourceIds.length > 0) {
       await supabaseServer.from('customer_payment_method_sources').insert(
         sourceIds.map((sid, idx) => ({
@@ -738,9 +887,28 @@ paymentRouter.patch(
     const updates: Record<string, unknown> = { updated_at: new Date().toISOString() };
     if (req.body?.displayName !== undefined) updates.display_name = String(req.body.displayName).trim();
     if (req.body?.enabled !== undefined) updates.enabled = Boolean(req.body.enabled);
-    if (req.body?.channel !== undefined) updates.channel = String(req.body.channel).trim();
+    if (req.body?.channel !== undefined) {
+      const ch = String(req.body.channel).trim();
+      if (!ALLOWED_CUSTOMER_METHOD_CHANNELS.includes(ch)) {
+        return res.status(400).json({ error: `قناة طريقة الدفع غير صالحة. القنوات المسموحة: ${ALLOWED_CUSTOMER_METHOD_CHANNELS.join(', ')}` });
+      }
+      updates.channel = ch;
+    }
     if (req.body?.instructions !== undefined) updates.instructions = req.body.instructions ? String(req.body.instructions).trim() : null;
     if (req.body?.sortOrder !== undefined) updates.sort_order = Number(req.body.sortOrder);
+
+    if (Array.isArray(req.body?.sourceIds) && req.body.sourceIds.length > 0) {
+      const { data: validSources, error: srcError } = await supabaseServer
+        .from('payment_sources')
+        .select('id')
+        .in('id', req.body.sourceIds);
+      if (srcError) return res.status(503).json({ error: 'تعذر التحقق من مصادر الدفع' });
+      const validSet = new Set((validSources || []).map((s: any) => s.id));
+      const invalidIds = req.body.sourceIds.filter((id: string) => !validSet.has(id));
+      if (invalidIds.length > 0) {
+        return res.status(400).json({ error: `مصادر الدفع التالية غير موجودة: ${invalidIds.join(', ')}` });
+      }
+    }
 
     const { data, error } = await supabaseServer
       .from('customer_payment_methods')
@@ -771,14 +939,15 @@ paymentRouter.patch(
 // Problem Orders Endpoint (طلبات تحتاج مراجعة)
 // ------------------------------------------------------------------------------
 paymentRouter.get('/admin/payments/problem-orders', requireAuth, async (_req: AuthenticatedRequest, res: Response) => {
-  // Query orders with pending deposits or linked to problematic payment reviews / sessions
+  // Query orders with pending/rejected deposits, open review items, or problematic payment sessions
   const [ordersRes, reviewsRes, sessionsRes] = await Promise.all([
     supabaseServer
       .from('orders')
       .select('id,order_number,status,deposit_status,deposit_amount,deposit_paid,total_amount,payment_mode,deposit_method,customer_name,customer_phone,created_at')
       .or('deposit_status.eq.pending,deposit_status.eq.rejected')
+      .neq('status', 'cancelled')
       .order('created_at', { ascending: false })
-      .limit(150),
+      .limit(200),
     supabaseServer
       .from('payment_review_items')
       .select('*')
@@ -787,7 +956,7 @@ paymentRouter.get('/admin/payments/problem-orders', requireAuth, async (_req: Au
     supabaseServer
       .from('payment_sessions')
       .select('*')
-      .in('status', ['needs_review', 'expired_needs_review'])
+      .in('status', ['needs_review', 'expired_needs_review', 'underpaid', 'amount_mismatch', 'late_payment'])
       .order('created_at', { ascending: false }),
   ]);
 
@@ -800,13 +969,57 @@ paymentRouter.get('/admin/payments/problem-orders', requireAuth, async (_req: Au
     if (r.session_id) reviewMapBySession.set(r.session_id, r);
   }
 
+  const sessionMapByOrder = new Map<string, any>();
+  for (const s of problematicSessions) {
+    if (s.order_id && !sessionMapByOrder.has(s.order_id)) {
+      sessionMapByOrder.set(s.order_id, s);
+    }
+  }
+
+  const ordersMap = new Map<string, any>();
+  for (const o of ordersRes.data || []) {
+    ordersMap.set(o.id, o);
+  }
+
+  // Find any order IDs mentioned in reviews or sessions that were not in ordersRes
+  const extraOrderIds = new Set<string>();
+  for (const r of openReviews) {
+    if (r.order_id && !ordersMap.has(r.order_id)) extraOrderIds.add(r.order_id);
+  }
+  for (const s of problematicSessions) {
+    if (s.order_id && !ordersMap.has(s.order_id)) extraOrderIds.add(s.order_id);
+  }
+
+  if (extraOrderIds.size > 0) {
+    const { data: extraOrders } = await supabaseServer
+      .from('orders')
+      .select('id,order_number,status,deposit_status,deposit_amount,deposit_paid,total_amount,payment_mode,deposit_method,customer_name,customer_phone,created_at')
+      .in('id', Array.from(extraOrderIds))
+      .neq('status', 'cancelled');
+    for (const o of extraOrders || []) {
+      ordersMap.set(o.id, o);
+    }
+  }
+
   // Combine and deduplicate problematic orders
   const problemMap = new Map<string, any>();
 
-  // 1. Orders with deposit status pending or rejected
-  for (const ord of ordersRes.data || []) {
-    const linkedReview = reviewMapByOrder.get(ord.id);
-    problemMap.set(ord.id, {
+  for (const [orderId, ord] of ordersMap.entries()) {
+    const linkedReview = reviewMapByOrder.get(orderId);
+    const linkedSession = sessionMapByOrder.get(orderId);
+
+    let problemReason = 'بانتظار مراجعة الدفع';
+    if (linkedReview) {
+      problemReason = linkedReview.reason;
+    } else if (linkedSession) {
+      problemReason = `جلسة دفع: ${linkedSession.status}`;
+    } else if (ord.deposit_status === 'rejected') {
+      problemReason = 'عربون مرفوض';
+    } else if (ord.deposit_status === 'pending') {
+      problemReason = 'بانتظار تأكيد العربون';
+    }
+
+    problemMap.set(orderId, {
       id: ord.id,
       orderNumber: ord.order_number || ord.id,
       customerName: ord.customer_name || 'عميل غير مسجل',
@@ -819,13 +1032,16 @@ paymentRouter.get('/admin/payments/problem-orders', requireAuth, async (_req: Au
       depositStatus: ord.deposit_status,
       paymentMode: ord.payment_mode || 'deposit_online',
       paymentMethod: ord.deposit_method || 'electronic',
-      problemReason: linkedReview ? linkedReview.reason : (ord.deposit_status === 'pending' ? 'بانتظار تأكيد العربون' : 'عربون مرفوض'),
+      problemReason,
       reviewId: linkedReview?.id || null,
+      reviewStatus: linkedReview?.status || null,
+      sessionId: linkedSession?.id || linkedReview?.session_id || null,
+      sessionStatus: linkedSession?.status || null,
       createdAt: ord.created_at,
     });
   }
 
-  // 2. Open reviews with an orderId not already included
+  // Also include any reviews without orders (e.g. unassigned bridge events)
   for (const r of openReviews) {
     if (r.order_id && !problemMap.has(r.order_id)) {
       problemMap.set(r.order_id, {
@@ -843,7 +1059,9 @@ paymentRouter.get('/admin/payments/problem-orders', requireAuth, async (_req: Au
         paymentMethod: 'electronic',
         problemReason: r.reason,
         reviewId: r.id,
+        reviewStatus: r.status,
         sessionId: r.session_id || null,
+        sessionStatus: null,
         createdAt: r.created_at,
       });
     }
@@ -1132,7 +1350,8 @@ paymentRouter.post(
           .eq('id', session.id).select('*').single();
         if (paidError) return res.status(503).json({ error: 'تعذر تأكيد الجلسة' });
         await releaseDeviceForSession(String(session.id));
-        await confirmOrderPayment({ ...paid, amount_difference: difference }, received, provider, eventPublicId);
+        const adminActor = req.admin?.email || req.admin?.id || 'admin';
+        await confirmOrderPayment({ ...paid, amount_difference: difference }, received, provider, eventPublicId, adminActor);
         broadcastSessionEvent(String(session.id), 'payment_confirmed', mapSession(paid));
       }
     } else if (action === 'cancel_session' && review.session_id) {
@@ -1169,32 +1388,154 @@ paymentRouter.post(
 
 // ==============================================================================
 // Customer-store integration API (server-to-server create/cancel)
+// FIX 3, FIX 4, FIX 10, FIX 18: Deterministic source selection with device health
 // ==============================================================================
+async function findEligibleSourceForMethod(
+  customerPaymentMethodId?: string | null,
+  paymentMethodCode?: string | null,
+  paymentSourceId?: string | null,
+  fallbackProvider?: string | null
+): Promise<{ source: any; provider: PaymentProvider; customerPaymentMethodId: string | null } | null> {
+  // Query active, non-busy devices:
+  // - online = true, is_enabled = true
+  // - internet_connected = true, app_running = true, notification_listener_enabled = true
+  // - is_busy = false
+  // - last_heartbeat_at >= NOW() - 45 seconds
+  const cutoff = new Date(Date.now() - 45_000).toISOString();
+  const { data: activeDevices } = await supabaseServer
+    .from('payment_devices')
+    .select('id,device_id,vf_cash_enabled,bank_alahly_enabled')
+    .eq('is_enabled', true)
+    .eq('online', true)
+    .eq('internet_connected', true)
+    .eq('app_running', true)
+    .eq('notification_listener_enabled', true)
+    .eq('is_busy', false)
+    .gte('last_heartbeat_at', cutoff);
+
+  const activeDeviceList = activeDevices || [];
+  const activeDeviceIds = activeDeviceList.map((d: any) => d.id);
+
+  if (activeDeviceIds.length === 0) {
+    return null;
+  }
+
+  // Get device source mappings for active devices
+  let activeAssignedSourceIds = new Set<string>();
+  if (activeDeviceIds.length > 0) {
+    const { data: devSources } = await supabaseServer
+      .from('payment_device_sources')
+      .select('payment_source_id,device_id')
+      .eq('enabled', true)
+      .in('device_id', activeDeviceIds);
+
+    if (devSources && devSources.length > 0) {
+      activeAssignedSourceIds = new Set(devSources.map((ds: any) => ds.payment_source_id));
+    }
+  }
+
+  // 1. If explicit paymentSourceId provided
+  if (paymentSourceId) {
+    const { data: src } = await supabaseServer.from('payment_sources').select('*').eq('id', paymentSourceId).maybeSingle();
+    if (src && src.enabled) {
+      const isAssigned = activeAssignedSourceIds.has(src.id) || activeDeviceList.some((d: any) =>
+        (src.code === 'vf_cash' && d.vf_cash_enabled) || (src.code === 'bank_alahly' && d.bank_alahly_enabled)
+      );
+      if (isAssigned) {
+        return { source: src, provider: normalizeProvider(src.code) || src.code, customerPaymentMethodId: customerPaymentMethodId || null };
+      }
+    }
+  }
+
+  // 2. Resolve via customer_payment_methods
+  let method: any = null;
+  if (customerPaymentMethodId) {
+    const { data } = await supabaseServer.from('customer_payment_methods').select('*').eq('id', customerPaymentMethodId).maybeSingle();
+    method = data;
+  } else if (paymentMethodCode) {
+    const { data } = await supabaseServer.from('customer_payment_methods').select('*').eq('code', paymentMethodCode).maybeSingle();
+    method = data;
+  }
+
+  if (method) {
+    const { data: mappedSources } = await supabaseServer
+      .from('customer_payment_method_sources')
+      .select('payment_source_id,is_primary,payment_sources(*)')
+      .eq('customer_payment_method_id', method.id);
+
+    if (mappedSources && mappedSources.length > 0) {
+      // Sort by: is_primary DESC, source.priority DESC
+      const candidates = mappedSources
+        .map((ms: any) => ({
+          isPrimary: Boolean(ms.is_primary),
+          source: ms.payment_sources,
+        }))
+        .filter((item: any) => item.source && item.source.enabled)
+        .sort((a: any, b: any) => {
+          if (a.isPrimary !== b.isPrimary) return a.isPrimary ? -1 : 1;
+          return Number(b.source.priority || 0) - Number(a.source.priority || 0);
+        });
+
+      for (const item of candidates) {
+        const src = item.source;
+        const isDirectlyAssigned = activeAssignedSourceIds.has(src.id);
+        const isLegacyAssigned = activeDeviceList.some((d: any) =>
+          (src.code === 'vf_cash' && d.vf_cash_enabled) ||
+          (src.code === 'bank_alahly' && d.bank_alahly_enabled)
+        );
+
+        if (isDirectlyAssigned || isLegacyAssigned) {
+          return {
+            source: src,
+            provider: normalizeProvider(src.code) || src.code,
+            customerPaymentMethodId: method.id,
+          };
+        }
+      }
+    }
+  }
+
+  // 3. Fallback: provider code resolution
+  const prov = normalizeProvider(paymentMethodCode || fallbackProvider);
+  if (prov) {
+    const { data: src } = await supabaseServer.from('payment_sources').select('*').eq('code', prov).eq('enabled', true).maybeSingle();
+    if (src) {
+      const isDirectlyAssigned = activeAssignedSourceIds.has(src.id);
+      const isLegacyAssigned = activeDeviceList.some((d: any) =>
+        (src.code === 'vf_cash' && d.vf_cash_enabled) ||
+        (src.code === 'bank_alahly' && d.bank_alahly_enabled)
+      );
+      if (isDirectlyAssigned || isLegacyAssigned) {
+        return { source: src, provider: prov, customerPaymentMethodId: method?.id || null };
+      }
+    } else {
+      const isLegacyAssigned = activeDeviceList.some((d: any) =>
+        (prov === 'vf_cash' && d.vf_cash_enabled) ||
+        (prov === 'bank_alahly' && d.bank_alahly_enabled)
+      );
+      if (isLegacyAssigned) {
+        return { source: null, provider: prov, customerPaymentMethodId: method?.id || null };
+      }
+    }
+  }
+
+  return null;
+}
+
 paymentRouter.post('/payments/sessions', requireIntegrationKey, async (req: Request, res: Response) => {
   await expireSessions();
 
   const orderId = String(req.body?.orderId || '').trim();
+  const customerPaymentMethodId = req.body?.customerPaymentMethodId ? String(req.body.customerPaymentMethodId).trim() : null;
+  const paymentMethodCode = req.body?.paymentMethodCode ? String(req.body.paymentMethodCode).trim() : null;
   const sourceId = req.body?.paymentSourceId ? String(req.body.paymentSourceId).trim() : null;
   const rawProvider = String(req.body?.provider || '').trim();
-  let provider = normalizeProvider(rawProvider);
-
-  // Resolve dynamic payment source
-  let resolvedSource: any = null;
-  if (sourceId) {
-    const { data: src } = await supabaseServer.from('payment_sources').select('*').eq('id', sourceId).maybeSingle();
-    resolvedSource = src;
-    if (src) provider = src.code;
-  } else if (provider) {
-    const { data: src } = await supabaseServer.from('payment_sources').select('*').eq('code', provider).maybeSingle();
-    resolvedSource = src;
-  }
 
   const expectedAmount = Number(req.body?.expectedAmount);
   const customerId = req.body?.customerId ? String(req.body.customerId) : null;
   const customerPhone = normalizePhone(req.body?.customerPhone);
 
   if (!orderId) return res.status(400).json({ error: 'orderId is required' });
-  if (!provider) return res.status(400).json({ error: 'Unsupported payment provider' });
   if (!Number.isFinite(expectedAmount) || expectedAmount <= 0) {
     return res.status(400).json({ error: 'expectedAmount must be a positive number' });
   }
@@ -1208,6 +1549,18 @@ paymentRouter.post('/payments/sessions', requireIntegrationKey, async (req: Requ
   if (!order) return res.status(404).json({ error: 'Order not found' });
   if (order.status === 'cancelled') return res.status(409).json({ error: 'Cancelled order cannot start payment' });
 
+  // Resolve eligible payment source and online non-busy device (FIX 3, FIX 4, FIX 10, FIX 18)
+  const resolved = await findEligibleSourceForMethod(customerPaymentMethodId, paymentMethodCode, sourceId, rawProvider);
+  if (!resolved) {
+    return res.status(503).json({
+      error: 'no_payment_device_available',
+      message: 'لا يوجد جهاز دفع أو محفظة متاحين لاستقبال الدفع حالياً. يرجى المحاولة بعد قليل أو اختيار وسيلة دفع أخرى.',
+    });
+  }
+
+  const { source: resolvedSource, provider, customerPaymentMethodId: resolvedMethodId } = resolved;
+
+  // Check for an existing waiting session for this order and provider
   const { data: existing } = await supabaseServer
     .from('payment_sessions')
     .select('*')
@@ -1245,6 +1598,7 @@ paymentRouter.post('/payments/sessions', requireIntegrationKey, async (req: Requ
       customer_phone: customerPhone || normalizePhone(order.customer_phone),
       provider,
       payment_source_id: resolvedSource?.id || null,
+      customer_payment_method_id: resolvedMethodId || null,
       expected_amount: Math.round(expectedAmount * 100) / 100,
       amount_tolerance: tolerance,
       status: 'waiting',
@@ -1265,7 +1619,7 @@ paymentRouter.post('/payments/sessions', requireIntegrationKey, async (req: Requ
     await supabaseServer.from('payment_sessions').delete().eq('id', sessionId);
     return res.status(503).json({
       error: 'no_payment_device_available',
-      message: 'لا يوجد جهاز دفع متاح ومستوفي شروط الاتصال حالياً',
+      message: 'لا يوجد جهاز دفع أو محفظة متاحين لاستقبال الدفع حالياً. يرجى المحاولة بعد قليل أو اختيار وسيلة دفع أخرى.',
     });
   }
 
@@ -1273,7 +1627,12 @@ paymentRouter.post('/payments/sessions', requireIntegrationKey, async (req: Requ
     .from('payment_sessions').select('*').eq('id', sessionId).single();
   if (reloadError) return res.status(503).json({ error: 'Payment session reservation failed' });
 
-  const result = { ...mapSession(complete), clientToken, timeoutSeconds };
+  const result = {
+    ...mapSession(complete),
+    clientToken,
+    timeoutSeconds,
+    instructions: resolvedSource?.destination ? `يرجى التحويل إلى: ${resolvedSource.destination}` : undefined,
+  };
   broadcastRealtimeEvent('payment_session_created', mapSession(complete));
   return res.status(201).json(result);
 });
@@ -1513,6 +1872,7 @@ paymentRouter.post('/payment-bridge/events', verifyBridgeRequest, async (req: Ra
     currency: String(req.body?.currency || 'EGP'),
     payer_phone: payerPhone,
     wallet_phone: normalizePhone(req.body?.walletPhone),
+    account_identifier: req.body?.accountIdentifier ? String(req.body.accountIdentifier).trim() : (req.body?.account_identifier ? String(req.body.account_identifier).trim() : null),
     transaction_reference: req.body?.transactionReference ? String(req.body.transactionReference) : null,
     account_last4: req.body?.accountLast4 ? String(req.body.accountLast4) : null,
     source_sender: req.body?.sourceSender ? String(req.body.sourceSender) : null,
@@ -1539,56 +1899,53 @@ paymentRouter.post('/payment-bridge/events', verifyBridgeRequest, async (req: Ra
     .update({ last_event_at: new Date().toISOString(), updated_at: new Date().toISOString() })
     .eq('id', device.id);
 
-  // Authoritative active reservation check
+  // FIX 7 & FIX 8: Robust candidate selection with timing window and scoring
   let candidates: Record<string, any>[] = [];
-  let activeMatches = false;
+  const lowerBound = new Date(capturedAt.getTime() - LATE_MATCH_WINDOW_MS).toISOString();
+  const upperBound = new Date(capturedAt.getTime() + 15_000).toISOString();
 
-  if (device.busy_session_id) {
-    const { data: activeSession } = await supabaseServer
+  const { data: recentSessions, error: sessionErr } = await supabaseServer
+    .from('payment_sessions')
+    .select('*')
+    .eq('device_id', device.id)
+    .in('status', ['waiting', 'expired', 'expired_needs_review', 'needs_review'])
+    .lte('created_at', upperBound)
+    .gte('expires_at', lowerBound)
+    .order('created_at', { ascending: false })
+    .limit(10);
+
+  if (sessionErr) return res.status(503).json({ error: 'Payment matching service unavailable' });
+
+  candidates = (recentSessions || []).filter((session: any) => {
+    const providerMatches =
+      normalizeProvider(session.provider) === provider ||
+      (resolvedSource && session.payment_source_id === resolvedSource.id);
+    if (!providerMatches) return false;
+    const created = new Date(session.created_at).getTime();
+    const expires = new Date(session.expires_at).getTime();
+    // FIX 7: Ensure capturedAt was not before creation (with 15s leeway) and within late window
+    return capturedAtMs >= created - 15_000 && capturedAtMs <= expires + LATE_MATCH_WINDOW_MS;
+  });
+
+  // If busy_session_id is known on the device and not already in candidates, check it as well
+  if (device.busy_session_id && !candidates.some((c) => c.id === device.busy_session_id)) {
+    const { data: busySession } = await supabaseServer
       .from('payment_sessions')
       .select('*')
       .eq('id', device.busy_session_id)
       .in('status', ['waiting', 'expired', 'expired_needs_review', 'needs_review'])
       .maybeSingle();
 
-    if (activeSession) {
-      const created = new Date(activeSession.created_at).getTime();
-      const expires = new Date(activeSession.expires_at).getTime();
+    if (busySession) {
+      const created = new Date(busySession.created_at).getTime();
+      const expires = new Date(busySession.expires_at).getTime();
       const providerMatches =
-        normalizeProvider(activeSession.provider) === provider ||
-        (resolvedSource && activeSession.payment_source_id === resolvedSource.id);
-
+        normalizeProvider(busySession.provider) === provider ||
+        (resolvedSource && busySession.payment_source_id === resolvedSource.id);
       if (providerMatches && capturedAtMs >= created - 15_000 && capturedAtMs <= expires + LATE_MATCH_WINDOW_MS) {
-        candidates = [activeSession];
-        activeMatches = true;
+        candidates.push(busySession);
       }
     }
-  }
-
-  // Fallback: search recent historical sessions for this device
-  if (!activeMatches) {
-    const lowerBound = new Date(capturedAt.getTime() - LATE_MATCH_WINDOW_MS).toISOString();
-    const { data, error } = await supabaseServer
-      .from('payment_sessions')
-      .select('*')
-      .eq('device_id', device.id)
-      .in('status', ['waiting', 'expired', 'expired_needs_review', 'needs_review'])
-      .lte('created_at', new Date(capturedAt.getTime() + 15_000).toISOString())
-      .gte('expires_at', lowerBound)
-      .order('created_at', { ascending: false })
-      .limit(10);
-
-    if (error) return res.status(503).json({ error: 'Payment matching service unavailable' });
-
-    candidates = (data || []).filter((session: any) => {
-      const providerMatches =
-        normalizeProvider(session.provider) === provider ||
-        (resolvedSource && session.payment_source_id === resolvedSource.id);
-      if (!providerMatches) return false;
-      const created = new Date(session.created_at).getTime();
-      const expires = new Date(session.expires_at).getTime();
-      return capturedAtMs >= created - 15_000 && capturedAtMs <= expires + LATE_MATCH_WINDOW_MS;
-    });
   }
 
   if (candidates.length === 0) {
@@ -1605,10 +1962,9 @@ paymentRouter.post('/payment-bridge/events', verifyBridgeRequest, async (req: Ra
     return res.json({ status: 'accepted', eventId, matchStatus: 'NO_MATCH', message: 'Queued for review', serverTimestamp: Date.now() });
   }
 
-  // If the reserved session is known, it wins. Otherwise evaluate approximate
-  // amount + time + optional VF-Cash payer phone without transaction reference.
+  // FIX 8: Run candidate scoring whenever candidates.length > 1 regardless of busy_session_id
   let chosen = candidates[0];
-  if (!device.busy_session_id && candidates.length > 1) {
+  if (candidates.length > 1) {
     const plausible = candidates
       .map((session) => {
         const expected = Number(session.expected_amount);
@@ -1616,10 +1972,11 @@ paymentRouter.post('/payment-bridge/events', verifyBridgeRequest, async (req: Ra
         const diff = receivedAmount - expected;
         const absDiff = Math.abs(diff);
         const phone = normalizePhone(session.customer_phone);
-        const phoneBoost = provider === 'vf_cash' && payerPhone && phone && payerPhone === phone ? 10_000 : 0;
+        const phoneBoost = payerPhone && phone && payerPhone === phone ? 10_000 : 0;
+        const busyBoost = session.id === device.busy_session_id ? 1_500 : 0;
         const timeDistance = Math.abs(capturedAtMs - new Date(session.created_at).getTime());
         const amountScore = absDiff <= tolerance || diff < 0 ? Math.max(0, 5_000 - absDiff * 100) : 0;
-        return { session, score: phoneBoost + amountScore - timeDistance / 1000, absDiff, tolerance };
+        return { session, score: phoneBoost + busyBoost + amountScore - timeDistance / 1000, absDiff, tolerance };
       })
       .sort((a, b) => b.score - a.score);
 

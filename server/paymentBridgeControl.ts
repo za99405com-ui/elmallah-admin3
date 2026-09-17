@@ -50,10 +50,14 @@ export async function verifyPaymentBridge(req: RawBridgeRequest, res: Response, 
   if (error) return res.status(503).json({ error: 'Payment device service unavailable' });
   if (!device || !device.is_enabled) return res.status(401).json({ error: 'Unknown or disabled payment device' });
 
+  // Standard Bridge HMAC contract: For GET requests (and requests without body),
+  // rawBody is defined as "" (empty string). Body hash is sha256("").
   const rawBody =
     req.method === 'GET'
-      ? (req.rawBody ?? '')
-      : (req.rawBody ?? (req.body && Object.keys(req.body).length > 0 ? JSON.stringify(req.body) : ''));
+      ? ''
+      : (typeof req.rawBody === 'string'
+          ? req.rawBody
+          : (req.body && Object.keys(req.body).length > 0 ? JSON.stringify(req.body) : ''));
   const expectedHash = crypto.createHash('sha256').update(rawBody, 'utf8').digest('hex');
   if (!safeCompare(expectedHash, bodyHash)) return res.status(401).json({ error: 'Invalid bridge body hash' });
 
@@ -82,12 +86,14 @@ export async function fetchDeviceRules(deviceRowId: string, device: any) {
     .eq('enabled', true);
 
   let sources: any[] = [];
-  if (!error && assignments && assignments.length > 0) {
+  if (!error && assignments) {
+    // If the table exists and returned results (including empty array []),
+    // return only the sources assigned and enabled for this device.
     sources = assignments
       .map((a: any) => a.payment_source)
       .filter((s: any) => s && s.enabled);
-  } else {
-    // Legacy fallback based on boolean flags on device
+  } else if (error) {
+    // Graceful fallback ONLY if table does not exist or errored (legacy database state before migration)
     const codes: string[] = [];
     if (device.vf_cash_enabled) codes.push('vf_cash');
     if (device.bank_alahly_enabled) codes.push('bank_alahly');

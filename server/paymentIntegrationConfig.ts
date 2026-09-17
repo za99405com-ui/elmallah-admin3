@@ -142,43 +142,81 @@ paymentIntegrationConfigRouter.get('/payments/config', requireIntegrationKey, as
     if (d.bank_alahly_enabled) eligibleSourceIds.add('bank_alahly_legacy');
   }
 
-  // Build customer payment methods
-  const methods = (methodsRes.data || []).map((method: any) => {
-    const mappedSources = (methodSourcesRes.data || [])
-      .filter((ms: any) => ms.customer_payment_method_id === method.id)
-      .map((ms: any) => ms.payment_sources)
-      .filter(Boolean);
+  const rawMethods = methodsRes.data || [];
+  let methods: any[] = [];
 
-    let isAvailable = false;
-    if (method.channel === 'cash_on_delivery') {
-      isAvailable = Boolean(method.enabled);
-    } else {
-      // Available if at least one mapped source has an eligible device or legacy provider matches
-      isAvailable = mappedSources.some((src: any) => {
-        if (!src.enabled) return false;
-        if (eligibleSourceIds.has(src.id)) return true;
-        if (src.code === 'vf_cash' && eligibleSourceIds.has('vf_cash_legacy')) return true;
-        if (src.code === 'bank_alahly' && eligibleSourceIds.has('bank_alahly_legacy')) return true;
-        return false;
-      });
-      // Fallback: if no mapped sources yet, check by method code
-      if (!isAvailable && mappedSources.length === 0) {
-        if (method.code === 'vodafone_cash' && eligibleDevices.some((d: any) => d.vf_cash_enabled)) isAvailable = true;
-        if (method.code === 'bank_transfer' && eligibleDevices.some((d: any) => d.bank_alahly_enabled)) isAvailable = true;
+  if (rawMethods.length > 0) {
+    // Build customer payment methods from V3 tables
+    methods = rawMethods.map((method: any) => {
+      const mappedSources = (methodSourcesRes.data || [])
+        .filter((ms: any) => ms.customer_payment_method_id === method.id)
+        .map((ms: any) => ms.payment_sources)
+        .filter(Boolean);
+
+      let isAvailable = false;
+      if (method.channel === 'cash_on_delivery') {
+        isAvailable = Boolean(method.enabled);
+      } else {
+        // Available if at least one mapped source has an eligible device or legacy provider matches
+        isAvailable = mappedSources.some((src: any) => {
+          if (!src.enabled) return false;
+          if (eligibleSourceIds.has(src.id)) return true;
+          if (src.code === 'vf_cash' && eligibleSourceIds.has('vf_cash_legacy')) return true;
+          if (src.code === 'bank_alahly' && eligibleSourceIds.has('bank_alahly_legacy')) return true;
+          return false;
+        });
+        // Fallback: if no mapped sources yet, check by method code
+        if (!isAvailable && mappedSources.length === 0) {
+          if (method.code === 'vodafone_cash' && eligibleDevices.some((d: any) => d.vf_cash_enabled)) isAvailable = true;
+          if (method.code === 'bank_transfer' && eligibleDevices.some((d: any) => d.bank_alahly_enabled)) isAvailable = true;
+        }
       }
-    }
 
-    return {
-      id: method.id,
-      code: method.code,
-      name: method.display_name,
-      enabled: Boolean(method.enabled),
-      available: Boolean(method.enabled && isAvailable),
-      channel: method.channel,
-      instructions: method.instructions || undefined,
-      sortOrder: Number(method.sort_order || 0),
-    };
-  });
+      return {
+        id: method.id,
+        code: method.code,
+        name: method.display_name,
+        enabled: Boolean(method.enabled),
+        available: Boolean(method.enabled && isAvailable),
+        channel: method.channel,
+        instructions: method.instructions || undefined,
+        sortOrder: Number(method.sort_order || 0),
+      };
+    });
+  } else {
+    // FIX 27: Graceful fallback when V3 tables do not exist yet (or are empty)
+    const vfAvailable = eligibleDevices.some((d: any) => Boolean(d.vf_cash_enabled));
+    const ahlyAvailable = eligibleDevices.some((d: any) => Boolean(d.bank_alahly_enabled));
+    methods = [
+      {
+        id: 'legacy-cod',
+        code: 'cash_on_delivery',
+        name: 'الدفع عند الاستلام',
+        enabled: settings.default_payment_policy !== 'deposit_required',
+        available: settings.default_payment_policy !== 'deposit_required',
+        channel: 'cash_on_delivery',
+        sortOrder: 1,
+      },
+      {
+        id: 'legacy-vf-cash',
+        code: 'vodafone_cash',
+        name: 'فودافون كاش',
+        enabled: true,
+        available: vfAvailable,
+        channel: 'wallet',
+        sortOrder: 2,
+      },
+      {
+        id: 'legacy-bank-transfer',
+        code: 'bank_transfer',
+        name: 'تحويل بنك مصر / الأهلي',
+        enabled: true,
+        available: ahlyAvailable,
+        channel: 'bank_transfer',
+        sortOrder: 3,
+      },
+    ];
+  }
 
   const isDepositRequired = Boolean(settings.deposit_required || settings.default_payment_policy === 'deposit_required');
 
@@ -265,9 +303,14 @@ paymentIntegrationConfigRouter.post('/payments/calculate-deposit', requireIntegr
     });
   }
 
+  // FIX 15: Validate deposit calculation parameters
   const depositType = settings?.deposit_type === 'percentage' ? 'percentage' : 'fixed';
-  const depositValue = Number(settings?.deposit_value || 100);
-  const minimumDeposit = Number(settings?.minimum_deposit || 50);
+  let depositValue = Number(settings?.deposit_value ?? 100);
+  if (!Number.isFinite(depositValue) || depositValue < 0) depositValue = 0;
+  if (depositType === 'percentage' && depositValue > 100) depositValue = 100;
+
+  let minimumDeposit = Number(settings?.minimum_deposit ?? 50);
+  if (!Number.isFinite(minimumDeposit) || minimumDeposit < 0) minimumDeposit = 0;
 
   let depositAmount = 0;
   if (depositType === 'percentage') {

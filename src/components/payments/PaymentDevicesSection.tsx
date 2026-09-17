@@ -34,7 +34,9 @@ export interface PaymentDevice {
   lastEventAt?: string;
   appVersion?: string;
   activeRulesCount?: number;
-  assignedSources?: string[]; // source IDs
+  sources?: PaymentSource[];
+  assignedSourceIds?: string[];
+  assignedSources?: string[]; // fallback alias
 }
 
 interface PaymentDevicesSectionProps {
@@ -67,7 +69,7 @@ export const PaymentDevicesSection: React.FC<PaymentDevicesSectionProps> = ({
 
   const handleOpenSourceAssignment = (device: PaymentDevice) => {
     setManagingSourcesDeviceId(device.id);
-    setSelectedSourceIds(device.assignedSources || []);
+    setSelectedSourceIds(device.assignedSourceIds || device.assignedSources || []);
     setError(null);
   };
 
@@ -426,7 +428,10 @@ export const PaymentDevicesSection: React.FC<PaymentDevicesSectionProps> = ({
       <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-4">
         {devices.map((device) => {
           const isOnline = device.online;
-          const assignedSourceObjects = sources.filter((s) => (device.assignedSources || []).includes(s.id));
+          const assignedIds = device.assignedSourceIds || device.assignedSources || [];
+          const assignedSourceObjects = device.sources && device.sources.length > 0
+            ? device.sources
+            : sources.filter((s) => assignedIds.includes(s.id));
 
           return (
             <div

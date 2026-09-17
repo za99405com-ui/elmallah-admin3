@@ -438,6 +438,31 @@ export interface PaymentDeviceItem {
   appVersion?: string;
   sources?: PaymentSource[];
   assignedSourceIds?: string[];
+  assignedSources?: string[];
+}
+
+export interface PaymentBridgeEventItem {
+  id: string;
+  eventId: string;
+  deviceId: string;
+  reportedDeviceId: string;
+  provider: string;
+  paymentSourceId?: string | null;
+  paymentChannel?: string | null;
+  amountMinor: number;
+  currency: string;
+  payerPhone?: string | null;
+  walletPhone?: string | null;
+  transactionReference?: string | null;
+  accountLast4?: string | null;
+  accountIdentifier?: string | null;
+  sourceSender?: string | null;
+  sourcePackage?: string | null;
+  notificationPostedAt?: string | null;
+  capturedAt: string;
+  matchStatus: string;
+  matchedSessionId?: string | null;
+  createdAt: string;
 }
 
 export interface PaymentSessionItem {

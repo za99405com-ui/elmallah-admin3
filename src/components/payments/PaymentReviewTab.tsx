@@ -60,7 +60,8 @@ interface OverviewResponse {
   sessions: PaymentSession[];
   settings: DepositPolicySettings;
   sources?: PaymentSource[];
-  methods?: CustomerPaymentMethod[];
+  customerMethods?: CustomerPaymentMethod[];
+  methods?: CustomerPaymentMethod[]; // legacy fallback
   problemOrders?: ProblemOrder[];
 }
 
@@ -116,18 +117,18 @@ export const PaymentReviewTab: React.FC<PaymentReviewTabProps> = ({ initialTab =
   const loadAllData = useCallback(async () => {
     try {
       setError(null);
-      const [overviewData, sourcesData, methodsData, problemOrdersData] = await Promise.all([
-        adminRequest<OverviewResponse>('/api/admin/payments/overview'),
-        adminRequest<PaymentSource[]>('/api/admin/payments/sources').catch(() => []),
-        adminRequest<CustomerPaymentMethod[]>('/api/admin/payments/customer-methods').catch(() => []),
-        adminRequest<ProblemOrder[]>('/api/admin/payments/problem-orders').catch(() => []),
-      ]);
-
+      const overviewData = await adminRequest<OverviewResponse>('/api/admin/payments/overview');
       setOverview(overviewData);
-      setSources(sourcesData.length > 0 ? sourcesData : overviewData.sources || []);
-      setCustomerMethods(methodsData.length > 0 ? methodsData : overviewData.methods || []);
-      setProblemOrders(problemOrdersData.length > 0 ? problemOrdersData : overviewData.problemOrders || []);
+
+      const resolvedSources = overviewData.sources ?? [];
+      const resolvedMethods = overviewData.customerMethods ?? overviewData.methods ?? [];
+      const resolvedProblemOrders = overviewData.problemOrders ?? [];
+
+      setSources(resolvedSources);
+      setCustomerMethods(resolvedMethods);
+      setProblemOrders(resolvedProblemOrders);
     } catch (err) {
+      console.error('[PaymentReviewTab] Load failed:', err);
       setError(err instanceof Error ? err.message : 'تعذر تحميل بيانات منظومة الدفع');
     } finally {
       setLoading(false);

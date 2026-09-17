@@ -4,6 +4,7 @@ import { ActiveTab } from '../../types';
 import {
   LayoutDashboard,
   ShoppingBag,
+  CreditCard,
   Banknote,
   PackageCheck,
   Users,
@@ -55,9 +56,9 @@ export const Sidebar: React.FC = () => {
       badgeVariant: 'warning',
     },
     {
-      id: 'deposits',
-      label: 'العربونات والمدفوعات',
-      icon: <Banknote className="w-5 h-5" />,
+      id: 'payments',
+      label: 'المدفوعات والمراجعة',
+      icon: <CreditCard className="w-5 h-5" />,
       badge: pendingDepositsCount > 0 ? pendingDepositsCount : undefined,
       badgeVariant: 'danger',
     },

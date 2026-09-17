@@ -216,18 +216,20 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
     setActiveTabState(tab);
     if (typeof window !== 'undefined') {
       const targetPath = tab === 'payments' ? '/payments-review' : '/';
-      if (window.location.pathname !== targetPath) {
+      if (window.location.pathname !== targetPath || window.history.state?.tab !== tab) {
         window.history.pushState({ tab }, '', targetPath);
       }
     }
   }, []);
 
   useEffect(() => {
-    const handlePopState = () => {
+    const handlePopState = (event: PopStateEvent) => {
       if (typeof window !== 'undefined') {
         const path = window.location.pathname;
         if (path.startsWith('/payments-review') || path.startsWith('/payments')) {
           setActiveTabState('payments');
+        } else if (event.state && event.state.tab) {
+          setActiveTabState(event.state.tab);
         } else {
           setActiveTabState('overview');
         }
