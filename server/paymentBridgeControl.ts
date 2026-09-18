@@ -191,9 +191,14 @@ paymentBridgeControlRouter.post('/payment-bridge/source-config', verifyPaymentBr
     }
   }
 
+  const existingPackages = Array.isArray(source.source_packages)
+    ? source.source_packages.map((value: unknown) => String(value).trim()).filter(Boolean)
+    : (source.source_package ? [String(source.source_package).trim()] : []);
+  const mergedPackages = Array.from(new Set([...existingPackages, ...packageNames])).slice(0, 20);
+
   const updates: Record<string, unknown> = {
-    source_package: packageNames[0],
-    source_packages: packageNames,
+    source_package: mergedPackages[0] || packageNames[0],
+    source_packages: mergedPackages,
     source_sender: optionalText(req.body?.sourceSender, 250),
     title_contains: optionalText(req.body?.titleContains, 500),
     body_contains: optionalText(req.body?.bodyContains, 500),
