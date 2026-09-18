@@ -199,7 +199,7 @@ BEGIN
          WHERE bank_alahly_enabled = true
         ON CONFLICT (device_id, payment_source_id) DO NOTHING;
     END IF;
-END $;
+END $$;
 
 -- Seeded legacy assignments are created after the first compatibility backfill,
 -- so run the destination inheritance once more for those newly-created rows.
@@ -330,7 +330,7 @@ ALTER TABLE IF EXISTS public.payment_sessions
     ADD COLUMN IF NOT EXISTS customer_payment_method_id UUID NULL REFERENCES public.customer_payment_methods(id) ON DELETE SET NULL,
     ADD COLUMN IF NOT EXISTS payment_intent TEXT NULL;
 
-DO $
+DO $$
 BEGIN
     IF NOT EXISTS (
         SELECT 1 FROM pg_constraint WHERE conname = 'chk_payment_session_intent'
@@ -339,7 +339,7 @@ BEGIN
             ADD CONSTRAINT chk_payment_session_intent
             CHECK (payment_intent IS NULL OR payment_intent IN ('full_payment', 'deposit'));
     END IF;
-END $;
+END $$;
 
 CREATE INDEX IF NOT EXISTS idx_payment_sessions_source
     ON public.payment_sessions (payment_source_id, created_at DESC);
