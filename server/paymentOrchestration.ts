@@ -42,11 +42,20 @@ function safeCompare(a: string, b: string): boolean {
 
 function normalizePhone(value: unknown): string | null {
   if (typeof value !== 'string') return null;
-  const digits = value.replace(/\D/g, '');
+  const normalized = value
+    .replace(/[٠-٩]/g, (digit) => String(digit.charCodeAt(0) - 0x0660))
+    .replace(/[۰-۹]/g, (digit) => String(digit.charCodeAt(0) - 0x06f0));
+  let digits = normalized.replace(/\D/g, '');
   if (!digits) return null;
-  if (digits.startsWith('20') && digits.length >= 12) return `0${digits.slice(2)}`;
-  if (digits.length === 10 && digits.startsWith('1')) return `0${digits}`;
+  if (digits.startsWith('0020')) digits = digits.slice(4);
+  else if (digits.startsWith('20') && digits.length === 12) digits = digits.slice(2);
+  if (digits.length === 10 && /^(10|11|12|15)/.test(digits)) digits = `0${digits}`;
   return digits;
+}
+
+function isValidEgyptianMobile(value: unknown): boolean {
+  const phone = normalizePhone(value);
+  return Boolean(phone && /^01[0125][0-9]{8}$/.test(phone));
 }
 
 function normalizeProvider(value: unknown): string {
@@ -87,6 +96,8 @@ function mapSession(row: Record<string, any>) {
     matchedAmount: row.matched_amount != null ? Number(row.matched_amount) : undefined,
     amountDifference: row.amount_difference != null ? Number(row.amount_difference) : undefined,
     payerPhone: row.payer_phone || undefined,
+    expectedPayerPhone: row.expected_payer_phone || undefined,
+    payerPhoneConfirmedAt: row.payer_phone_confirmed_at || undefined,
     paidAt: row.paid_at || undefined,
     createdAt: row.created_at,
     updatedAt: row.updated_at,
@@ -185,11 +196,22 @@ async function expireSessions(): Promise<string[]> {
 }
 
 async function releaseDeviceForSession(sessionId: string) {
-  const { error } = await supabaseServer
-    .from('payment_devices')
-    .update({ is_busy: false, busy_session_id: null, updated_at: new Date().toISOString() })
-    .eq('busy_session_id', sessionId);
-  if (error) console.error('[Payment Orchestration] Device release failed:', error.message);
+  const { data: session, error: sessionError } = await supabaseServer
+    .from('payment_sessions')
+    .select('device_id')
+    .eq('id', sessionId)
+    .maybeSingle();
+
+  if (sessionError) {
+    console.error('[Payment Orchestration] Device release lookup failed:', sessionError.message);
+    return;
+  }
+  if (!session?.device_id) return;
+
+  const { error } = await supabaseServer.rpc('refresh_payment_device_capacity', {
+    p_device_id: session.device_id,
+  });
+  if (error) console.error('[Payment Orchestration] Device capacity refresh failed:', error.message);
 }
 
 function broadcastSessionEvent(sessionId: string, event: string, data: unknown) {
@@ -1247,7 +1269,7 @@ paymentRouter.get('/admin/payments/overview', requireAuth, async (_req: Authenti
   ] = await Promise.all([
     supabaseServer
       .from('payment_devices')
-      .select('id,device_id,name,payment_destination,is_enabled,vf_cash_enabled,bank_alahly_enabled,online,internet_connected,app_running,notification_listener_enabled,is_busy,busy_session_id,last_heartbeat_at,last_event_at,app_version,created_at,updated_at')
+      .select('id,device_id,name,payment_destination,is_enabled,vf_cash_enabled,bank_alahly_enabled,online,internet_connected,app_running,notification_listener_enabled,is_busy,busy_session_id,max_concurrent_sessions,last_heartbeat_at,last_event_at,app_version,created_at,updated_at')
       .order('created_at', { ascending: true }),
     supabaseServer
       .from('payment_device_sources')
@@ -1318,8 +1340,17 @@ paymentRouter.get('/admin/payments/overview', requireAuth, async (_req: Authenti
     }
   }
 
+  const activeSessionCounts = new Map<string, number>();
+  for (const session of sessionsResult.data || []) {
+    if (session.status === 'waiting' && session.device_id && new Date(session.expires_at).getTime() > now) {
+      activeSessionCounts.set(session.device_id, (activeSessionCounts.get(session.device_id) || 0) + 1);
+    }
+  }
+
   const devices = (devicesResult.data || []).map((d: any) => {
     const assignedSources = deviceSourcesMap.get(d.id) || [];
+    const activeSessions = activeSessionCounts.get(d.id) || 0;
+    const maxConcurrentSessions = Math.max(1, Number(d.max_concurrent_sessions || 3));
     return {
       id: d.id,
       deviceId: d.device_id,
@@ -1332,8 +1363,11 @@ paymentRouter.get('/admin/payments/overview', requireAuth, async (_req: Authenti
       internetConnected: Boolean(d.internet_connected),
       appRunning: Boolean(d.app_running),
       notificationListenerEnabled: Boolean(d.notification_listener_enabled),
-      busy: Boolean(d.is_busy),
+      busy: activeSessions >= maxConcurrentSessions,
       busySessionId: d.busy_session_id || undefined,
+      activeSessions,
+      maxConcurrentSessions,
+      availableSlots: Math.max(0, maxConcurrentSessions - activeSessions),
       lastHeartbeatAt: d.last_heartbeat_at || undefined,
       lastEventAt: d.last_event_at || undefined,
       appVersion: d.app_version || undefined,
@@ -1447,6 +1481,7 @@ paymentRouter.post(
       is_enabled: req.body?.isEnabled !== false,
       vf_cash_enabled: Boolean(req.body?.vfCashEnabled),
       bank_alahly_enabled: Boolean(req.body?.bankAlAhlyEnabled),
+      max_concurrent_sessions: Math.min(10, Math.max(1, Number(req.body?.maxConcurrentSessions || 3))),
       updated_at: new Date().toISOString(),
     };
     const { data, error } = await supabaseServer.from('payment_devices').insert(row).select('*').single();
@@ -1462,6 +1497,7 @@ paymentRouter.post(
         paymentDestination: data.payment_destination,
         vfCashEnabled: data.vf_cash_enabled,
         bankAlAhlyEnabled: data.bank_alahly_enabled,
+        maxConcurrentSessions: Number(data.max_concurrent_sessions || 3),
       },
       provisioningSecret,
       warning: 'يظهر مفتاح التهيئة مرة واحدة فقط. أدخله في تطبيق Payment Bridge على هذا الهاتف.',
@@ -1480,6 +1516,13 @@ paymentRouter.patch(
     if (req.body?.isEnabled !== undefined) updates.is_enabled = Boolean(req.body.isEnabled);
     if (req.body?.vfCashEnabled !== undefined) updates.vf_cash_enabled = Boolean(req.body.vfCashEnabled);
     if (req.body?.bankAlAhlyEnabled !== undefined) updates.bank_alahly_enabled = Boolean(req.body.bankAlAhlyEnabled);
+    if (req.body?.maxConcurrentSessions !== undefined) {
+      const maxSessions = Number(req.body.maxConcurrentSessions);
+      if (!Number.isInteger(maxSessions) || maxSessions < 1 || maxSessions > 10) {
+        return res.status(400).json({ error: 'الحد الأقصى للجلسات يجب أن يكون بين 1 و10' });
+      }
+      updates.max_concurrent_sessions = maxSessions;
+    }
     if (req.body?.provisioningSecret !== undefined) {
       const secret = String(req.body.provisioningSecret).trim();
       if (secret.length < 32) return res.status(400).json({ error: 'مفتاح HMAC يجب ألا يقل عن 32 حرفاً' });
@@ -1495,7 +1538,7 @@ paymentRouter.patch(
       .from('payment_devices')
       .update(updates)
       .eq('id', req.params.id)
-      .select('id,device_id,name,payment_destination,is_enabled,vf_cash_enabled,bank_alahly_enabled,online,internet_connected,app_running,notification_listener_enabled,is_busy,busy_session_id,last_heartbeat_at,last_event_at,app_version,updated_at')
+      .select('id,device_id,name,payment_destination,is_enabled,vf_cash_enabled,bank_alahly_enabled,online,internet_connected,app_running,notification_listener_enabled,is_busy,busy_session_id,max_concurrent_sessions,last_heartbeat_at,last_event_at,app_version,updated_at')
       .single();
     if (error) return res.status(503).json({ error: 'تعذر تحديث جهاز الدفع' });
 
@@ -1595,29 +1638,41 @@ async function findEligibleSourceForMethod(
   | { disabled: true; method: any; customerPaymentMethodId: string | null }
   | null
 > {
-  // Query active, non-busy devices:
-  // - online = true, is_enabled = true
-  // - internet_connected = true, app_running = true, notification_listener_enabled = true
-  // - is_busy = false
-  // - last_heartbeat_at >= NOW() - 45 seconds
-  const cutoff = new Date(Date.now() - 45_000).toISOString();
-  const { data: activeDevices } = await supabaseServer
+  // Healthy devices remain eligible until they reach their configured concurrent-session capacity.
+  const cutoff = new Date(Date.now() - HEARTBEAT_FRESH_MS).toISOString();
+  const { data: healthyDevices } = await supabaseServer
     .from('payment_devices')
-    .select('id,device_id,vf_cash_enabled,bank_alahly_enabled')
+    .select('id,device_id,vf_cash_enabled,bank_alahly_enabled,max_concurrent_sessions')
     .eq('is_enabled', true)
     .eq('online', true)
     .eq('internet_connected', true)
     .eq('app_running', true)
     .eq('notification_listener_enabled', true)
-    .eq('is_busy', false)
     .gte('last_heartbeat_at', cutoff);
 
-  const activeDeviceList = activeDevices || [];
+  const healthyDeviceIds = (healthyDevices || []).map((d: any) => d.id);
+  if (healthyDeviceIds.length === 0) return null;
+
+  const { data: waitingSessions } = await supabaseServer
+    .from('payment_sessions')
+    .select('device_id')
+    .eq('status', 'waiting')
+    .gt('expires_at', new Date().toISOString())
+    .in('device_id', healthyDeviceIds);
+
+  const activeCounts = new Map<string, number>();
+  for (const row of waitingSessions || []) {
+    if (!row.device_id) continue;
+    activeCounts.set(row.device_id, (activeCounts.get(row.device_id) || 0) + 1);
+  }
+
+  const activeDeviceList = (healthyDevices || []).filter((d: any) => {
+    const max = Math.max(1, Number(d.max_concurrent_sessions || 3));
+    return (activeCounts.get(d.id) || 0) < max;
+  });
   const activeDeviceIds = activeDeviceList.map((d: any) => d.id);
 
-  if (activeDeviceIds.length === 0) {
-    return null;
-  }
+  if (activeDeviceIds.length === 0) return null;
 
   // Get device source mappings for active devices
   let activeAssignedSourceIds = new Set<string>();
