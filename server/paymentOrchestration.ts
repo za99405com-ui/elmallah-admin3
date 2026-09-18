@@ -585,13 +585,51 @@ paymentRouter.put(
 // ------------------------------------------------------------------------------
 // Simplified unified payment controls
 // ------------------------------------------------------------------------------
+type SimpleMessageSample = {
+  code: 'vf_cash' | 'instapay';
+  label: string;
+  appName: string | null;
+  packageName: string | null;
+  senderTitle: string | null;
+  sampleMessage: string | null;
+  configured: boolean;
+};
+
+function deriveMessageSignature(code: 'vf_cash' | 'instapay', sampleMessage: string): string {
+  const normalized = sampleMessage.replace(/\s+/g, ' ').trim();
+  const knownPhrases =
+    code === 'instapay'
+      ? ['تم إضافة تحويل لحظي', 'تم اضافه تحويل لحظي', 'تم إضافة تحويل', 'تم اضافه تحويل']
+      : ['تم استلام', 'استلمت', 'استلام'];
+
+  const known = knownPhrases.find((phrase) => normalized.includes(phrase));
+  if (known) return known;
+
+  const beforeFirstNumber = normalized.split(/[0-9٠-٩]/, 1)[0]?.trim() || normalized;
+  const compact = beforeFirstNumber.replace(/[,:;،؛\-]+$/g, '').trim();
+  return (compact || normalized).slice(0, 80);
+}
+
+const SIMPLE_PAYMENT_AMOUNT_REGEX =
+  '(?:بمبلغ|مبلغ|تم استلام|استلمت|استلام|received|amount)[^0-9]{0,30}([0-9,]+(?:[\\\\.,][0-9]+)?)';
+
 async function getSimplePaymentSettings() {
-  const [settings, methodsRes] = await Promise.all([
+  const [settings, methodsRes, devicesRes, sourcesRes] = await Promise.all([
     getAdminPaymentSettings(),
     supabaseServer
       .from('customer_payment_methods')
       .select('code,enabled')
       .in('code', ['vodafone_cash', 'instapay', 'cash_on_delivery']),
+    supabaseServer
+      .from('payment_devices')
+      .select('id,device_id,name,app_version,last_heartbeat_at,is_enabled')
+      .eq('is_enabled', true)
+      .order('last_heartbeat_at', { ascending: false })
+      .limit(1),
+    supabaseServer
+      .from('payment_sources')
+      .select('id,code')
+      .in('code', ['vf_cash', 'instapay']),
   ]);
 
   const methodEnabled = new Map(
@@ -603,6 +641,46 @@ async function getSimplePaymentSettings() {
     ? Boolean(methodEnabled.get('cash_on_delivery'))
     : !deposit;
 
+  const sourceIds = new Map(
+    (sourcesRes.data || []).map((row: any) => [String(row.code), String(row.id)])
+  );
+  const activeDevice = devicesRes.data?.[0] || null;
+  const assignmentsBySourceId = new Map<string, any>();
+
+  if (activeDevice && sourceIds.size > 0) {
+    const { data: assignments } = await supabaseServer
+      .from('payment_device_sources')
+      .select(
+        'payment_source_id,source_packages,app_name,sample_sender_title,sample_message,body_contains,enabled'
+      )
+      .eq('device_id', activeDevice.id)
+      .in('payment_source_id', Array.from(sourceIds.values()));
+
+    for (const row of assignments || []) {
+      assignmentsBySourceId.set(String(row.payment_source_id), row);
+    }
+  }
+
+  const buildSample = (code: 'vf_cash' | 'instapay', label: string): SimpleMessageSample => {
+    const assignment = assignmentsBySourceId.get(sourceIds.get(code) || '');
+    const packageName = Array.isArray(assignment?.source_packages)
+      ? String(assignment.source_packages[0] || '') || null
+      : null;
+    const sampleMessage = assignment?.sample_message ? String(assignment.sample_message) : null;
+
+    return {
+      code,
+      label,
+      appName: assignment?.app_name ? String(assignment.app_name) : null,
+      packageName,
+      senderTitle: assignment?.sample_sender_title
+        ? String(assignment.sample_sender_title)
+        : null,
+      sampleMessage,
+      configured: Boolean(assignment?.enabled && packageName && sampleMessage),
+    };
+  };
+
   return {
     vodafoneCash: Boolean(methodEnabled.get('vodafone_cash')),
     instaPay: Boolean(methodEnabled.get('instapay')),
@@ -612,6 +690,18 @@ async function getSimplePaymentSettings() {
     depositValue: settings.depositValue,
     minimumDeposit: settings.minimumDeposit,
     sessionTimeoutSeconds: settings.sessionTimeoutSeconds,
+    bridgeDevice: activeDevice
+      ? {
+          deviceId: activeDevice.device_id,
+          name: activeDevice.name,
+          appVersion: activeDevice.app_version || null,
+          lastHeartbeatAt: activeDevice.last_heartbeat_at || null,
+        }
+      : null,
+    messageSamples: {
+      vodafoneCash: buildSample('vf_cash', 'فودافون كاش'),
+      instaPay: buildSample('instapay', 'إنستا باي'),
+    },
   };
 }
 
@@ -642,7 +732,6 @@ paymentRouter.put(
         ? current.cashOnDelivery
         : Boolean(req.body.cashOnDelivery);
 
-    // Deposit and cash-on-delivery are one exclusive order policy.
     if (deposit === cashOnDelivery) {
       if (changed === 'cashOnDelivery') {
         deposit = !cashOnDelivery;
@@ -659,6 +748,10 @@ paymentRouter.put(
       req.body?.minimumDeposit === undefined
         ? current.minimumDeposit
         : Number(req.body.minimumDeposit);
+    const sessionTimeoutSeconds =
+      req.body?.sessionTimeoutSeconds === undefined
+        ? current.sessionTimeoutSeconds
+        : Number(req.body.sessionTimeoutSeconds);
 
     if (!Number.isFinite(depositValue) || depositValue < 0) {
       return res.status(400).json({ error: 'قيمة العربون غير صالحة' });
@@ -668,6 +761,13 @@ paymentRouter.put(
     }
     if (!Number.isFinite(minimumDeposit) || minimumDeposit < 0) {
       return res.status(400).json({ error: 'الحد الأدنى للعربون غير صالح' });
+    }
+    if (
+      !Number.isInteger(sessionTimeoutSeconds) ||
+      sessionTimeoutSeconds < 30 ||
+      sessionTimeoutSeconds > 600
+    ) {
+      return res.status(400).json({ error: 'مدة جلسة الدفع يجب أن تكون بين 30 ثانية و10 دقائق' });
     }
 
     const now = new Date().toISOString();
@@ -714,7 +814,6 @@ paymentRouter.put(
     const sourceUpdates = [
       ['vf_cash', vodafoneCash],
       ['instapay', instaPay],
-      // Hidden legacy sources stay disabled in the simplified two-source model.
       ['bank_alahly', false],
       ['banque_misr', false],
     ] as const;
@@ -729,7 +828,6 @@ paymentRouter.put(
       if (error) return res.status(503).json({ error: 'تعذر تحديث مصادر جسر المدفوعات' });
     }
 
-    // Keep customer methods mapped to exactly one matching bridge source.
     const mappingPairs = [
       ['vodafone_cash', 'vf_cash'],
       ['instapay', 'instapay'],
@@ -771,7 +869,6 @@ paymentRouter.put(
         .eq('customer_payment_method_id', bankMethod.id);
     }
 
-    // Every enabled bridge device receives the same two logical sources.
     const visibleSourceIds = [
       sourcesByCode.get('vf_cash')?.id,
       sourcesByCode.get('instapay')?.id,
@@ -821,7 +918,6 @@ paymentRouter.put(
         .from('payment_devices')
         .update({
           vf_cash_enabled: vodafoneCash,
-          // Legacy field retained for compatibility; it mirrors logical InstaPay availability.
           bank_alahly_enabled: instaPay,
           updated_at: now,
         })
@@ -844,24 +940,16 @@ paymentRouter.put(
         deposit_type: depositType,
         deposit_value: depositValue,
         minimum_deposit: minimumDeposit,
+        payment_session_timeout_seconds: sessionTimeoutSeconds,
         updated_at: now,
       })
       .eq('id', 1);
 
     if (settingsError) {
-      return res.status(503).json({ error: 'تعذر تحديث سياسة العربون والدفع عند الاستلام' });
+      return res.status(503).json({ error: 'تعذر تحديث إعدادات الدفع' });
     }
 
-    const result = {
-      vodafoneCash,
-      instaPay,
-      deposit,
-      cashOnDelivery,
-      depositType,
-      depositValue,
-      minimumDeposit,
-      sessionTimeoutSeconds: current.sessionTimeoutSeconds,
-    };
+    const result = await getSimplePaymentSettings();
 
     logAuditAction(
       req.admin,
@@ -874,6 +962,116 @@ paymentRouter.put(
     );
     broadcastRealtimeEvent('payment_settings_updated', result);
     return res.json(result);
+  }
+);
+
+paymentRouter.put(
+  '/admin/payments/message-samples/:code',
+  requireAuth,
+  requireRole(['super_admin', 'manager']),
+  async (req: AuthenticatedRequest, res: Response) => {
+    const code = String(req.params.code || '').trim();
+    if (code !== 'vf_cash' && code !== 'instapay') {
+      return res.status(400).json({ error: 'طريقة الدفع غير مدعومة' });
+    }
+
+    const sampleMessage = String(req.body?.sampleMessage || '').trim();
+    if (!sampleMessage) {
+      return res.status(400).json({ error: 'ضع نص رسالة الدفع بالكامل أولاً' });
+    }
+    if (sampleMessage.length > 5000) {
+      return res.status(400).json({ error: 'نص الرسالة أطول من الحد المسموح' });
+    }
+
+    const appName = req.body?.appName ? String(req.body.appName).trim().slice(0, 250) : null;
+    const packageName = req.body?.packageName
+      ? String(req.body.packageName).trim().slice(0, 250)
+      : null;
+    const senderTitle = req.body?.senderTitle
+      ? String(req.body.senderTitle).trim().slice(0, 250)
+      : null;
+
+    const [{ data: source, error: sourceError }, { data: device, error: deviceError }] =
+      await Promise.all([
+        supabaseServer.from('payment_sources').select('id,code').eq('code', code).maybeSingle(),
+        supabaseServer
+          .from('payment_devices')
+          .select('id,device_id')
+          .eq('is_enabled', true)
+          .order('last_heartbeat_at', { ascending: false })
+          .limit(1)
+          .maybeSingle(),
+      ]);
+
+    if (sourceError || !source) {
+      return res.status(404).json({ error: 'مصدر الدفع غير موجود' });
+    }
+    if (deviceError || !device) {
+      return res.status(409).json({ error: 'لا يوجد جهاز Bridge مفعّل لربط الرسالة' });
+    }
+
+    const { data: existingAssignment, error: assignmentLookupError } = await supabaseServer
+      .from('payment_device_sources')
+      .select('*')
+      .eq('device_id', device.id)
+      .eq('payment_source_id', source.id)
+      .maybeSingle();
+
+    if (assignmentLookupError) {
+      return res.status(503).json({ error: 'تعذر تحميل إعداد رسالة الدفع' });
+    }
+
+    const signature = deriveMessageSignature(code, sampleMessage);
+    const now = new Date().toISOString();
+    const row = {
+      device_id: device.id,
+      payment_source_id: source.id,
+      enabled: true,
+      source_packages: packageName
+        ? [packageName]
+        : Array.isArray(existingAssignment?.source_packages)
+          ? existingAssignment.source_packages
+          : [],
+      app_name: appName || existingAssignment?.app_name || null,
+      sample_sender_title: senderTitle || existingAssignment?.sample_sender_title || null,
+      sample_message: sampleMessage,
+      body_contains: signature,
+      amount_regex: SIMPLE_PAYMENT_AMOUNT_REGEX,
+      parser_type: 'regex',
+      updated_at: now,
+    };
+
+    let saveError;
+    if (existingAssignment) {
+      const result = await supabaseServer
+        .from('payment_device_sources')
+        .update(row)
+        .eq('id', existingAssignment.id);
+      saveError = result.error;
+    } else {
+      const result = await supabaseServer.from('payment_device_sources').insert({
+        ...row,
+        created_at: now,
+      });
+      saveError = result.error;
+    }
+
+    if (saveError) {
+      return res.status(503).json({ error: 'تعذر حفظ عينة رسالة الدفع' });
+    }
+
+    const refreshed = await getSimplePaymentSettings();
+    logAuditAction(
+      req.admin,
+      'update_payment_message_sample',
+      'payment_source',
+      String(source.id),
+      existingAssignment,
+      { code, signature, sampleMessage, packageName, appName },
+      req.ip
+    );
+    broadcastRealtimeEvent('payment_message_sample_updated', { code, deviceId: device.device_id });
+    return res.json(refreshed);
   }
 );
 
