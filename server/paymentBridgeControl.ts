@@ -325,18 +325,41 @@ paymentBridgeControlRouter.post('/payment-bridge/heartbeat', verifyPaymentBridge
       updated_at: now,
     })
     .eq('id', device.id)
-    .select('device_id,is_busy,busy_session_id,last_heartbeat_at,vf_cash_enabled,bank_alahly_enabled')
+    .select('device_id,is_busy,busy_session_id,max_concurrent_sessions,last_heartbeat_at,vf_cash_enabled,bank_alahly_enabled')
     .single();
 
   if (error) return res.status(503).json({ error: 'Heartbeat could not be stored' });
+
+  const { data: activeSessionRows, error: activeSessionError } = await supabaseServer
+    .from('payment_sessions')
+    .select('id')
+    .eq('device_id', device.id)
+    .eq('status', 'waiting')
+    .gt('expires_at', now);
+
+  if (activeSessionError) {
+    return res.status(503).json({ error: 'Device capacity could not be read' });
+  }
+
+  const activeSessions = activeSessionRows?.length || 0;
+  const maxConcurrentSessions = Math.max(1, Number(data.max_concurrent_sessions || 3));
+  const availableSlots = Math.max(0, maxConcurrentSessions - activeSessions);
+  const isFull = availableSlots === 0;
+
+  if (Boolean(data.is_busy) !== isFull) {
+    await supabaseServer.rpc('refresh_payment_device_capacity', { p_device_id: device.id });
+  }
 
   const { rulesVersion, rules } = await fetchDeviceRules(device.id, data);
 
   const result = {
     status: 'ok',
     online: true,
-    busy: Boolean(data.is_busy),
-    busySessionId: data.busy_session_id || null,
+    busy: isFull,
+    busySessionId: isFull ? data.busy_session_id || null : null,
+    activeSessions,
+    maxConcurrentSessions,
+    availableSlots,
     vfCashEnabled: Boolean(data.vf_cash_enabled),
     bankAlAhlyEnabled: Boolean(data.bank_alahly_enabled),
     activeRulesCount: rules.length,
@@ -356,7 +379,7 @@ paymentBridgeControlRouter.post('/payment-bridge/config', verifyPaymentBridge, a
   // Retrieve current authoritative state from database without overwriting with device's payload
   const { data, error } = await supabaseServer
     .from('payment_devices')
-    .select('device_id,vf_cash_enabled,bank_alahly_enabled,is_busy,busy_session_id')
+.select('device_id,vf_cash_enabled,bank_alahly_enabled,is_busy,busy_session_id,max_concurrent_sessions')
     .eq('id', device.id)
     .single();
 
