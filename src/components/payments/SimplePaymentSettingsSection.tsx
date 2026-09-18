@@ -1,12 +1,26 @@
 import React, { useEffect, useState } from 'react';
 import {
   BadgeDollarSign,
+  Clock3,
   Loader2,
+  MessageSquareText,
   RefreshCw,
+  Save,
+  Smartphone,
   Truck,
   WalletCards,
   Zap,
 } from 'lucide-react';
+
+export interface PaymentMessageSampleSettings {
+  code: 'vf_cash' | 'instapay';
+  label: string;
+  appName: string | null;
+  packageName: string | null;
+  senderTitle: string | null;
+  sampleMessage: string | null;
+  configured: boolean;
+}
 
 export interface SimplePaymentState {
   vodafoneCash: boolean;
@@ -17,6 +31,16 @@ export interface SimplePaymentState {
   depositValue: number;
   minimumDeposit: number;
   sessionTimeoutSeconds: number;
+  bridgeDevice: {
+    deviceId: string;
+    name: string;
+    appVersion: string | null;
+    lastHeartbeatAt: string | null;
+  } | null;
+  messageSamples: {
+    vodafoneCash: PaymentMessageSampleSettings;
+    instaPay: PaymentMessageSampleSettings;
+  };
 }
 
 interface SimplePaymentSettingsSectionProps {
@@ -25,6 +49,7 @@ interface SimplePaymentSettingsSectionProps {
 }
 
 type ToggleKey = 'vodafoneCash' | 'instaPay' | 'deposit' | 'cashOnDelivery';
+type SampleKey = 'vodafoneCash' | 'instaPay';
 
 const toggleMeta: Array<{
   key: ToggleKey;
@@ -58,20 +83,40 @@ const toggleMeta: Array<{
   },
 ];
 
+const timeoutOptions = [
+  { seconds: 60, label: 'دقيقة واحدة' },
+  { seconds: 120, label: 'دقيقتان' },
+  { seconds: 180, label: '3 دقائق' },
+  { seconds: 300, label: '5 دقائق' },
+  { seconds: 600, label: '10 دقائق' },
+];
+
 export const SimplePaymentSettingsSection: React.FC<SimplePaymentSettingsSectionProps> = ({
   adminRequest,
   onRefresh,
 }) => {
   const [state, setState] = useState<SimplePaymentState | null>(null);
+  const [sampleDrafts, setSampleDrafts] = useState<Record<SampleKey, string>>({
+    vodafoneCash: '',
+    instaPay: '',
+  });
   const [busyKey, setBusyKey] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [saved, setSaved] = useState<string | null>(null);
+
+  const applyLoadedState = (data: SimplePaymentState) => {
+    setState(data);
+    setSampleDrafts({
+      vodafoneCash: data.messageSamples?.vodafoneCash?.sampleMessage || '',
+      instaPay: data.messageSamples?.instaPay?.sampleMessage || '',
+    });
+  };
 
   const load = async () => {
     try {
       setError(null);
       const data = (await adminRequest('/api/admin/payments/simple-settings')) as SimplePaymentState;
-      setState(data);
+      applyLoadedState(data);
     } catch (err) {
       setError(err instanceof Error ? err.message : 'تعذر تحميل إعدادات الدفع');
     }
@@ -88,10 +133,20 @@ export const SimplePaymentSettingsSection: React.FC<SimplePaymentSettingsSection
       setSaved(null);
       const result = (await adminRequest('/api/admin/payments/simple-settings', {
         method: 'PUT',
-        body: JSON.stringify({ ...next, changed }),
+        body: JSON.stringify({
+          vodafoneCash: next.vodafoneCash,
+          instaPay: next.instaPay,
+          deposit: next.deposit,
+          cashOnDelivery: next.cashOnDelivery,
+          depositType: next.depositType,
+          depositValue: next.depositValue,
+          minimumDeposit: next.minimumDeposit,
+          sessionTimeoutSeconds: next.sessionTimeoutSeconds,
+          changed,
+        }),
       })) as SimplePaymentState;
-      setState(result);
-      setSaved('تم حفظ إعدادات الدفع وربطها بالمتجر وتطبيق جسر المدفوعات.');
+      applyLoadedState(result);
+      setSaved('تم حفظ الإعدادات وربطها بالمتجر وتطبيق جسر المدفوعات.');
       await onRefresh?.();
     } catch (err) {
       setError(err instanceof Error ? err.message : 'تعذر حفظ إعدادات الدفع');
@@ -117,6 +172,38 @@ export const SimplePaymentSettingsSection: React.FC<SimplePaymentSettingsSection
     await saveState(next, key);
   };
 
+  const saveSample = async (key: SampleKey) => {
+    if (!state || busyKey) return;
+    const sample = state.messageSamples[key];
+    const sampleMessage = sampleDrafts[key].trim();
+    if (!sampleMessage) {
+      setError('ضع رسالة ' + sample.label + ' كاملة أولاً');
+      return;
+    }
+
+    try {
+      setBusyKey('sample:' + key);
+      setError(null);
+      setSaved(null);
+      const result = (await adminRequest('/api/admin/payments/message-samples/' + sample.code, {
+        method: 'PUT',
+        body: JSON.stringify({
+          sampleMessage,
+          appName: sample.appName,
+          packageName: sample.packageName,
+          senderTitle: sample.senderTitle,
+        }),
+      })) as SimplePaymentState;
+      applyLoadedState(result);
+      setSaved('تم حفظ عينة رسالة ' + sample.label + '.');
+      await onRefresh?.();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'تعذر حفظ عينة الرسالة');
+    } finally {
+      setBusyKey(null);
+    }
+  };
+
   if (!state) {
     return (
       <div className="min-h-[260px] flex items-center justify-center">
@@ -128,6 +215,10 @@ export const SimplePaymentSettingsSection: React.FC<SimplePaymentSettingsSection
     );
   }
 
+  const isOldBridgeVersion =
+    state.bridgeDevice?.appVersion &&
+    /^1\.0(?:\.|$)/.test(state.bridgeDevice.appVersion);
+
   return (
     <div className="space-y-5">
       <div className="rounded-2xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900 p-4 sm:p-5">
@@ -137,7 +228,7 @@ export const SimplePaymentSettingsSection: React.FC<SimplePaymentSettingsSection
               إعدادات الدفع
             </h2>
             <p className="text-xs text-slate-500 dark:text-slate-400 mt-1">
-              أربع اختيارات فقط. العربون والدفع عند الاستلام مرتبطان عكسيًا تلقائيًا.
+              فودافون كاش، إنستا باي، العربون، والدفع عند الاستلام — من مكان واحد.
             </p>
           </div>
           <button
@@ -200,13 +291,52 @@ export const SimplePaymentSettingsSection: React.FC<SimplePaymentSettingsSection
         </div>
       </div>
 
+      <div className="rounded-2xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900 p-4 sm:p-5">
+        <div className="flex items-center gap-2 mb-4">
+          <Clock3 className="w-5 h-5 text-cyan-600" />
+          <div>
+            <h3 className="text-sm font-black text-slate-900 dark:text-white">وقت جلسة الدفع</h3>
+            <p className="text-[11px] text-slate-500 mt-0.5">
+              المدة التي يظل فيها الطلب منتظرًا وصول التحويل قبل انتهاء الجلسة.
+            </p>
+          </div>
+        </div>
+
+        <div className="flex flex-col sm:flex-row gap-3 sm:items-end">
+          <label className="space-y-1.5 flex-1">
+            <span className="text-xs font-bold text-slate-600 dark:text-slate-300">مدة الانتظار</span>
+            <select
+              value={state.sessionTimeoutSeconds}
+              onChange={(e) =>
+                setState((prev) =>
+                  prev ? { ...prev, sessionTimeoutSeconds: Number(e.target.value) } : prev
+                )
+              }
+              className="w-full rounded-xl border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-950 px-3 py-2.5 text-sm font-bold"
+            >
+              {timeoutOptions.map((option) => (
+                <option key={option.seconds} value={option.seconds}>
+                  {option.label}
+                </option>
+              ))}
+            </select>
+          </label>
+
+          <button
+            onClick={() => void saveState(state, 'sessionTimeout')}
+            disabled={Boolean(busyKey)}
+            className="rounded-xl bg-cyan-600 hover:bg-cyan-700 text-white px-5 py-2.5 text-xs font-black disabled:opacity-50"
+          >
+            {busyKey === 'sessionTimeout' ? 'جارٍ الحفظ...' : 'حفظ وقت الجلسة'}
+          </button>
+        </div>
+      </div>
+
       {state.deposit && (
         <div className="rounded-2xl border border-cyan-200 dark:border-cyan-900 bg-white dark:bg-slate-900 p-4 sm:p-5">
           <div className="mb-4">
             <h3 className="text-sm font-black text-slate-900 dark:text-white">إعداد العربون</h3>
-            <p className="text-[11px] text-slate-500 mt-1">
-              يظهر فقط عندما يكون وضع العربون مفعّلًا.
-            </p>
+            <p className="text-[11px] text-slate-500 mt-1">يظهر فقط عندما يكون وضع العربون مفعّلًا.</p>
           </div>
 
           <div className="grid sm:grid-cols-3 gap-3">
@@ -267,6 +397,93 @@ export const SimplePaymentSettingsSection: React.FC<SimplePaymentSettingsSection
           </div>
         </div>
       )}
+
+      <div className="rounded-2xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900 p-4 sm:p-5">
+        <div className="flex items-start gap-2 mb-4">
+          <MessageSquareText className="w-5 h-5 text-cyan-600 mt-0.5" />
+          <div className="flex-1">
+            <h3 className="text-sm font-black text-slate-900 dark:text-white">عينات رسائل الدفع</h3>
+            <p className="text-[11px] text-slate-500 mt-0.5">
+              ضع الرسالة الحقيقية بالكامل لكل طريقة. اختيار تطبيق الرسائل نفسه يتم من تطبيق الجسر على الهاتف.
+            </p>
+          </div>
+        </div>
+
+        {state.bridgeDevice && (
+          <div
+            className={[
+              'mb-4 rounded-xl border px-3 py-2.5 text-xs',
+              isOldBridgeVersion
+                ? 'border-amber-200 bg-amber-50 text-amber-800 dark:border-amber-900 dark:bg-amber-950/30 dark:text-amber-300'
+                : 'border-slate-200 bg-slate-50 text-slate-600 dark:border-slate-800 dark:bg-slate-950/40 dark:text-slate-300',
+            ].join(' ')}
+          >
+            <div className="flex items-center gap-2 font-bold">
+              <Smartphone className="w-4 h-4" />
+              الجهاز: {state.bridgeDevice.name || state.bridgeDevice.deviceId}
+              {state.bridgeDevice.appVersion ? ' — التطبيق v' + state.bridgeDevice.appVersion : ''}
+            </div>
+            {isOldBridgeVersion && (
+              <div className="mt-1">
+                النسخة المتصلة ما زالت 1.0؛ ثبّت النسخة 1.1 أو أحدث لكي يظهر إعداد الرسائل المبسّط داخل التطبيق.
+              </div>
+            )}
+          </div>
+        )}
+
+        <div className="grid xl:grid-cols-2 gap-4">
+          {(['vodafoneCash', 'instaPay'] as SampleKey[]).map((key) => {
+            const sample = state.messageSamples[key];
+            const saving = busyKey === 'sample:' + key;
+            return (
+              <div
+                key={key}
+                className="rounded-2xl border border-slate-200 dark:border-slate-800 p-4 bg-slate-50/70 dark:bg-slate-950/30"
+              >
+                <div className="flex items-center justify-between gap-2 mb-3">
+                  <div>
+                    <div className="text-sm font-black text-slate-900 dark:text-white">{sample.label}</div>
+                    <div className="text-[10px] text-slate-500 mt-0.5">
+                      {sample.appName || sample.packageName
+                        ? 'تطبيق الرسائل: ' + (sample.appName || sample.packageName)
+                        : 'تطبيق الرسائل لم يتم اختياره من الهاتف بعد'}
+                    </div>
+                  </div>
+                  <span
+                    className={[
+                      'rounded-full px-2.5 py-1 text-[10px] font-black',
+                      sample.configured
+                        ? 'bg-emerald-100 text-emerald-700 dark:bg-emerald-950/60 dark:text-emerald-300'
+                        : 'bg-amber-100 text-amber-700 dark:bg-amber-950/60 dark:text-amber-300',
+                    ].join(' ')}
+                  >
+                    {sample.configured ? 'جاهز' : 'يحتاج إعداد'}
+                  </span>
+                </div>
+
+                <textarea
+                  value={sampleDrafts[key]}
+                  onChange={(e) =>
+                    setSampleDrafts((prev) => ({ ...prev, [key]: e.target.value }))
+                  }
+                  placeholder={'الصق رسالة ' + sample.label + ' كاملة هنا كما تصل على الهاتف...'}
+                  rows={7}
+                  className="w-full resize-y rounded-xl border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-950 px-3 py-2.5 text-xs leading-6"
+                />
+
+                <button
+                  onClick={() => void saveSample(key)}
+                  disabled={Boolean(busyKey)}
+                  className="mt-3 w-full inline-flex items-center justify-center gap-2 rounded-xl bg-slate-900 dark:bg-white dark:text-slate-900 text-white px-4 py-2.5 text-xs font-black disabled:opacity-50"
+                >
+                  {saving ? <Loader2 className="w-4 h-4 animate-spin" /> : <Save className="w-4 h-4" />}
+                  حفظ رسالة {sample.label}
+                </button>
+              </div>
+            );
+          })}
+        </div>
+      </div>
 
       {error && (
         <div className="rounded-xl border border-rose-200 bg-rose-50 dark:border-rose-900 dark:bg-rose-950/30 px-4 py-3 text-xs font-bold text-rose-700 dark:text-rose-300">
