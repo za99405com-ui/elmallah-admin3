@@ -78,6 +78,9 @@ CREATE TABLE IF NOT EXISTS public.payment_sources (
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
+ALTER TABLE IF EXISTS public.payment_sources
+    ADD COLUMN IF NOT EXISTS source_packages TEXT[] NOT NULL DEFAULT '{}'::TEXT[];
+
 CREATE INDEX IF NOT EXISTS idx_payment_sources_enabled_priority
     ON public.payment_sources (enabled, priority DESC);
 CREATE INDEX IF NOT EXISTS idx_payment_sources_code
@@ -196,7 +199,7 @@ BEGIN
          WHERE bank_alahly_enabled = true
         ON CONFLICT (device_id, payment_source_id) DO NOTHING;
     END IF;
-END $;
+END $$;
 
 -- Seeded legacy assignments are created after the first compatibility backfill,
 -- so run the destination inheritance once more for those newly-created rows.
@@ -327,7 +330,7 @@ ALTER TABLE IF EXISTS public.payment_sessions
     ADD COLUMN IF NOT EXISTS customer_payment_method_id UUID NULL REFERENCES public.customer_payment_methods(id) ON DELETE SET NULL,
     ADD COLUMN IF NOT EXISTS payment_intent TEXT NULL;
 
-DO $
+DO $$
 BEGIN
     IF NOT EXISTS (
         SELECT 1 FROM pg_constraint WHERE conname = 'chk_payment_session_intent'
@@ -336,7 +339,7 @@ BEGIN
             ADD CONSTRAINT chk_payment_session_intent
             CHECK (payment_intent IS NULL OR payment_intent IN ('full_payment', 'deposit'));
     END IF;
-END $;
+END $$;
 
 CREATE INDEX IF NOT EXISTS idx_payment_sessions_source
     ON public.payment_sessions (payment_source_id, created_at DESC);
@@ -420,9 +423,9 @@ BEGIN
     -- Fallback lookup for legacy aliases
     IF v_source.id IS NULL THEN
         IF v_clean_provider IN ('vodafone_cash', 'vf_cash') THEN
-            SELECT * INTO v_source FROM public.payment_sources WHERE code = 'vf_cash' LIMIT 1;
+            SELECT * INTO v_source FROM public.payment_sources WHERE code = 'vf_cash' AND enabled = true LIMIT 1;
         ELSIF v_clean_provider IN ('bank_alahly', 'nbe', 'bank_al_ahly') THEN
-            SELECT * INTO v_source FROM public.payment_sources WHERE code = 'bank_alahly' LIMIT 1;
+            SELECT * INTO v_source FROM public.payment_sources WHERE code = 'bank_alahly' AND enabled = true LIMIT 1;
         END IF;
     END IF;
 
@@ -455,12 +458,14 @@ BEGIN
             ))
             -- Or legacy fallback boolean flags, only with a usable destination.
             OR (
-                v_clean_provider IN ('vf_cash', 'vodafone_cash')
+                v_source.id IS NOT NULL
+                AND v_clean_provider IN ('vf_cash', 'vodafone_cash')
                 AND d.vf_cash_enabled = true
                 AND COALESCE(NULLIF(trim(d.payment_destination), ''), NULLIF(trim(v_source.destination), '')) IS NOT NULL
             )
             OR (
-                v_clean_provider IN ('bank_alahly', 'nbe')
+                v_source.id IS NOT NULL
+                AND v_clean_provider IN ('bank_alahly', 'nbe')
                 AND d.bank_alahly_enabled = true
                 AND COALESCE(NULLIF(trim(d.payment_destination), ''), NULLIF(trim(v_source.destination), '')) IS NOT NULL
             )
