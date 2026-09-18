@@ -163,7 +163,7 @@ paymentIntegrationConfigRouter.get('/payments/config', requireIntegrationKey, as
   const [devicesRes, methodsRes, methodSourcesRes, deviceSourcesRes] = await Promise.all([
     supabaseServer
       .from('payment_devices')
-      .select('id,device_id,vf_cash_enabled,bank_alahly_enabled,is_enabled,online,internet_connected,app_running,notification_listener_enabled,is_busy,last_heartbeat_at')
+      .select('id,device_id,payment_destination,vf_cash_enabled,bank_alahly_enabled,is_enabled,online,internet_connected,app_running,notification_listener_enabled,is_busy,last_heartbeat_at')
       .eq('is_enabled', true),
     supabaseServer
       .from('customer_payment_methods')
@@ -174,7 +174,7 @@ paymentIntegrationConfigRouter.get('/payments/config', requireIntegrationKey, as
       .select('customer_payment_method_id,payment_source_id,is_primary,payment_sources(*)'),
     supabaseServer
       .from('payment_device_sources')
-      .select('device_id,payment_source_id,enabled')
+      .select('*')
       .eq('enabled', true),
   ]);
 
@@ -191,16 +191,26 @@ paymentIntegrationConfigRouter.get('/payments/config', requireIntegrationKey, as
     );
   });
 
-  // Map which payment source IDs have at least one eligible device
+  // A method is available only when at least one healthy device can also
+  // provide a destination for the assigned payment source.
   const eligibleSourceIds = new Set<string>();
   for (const d of eligibleDevices) {
-    const assigned = (deviceSourcesRes.data || []).filter((ds: any) => ds.device_id === d.id);
+    const assigned = (deviceSourcesRes.data || []).filter(
+      (ds: any) => ds.device_id === d.id && ds.enabled !== false
+    );
     for (const a of assigned) {
-      eligibleSourceIds.add(a.payment_source_id);
+      const hasDestination = Boolean(
+        String(a.destination || '').trim() ||
+        String(d.payment_destination || '').trim()
+      );
+      if (hasDestination) eligibleSourceIds.add(a.payment_source_id);
     }
-    // Also include legacy boolean flags
-    if (d.vf_cash_enabled) eligibleSourceIds.add('vf_cash_legacy');
-    if (d.bank_alahly_enabled) eligibleSourceIds.add('bank_alahly_legacy');
+
+    // Legacy compatibility before per-source destinations are migrated.
+    if (String(d.payment_destination || '').trim()) {
+      if (d.vf_cash_enabled) eligibleSourceIds.add('vf_cash_legacy');
+      if (d.bank_alahly_enabled) eligibleSourceIds.add('bank_alahly_legacy');
+    }
   }
 
   const rawMethods = methodsRes.data || [];
