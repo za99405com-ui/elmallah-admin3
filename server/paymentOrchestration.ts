@@ -1503,20 +1503,7 @@ async function findEligibleSourceForMethod(
     }
   }
 
-  // 1. If explicit paymentSourceId provided
-  if (paymentSourceId) {
-    const { data: src } = await supabaseServer.from('payment_sources').select('*').eq('id', paymentSourceId).maybeSingle();
-    if (src && src.enabled) {
-      const isAssigned = activeAssignedSourceIds.has(src.id) || activeDeviceList.some((d: any) =>
-        (src.code === 'vf_cash' && d.vf_cash_enabled) || (src.code === 'bank_alahly' && d.bank_alahly_enabled)
-      );
-      if (isAssigned) {
-        return { source: src, provider: normalizeProvider(src.code) || src.code, customerPaymentMethodId: customerPaymentMethodId || null };
-      }
-    }
-  }
-
-  // 2. Resolve via customer_payment_methods
+  // 1. Validate and resolve via customer_payment_methods FIRST if requested
   let method: any = null;
   if (customerPaymentMethodId) {
     const { data } = await supabaseServer.from('customer_payment_methods').select('*').eq('id', customerPaymentMethodId).maybeSingle();
@@ -1528,6 +1515,7 @@ async function findEligibleSourceForMethod(
 
   // If customerPaymentMethodId or paymentMethodCode was requested:
   // Reject non-existent or disabled payment methods immediately (must never create a session)
+  // An explicit paymentSourceId must never bypass a disabled or non-existent customer payment method.
   if (customerPaymentMethodId || paymentMethodCode) {
     if (!method) {
       return { notFound: true, customerPaymentMethodId: customerPaymentMethodId || null };
@@ -1535,35 +1523,30 @@ async function findEligibleSourceForMethod(
     if (!method.enabled) {
       return { disabled: true, method, customerPaymentMethodId: method.id };
     }
-  }
 
-  if (method) {
+    // Resolve allowed sources mapped to this enabled method
     const { data: mappedSources } = await supabaseServer
       .from('customer_payment_method_sources')
       .select('payment_source_id,is_primary,payment_sources(*)')
       .eq('customer_payment_method_id', method.id);
 
-    if (mappedSources && mappedSources.length > 0) {
-      // Sort by: is_primary DESC, source.priority DESC
-      const candidates = mappedSources
-        .map((ms: any) => ({
-          isPrimary: Boolean(ms.is_primary),
-          source: ms.payment_sources,
-        }))
-        .filter((item: any) => item.source && item.source.enabled)
-        .sort((a: any, b: any) => {
-          if (a.isPrimary !== b.isPrimary) return a.isPrimary ? -1 : 1;
-          return Number(b.source.priority || 0) - Number(a.source.priority || 0);
-        });
+    const candidates = (mappedSources || [])
+      .map((ms: any) => ({
+        isPrimary: Boolean(ms.is_primary),
+        source: ms.payment_sources,
+      }))
+      .filter((item: any) => item.source && item.source.enabled);
 
-      for (const item of candidates) {
-        const src = item.source;
+    // If an explicit paymentSourceId was ALSO supplied, it MUST be one of this method's allowed sources
+    if (paymentSourceId) {
+      const matched = candidates.find((c: any) => c.source.id === paymentSourceId);
+      if (matched) {
+        const src = matched.source;
         const isDirectlyAssigned = activeAssignedSourceIds.has(src.id);
         const isLegacyAssigned = activeDeviceList.some((d: any) =>
           (src.code === 'vf_cash' && d.vf_cash_enabled) ||
           (src.code === 'bank_alahly' && d.bank_alahly_enabled)
         );
-
         if (isDirectlyAssigned || isLegacyAssigned) {
           return {
             source: src,
@@ -1572,31 +1555,70 @@ async function findEligibleSourceForMethod(
           };
         }
       }
+      // If the explicit paymentSourceId is not allowed for this method or not active, do not bypass
+      return null;
     }
+
+    // Select the highest priority available source mapped to this method
+    const sortedCandidates = candidates.sort((a: any, b: any) => {
+      if (a.isPrimary !== b.isPrimary) return a.isPrimary ? -1 : 1;
+      return Number(b.source.priority || 0) - Number(a.source.priority || 0);
+    });
+
+    for (const item of sortedCandidates) {
+      const src = item.source;
+      const isDirectlyAssigned = activeAssignedSourceIds.has(src.id);
+      const isLegacyAssigned = activeDeviceList.some((d: any) =>
+        (src.code === 'vf_cash' && d.vf_cash_enabled) ||
+        (src.code === 'bank_alahly' && d.bank_alahly_enabled)
+      );
+
+      if (isDirectlyAssigned || isLegacyAssigned) {
+        return {
+          source: src,
+          provider: normalizeProvider(src.code) || src.code,
+          customerPaymentMethodId: method.id,
+        };
+      }
+    }
+
+    return null;
   }
 
-  // 3. Fallback: provider code resolution (only when no customer payment method was specified)
-  if (!customerPaymentMethodId && !paymentMethodCode) {
-    const prov = normalizeProvider(fallbackProvider);
-    if (prov) {
-      const { data: src } = await supabaseServer.from('payment_sources').select('*').eq('code', prov).eq('enabled', true).maybeSingle();
-      if (src) {
-        const isDirectlyAssigned = activeAssignedSourceIds.has(src.id);
-        const isLegacyAssigned = activeDeviceList.some((d: any) =>
-          (src.code === 'vf_cash' && d.vf_cash_enabled) ||
-          (src.code === 'bank_alahly' && d.bank_alahly_enabled)
-        );
-        if (isDirectlyAssigned || isLegacyAssigned) {
-          return { source: src, provider: prov, customerPaymentMethodId: null };
-        }
-      } else {
-        const isLegacyAssigned = activeDeviceList.some((d: any) =>
-          (prov === 'vf_cash' && d.vf_cash_enabled) ||
-          (prov === 'bank_alahly' && d.bank_alahly_enabled)
-        );
-        if (isLegacyAssigned) {
-          return { source: null, provider: prov, customerPaymentMethodId: null };
-        }
+  // 2. Only if no customer payment method was supplied: handle explicit paymentSourceId
+  if (paymentSourceId) {
+    const { data: src } = await supabaseServer.from('payment_sources').select('*').eq('id', paymentSourceId).maybeSingle();
+    if (src && src.enabled) {
+      const isAssigned = activeAssignedSourceIds.has(src.id) || activeDeviceList.some((d: any) =>
+        (src.code === 'vf_cash' && d.vf_cash_enabled) || (src.code === 'bank_alahly' && d.bank_alahly_enabled)
+      );
+      if (isAssigned) {
+        return { source: src, provider: normalizeProvider(src.code) || src.code, customerPaymentMethodId: null };
+      }
+    }
+    return null;
+  }
+
+  // 3. Fallback: provider code resolution (only when neither customer payment method nor paymentSourceId was specified)
+  const prov = normalizeProvider(fallbackProvider);
+  if (prov) {
+    const { data: src } = await supabaseServer.from('payment_sources').select('*').eq('code', prov).eq('enabled', true).maybeSingle();
+    if (src) {
+      const isDirectlyAssigned = activeAssignedSourceIds.has(src.id);
+      const isLegacyAssigned = activeDeviceList.some((d: any) =>
+        (src.code === 'vf_cash' && d.vf_cash_enabled) ||
+        (src.code === 'bank_alahly' && d.bank_alahly_enabled)
+      );
+      if (isDirectlyAssigned || isLegacyAssigned) {
+        return { source: src, provider: prov, customerPaymentMethodId: null };
+      }
+    } else {
+      const isLegacyAssigned = activeDeviceList.some((d: any) =>
+        (prov === 'vf_cash' && d.vf_cash_enabled) ||
+        (prov === 'bank_alahly' && d.bank_alahly_enabled)
+      );
+      if (isLegacyAssigned) {
+        return { source: null, provider: prov, customerPaymentMethodId: null };
       }
     }
   }
@@ -1869,6 +1891,33 @@ paymentRouter.get('/payment-bridge/health', (_req: Request, res: Response) => {
   return res.json({ status: 'ok', version: 'phase2', serverTime: Date.now() });
 });
 
+function isMissingV3ColumnError(err: any): boolean {
+  if (!err) return false;
+  const code = String(err.code || '');
+  const message = String(err.message || '').toLowerCase();
+  const details = String(err.details || '').toLowerCase();
+  const hint = String(err.hint || '').toLowerCase();
+
+  const isColumnErrorCode = code === 'PGRST204' || code === '42703';
+  const mentionsV3Columns =
+    message.includes('payment_source_id') ||
+    message.includes('account_identifier') ||
+    details.includes('payment_source_id') ||
+    details.includes('account_identifier') ||
+    hint.includes('payment_source_id') ||
+    hint.includes('account_identifier');
+
+  if (mentionsV3Columns) {
+    return true;
+  }
+
+  if (isColumnErrorCode && (message.includes('column') || details.includes('column') || message.includes('schema cache'))) {
+    return true;
+  }
+
+  return false;
+}
+
 paymentRouter.post('/payment-bridge/events', verifyBridgeRequest, async (req: RawBodyRequest, res: Response) => {
   const device = (req as any).paymentDevice;
   const reportedDeviceId = String(req.body?.deviceId || '').trim();
@@ -1886,38 +1935,83 @@ paymentRouter.post('/payment-bridge/events', verifyBridgeRequest, async (req: Ra
     return res.status(400).json({ error: 'Invalid payment event payload' });
   }
 
-  // 1. Resolve payment source first if paymentSourceId is provided
   let resolvedSource: any = null;
+  let provider: string = '';
+
+  // 1. If paymentSourceId is supplied: validate existence, enablement, and device assignment
   if (rawPaymentSourceId) {
-    const { data: src } = await supabaseServer
+    const { data: src, error: srcErr } = await supabaseServer
       .from('payment_sources')
       .select('*')
       .eq('id', rawPaymentSourceId)
       .maybeSingle();
+
+    if (srcErr || !src) {
+      return res.status(400).json({
+        error: 'invalid_payment_source',
+        message: 'Specified paymentSourceId does not exist or is invalid',
+      });
+    }
+
+    if (!src.enabled) {
+      return res.status(400).json({
+        error: 'payment_source_disabled',
+        message: 'Specified payment source is disabled',
+      });
+    }
+
+    // Verify source is assigned and enabled for the authenticated payment device
+    let isDirectlyAssigned = false;
+    try {
+      const { data: devSource, error: devSourceErr } = await supabaseServer
+        .from('payment_device_sources')
+        .select('enabled')
+        .eq('device_id', device.id)
+        .eq('payment_source_id', src.id)
+        .maybeSingle();
+      if (!devSourceErr && devSource && devSource.enabled) {
+        isDirectlyAssigned = true;
+      }
+    } catch (_err) {
+      // Handled if payment_device_sources is not yet available
+    }
+
+    const isLegacyAssigned =
+      (src.code === 'vf_cash' && Boolean(device.vf_cash_enabled)) ||
+      (src.code === 'bank_alahly' && Boolean(device.bank_alahly_enabled));
+
+    if (!isDirectlyAssigned && !isLegacyAssigned) {
+      return res.status(400).json({
+        error: 'payment_source_not_assigned',
+        message: 'Payment source is not assigned or enabled for this device',
+      });
+    }
+
     resolvedSource = src;
-  }
+    provider = normalizeProvider(src.code) || src.code;
+  } else {
+    // 2. Legacy provider fallback remains temporarily supported
+    provider = normalizeProvider(rawProvider);
+    if (!provider) {
+      return res.status(400).json({
+        error: 'missing_provider',
+        message: 'Either a valid paymentSourceId or a supported provider is required',
+      });
+    }
 
-  // 2. If not resolved by paymentSourceId, try resolving by legacy provider code
-  let provider = normalizeProvider(rawProvider);
-  if (!resolvedSource && provider) {
-    const { data: src } = await supabaseServer
-      .from('payment_sources')
-      .select('*')
-      .eq('code', provider)
-      .maybeSingle();
-    resolvedSource = src;
-  }
-
-  // 3. Derive provider/source code from the resolved source
-  if (!provider && resolvedSource) {
-    provider = normalizeProvider(resolvedSource.code) || resolvedSource.code;
-  }
-
-  // 4. Only reject when neither a valid paymentSourceId nor a usable legacy provider exists
-  if (!resolvedSource && !provider) {
-    return res.status(400).json({
-      error: 'Either a valid paymentSourceId or a supported provider is required',
-    });
+    try {
+      const { data: src } = await supabaseServer
+        .from('payment_sources')
+        .select('*')
+        .eq('code', provider)
+        .eq('enabled', true)
+        .maybeSingle();
+      if (src) {
+        resolvedSource = src;
+      }
+    } catch (_err) {
+      // Table may not exist pre-migration
+    }
   }
 
   const { data: duplicate, error: duplicateError } = await supabaseServer
@@ -1944,7 +2038,7 @@ paymentRouter.post('/payment-bridge/events', verifyBridgeRequest, async (req: Ra
   const receivedAmount = Math.round((amountMinor / 100) * 100) / 100;
   const payerPhone = normalizePhone(req.body?.payerPhone);
 
-  const eventInsert = {
+  const eventInsert: Record<string, any> = {
     event_id: eventId,
     device_id: device.id,
     reported_device_id: reportedDeviceId,
@@ -1970,12 +2064,36 @@ paymentRouter.post('/payment-bridge/events', verifyBridgeRequest, async (req: Ra
     match_status: 'received',
   };
 
-  const { data: eventRow, error: insertError } = await supabaseServer
+  let eventRow: any = null;
+  const { data: v3EventRow, error: insertError } = await supabaseServer
     .from('payment_bridge_events')
     .insert(eventInsert)
     .select('*')
     .single();
-  if (insertError) return res.status(503).json({ error: 'Could not store payment event' });
+
+  if (insertError) {
+    if (isMissingV3ColumnError(insertError)) {
+      // Missing V3 columns (pre-migration). Retry with legacy event columns only.
+      const { payment_source_id, account_identifier, ...legacyEventInsert } = eventInsert;
+      const { data: legacyRow, error: legacyError } = await supabaseServer
+        .from('payment_bridge_events')
+        .insert(legacyEventInsert)
+        .select('*')
+        .single();
+
+      if (legacyError) {
+        console.error('[PaymentBridge] Failed to store payment event on legacy retry:', legacyError);
+        return res.status(503).json({ error: 'Could not store payment event' });
+      }
+      eventRow = legacyRow;
+    } else {
+      // Unrelated database error - do NOT hide
+      console.error('[PaymentBridge] Failed to store payment event:', insertError);
+      return res.status(503).json({ error: 'Could not store payment event' });
+    }
+  } else {
+    eventRow = v3EventRow;
+  }
 
   await supabaseServer
     .from('payment_devices')
