@@ -666,10 +666,9 @@ paymentRouter.post(
       destination: req.body?.destination ? String(req.body.destination).trim() : null,
       enabled: req.body?.enabled !== false,
       parser_type: parserType,
-      source_package: req.body?.sourcePackage ? String(req.body.sourcePackage).trim() : null,
-      source_packages: Array.isArray(req.body?.sourcePackages)
-        ? req.body.sourcePackages.map((v: unknown) => String(v).trim()).filter(Boolean)
-        : (req.body?.sourcePackage ? [String(req.body.sourcePackage).trim()] : []),
+      source_package: Array.isArray(req.body?.sourcePackages) && req.body.sourcePackages.length > 0
+        ? String(req.body.sourcePackages[0]).trim()
+        : (req.body?.sourcePackage ? String(req.body.sourcePackage).trim() : null),
       source_sender: req.body?.sourceSender ? String(req.body.sourceSender).trim() : null,
       title_contains: req.body?.titleContains ? String(req.body.titleContains).trim() : null,
       body_contains: req.body?.bodyContains ? String(req.body.bodyContains).trim() : null,
@@ -725,9 +724,10 @@ paymentRouter.patch(
     }
     if (req.body?.sourcePackage !== undefined) updates.source_package = req.body.sourcePackage ? String(req.body.sourcePackage).trim() : null;
     if (req.body?.sourcePackages !== undefined) {
-      updates.source_packages = Array.isArray(req.body.sourcePackages)
+      const packages = Array.isArray(req.body.sourcePackages)
         ? req.body.sourcePackages.map((v: unknown) => String(v).trim()).filter(Boolean)
         : [];
+      updates.source_package = packages[0] || null;
     }
     if (req.body?.sourceSender !== undefined) updates.source_sender = req.body.sourceSender ? String(req.body.sourceSender).trim() : null;
     if (req.body?.titleContains !== undefined) updates.title_contains = req.body.titleContains ? String(req.body.titleContains).trim() : null;
@@ -806,7 +806,7 @@ paymentRouter.delete(
 paymentRouter.get('/admin/payments/devices/:id/sources', requireAuth, async (req: AuthenticatedRequest, res: Response) => {
   const { data, error } = await supabaseServer
     .from('payment_device_sources')
-    .select('id,device_id,payment_source_id,destination,destination_label,enabled,created_at,payment_sources(*)')
+    .select('*,payment_sources(*)')
     .eq('device_id', req.params.id);
   if (error) return res.status(503).json({ error: 'تعذر تحميل مصادر الجهاز' });
   return res.json(data || []);
@@ -859,6 +859,22 @@ paymentRouter.put(
       const invalidIds = sourceIds.filter((id) => !validIdSet.has(id));
       if (invalidIds.length > 0) {
         return res.status(400).json({ error: `بعض مصادر الدفع المحددة غير موجودة: ${invalidIds.join(', ')}` });
+      }
+    }
+
+    const wantsPerSourceDestination = uniqueAssignments.some(
+      (assignment) => assignment.destination || assignment.destinationLabel
+    );
+    if (wantsPerSourceDestination) {
+      const { error: destinationSchemaError } = await supabaseServer
+        .from('payment_device_sources')
+        .select('destination,destination_label')
+        .limit(1);
+      if (destinationSchemaError) {
+        return res.status(409).json({
+          error: 'payment_v3_migration_required',
+          message: 'حفظ رقم مختلف لكل مصدر على الجهاز يحتاج تشغيل Migration V3 أولاً.',
+        });
       }
     }
 
@@ -1235,7 +1251,7 @@ paymentRouter.get('/admin/payments/overview', requireAuth, async (_req: Authenti
       .order('created_at', { ascending: true }),
     supabaseServer
       .from('payment_device_sources')
-      .select('device_id,payment_source_id,destination,destination_label,enabled,payment_sources(*)'),
+      .select('*,payment_sources(*)'),
     supabaseServer
       .from('payment_sources')
       .select('*')
@@ -1266,7 +1282,16 @@ paymentRouter.get('/admin/payments/overview', requireAuth, async (_req: Authenti
     getAdminPaymentSettings(),
   ]);
 
-  const failed = [devicesResult, reviewsResult, sessionsResult].find((r) => r.error);
+  const failed = [
+    devicesResult,
+    deviceSourcesResult,
+    sourcesResult,
+    customerMethodsResult,
+    customerMethodSourcesResult,
+    reviewsResult,
+    sessionsResult,
+    problemOrdersRes,
+  ].find((r) => r.error);
   if (failed?.error) return res.status(503).json({ error: 'تعذر تحميل مركز مراجعة المدفوعات' });
 
   const now = Date.now();
