@@ -89,15 +89,70 @@ paymentIntegrationConfigRouter.post('/orders', async (req: Request, res: Respons
   return next();
 });
 
-paymentIntegrationConfigRouter.get('/payments/config', requireIntegrationKey, async (_req: Request, res: Response) => {
-  const { data: settings, error } = await supabaseServer
+async function getStorePaymentSettings(): Promise<{
+  default_payment_policy: string;
+  payment_session_timeout_seconds: number;
+  payment_amount_tolerance: number;
+  deposit_required: boolean;
+  deposit_type: 'fixed' | 'percentage';
+  deposit_value: number;
+  minimum_deposit: number;
+}> {
+  // 1. Read legacy-safe columns only (guaranteed to exist before migration)
+  const { data: legacy } = await supabaseServer
     .from('store_settings')
-    .select('default_payment_policy,payment_session_timeout_seconds,payment_amount_tolerance,deposit_required,deposit_type,deposit_value,minimum_deposit')
+    .select('default_payment_policy,payment_session_timeout_seconds,payment_amount_tolerance')
     .eq('id', 1)
     .maybeSingle();
 
-  if (error) return res.status(503).json({ error: 'Payment settings unavailable' });
-  if (!settings) return res.status(404).json({ error: 'Payment settings not found' });
+  const defaultPolicy = legacy?.default_payment_policy || 'cod_allowed';
+  const timeoutSeconds = Number(legacy?.payment_session_timeout_seconds || 120);
+  const tolerance = Number(legacy?.payment_amount_tolerance || 10);
+
+  let depositRequired = defaultPolicy === 'deposit_required';
+  let depositType: 'fixed' | 'percentage' = 'fixed';
+  let depositValue = 100;
+  let minimumDeposit = 50;
+
+  // 2. Attempt V3 fields separately or gracefully detect missing columns
+  try {
+    const { data: v3, error: v3Error } = await supabaseServer
+      .from('store_settings')
+      .select('deposit_required,deposit_type,deposit_value,minimum_deposit')
+      .eq('id', 1)
+      .maybeSingle();
+
+    if (!v3Error && v3) {
+      if (v3.deposit_required !== null && v3.deposit_required !== undefined) {
+        depositRequired = Boolean(v3.deposit_required);
+      }
+      if (v3.deposit_type === 'fixed' || v3.deposit_type === 'percentage') {
+        depositType = v3.deposit_type;
+      }
+      if (v3.deposit_value !== null && v3.deposit_value !== undefined) {
+        depositValue = Number(v3.deposit_value);
+      }
+      if (v3.minimum_deposit !== null && v3.minimum_deposit !== undefined) {
+        minimumDeposit = Number(v3.minimum_deposit);
+      }
+    }
+  } catch (_err) {
+    // V3 columns not available yet; proceed with legacy settings
+  }
+
+  return {
+    default_payment_policy: defaultPolicy,
+    payment_session_timeout_seconds: timeoutSeconds,
+    payment_amount_tolerance: tolerance,
+    deposit_required: depositRequired,
+    deposit_type: depositType,
+    deposit_value: depositValue,
+    minimum_deposit: minimumDeposit,
+  };
+}
+
+paymentIntegrationConfigRouter.get('/payments/config', requireIntegrationKey, async (_req: Request, res: Response) => {
+  const settings = await getStorePaymentSettings();
 
   const [devicesRes, methodsRes, methodSourcesRes, deviceSourcesRes] = await Promise.all([
     supabaseServer
@@ -243,11 +298,7 @@ paymentIntegrationConfigRouter.post('/payments/calculate-deposit', requireIntegr
   const customerPhone = req.body?.customerPhone;
   const customerId = req.body?.customerId;
 
-  const { data: settings } = await supabaseServer
-    .from('store_settings')
-    .select('default_payment_policy,deposit_required,deposit_type,deposit_value,minimum_deposit')
-    .eq('id', 1)
-    .maybeSingle();
+  const settings = await getStorePaymentSettings();
 
   let effectiveOverride: 'inherit' | 'allow' | 'deny' = 'inherit';
 

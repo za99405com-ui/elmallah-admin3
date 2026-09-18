@@ -183,36 +183,29 @@ paymentBridgeControlRouter.post('/payment-bridge/heartbeat', verifyPaymentBridge
   return res.json(result);
 });
 
-// Explicit signed config mutation. admin3 persists the requested change first and
-// returns the authoritative state; subsequent heartbeats only read this state.
+// Device-side mutation of vfCashEnabled/bankAlAhlyEnabled is deprecated and disabled.
+// Source assignment and provider enablement are authoritative in Admin3.
+// Device requests return the authoritative state from Admin3 without mutating it.
 paymentBridgeControlRouter.post('/payment-bridge/config', verifyPaymentBridge, async (req: RawBridgeRequest, res: Response) => {
   const device = (req as any).paymentDevice;
-  const updates: Record<string, unknown> = { updated_at: new Date().toISOString() };
 
-  if (req.body?.vfCashEnabled !== undefined) updates.vf_cash_enabled = Boolean(req.body.vfCashEnabled);
-  if (req.body?.bankAlAhlyEnabled !== undefined) updates.bank_alahly_enabled = Boolean(req.body.bankAlAhlyEnabled);
-
-  if (Object.keys(updates).length === 1) {
-    return res.status(400).json({ error: 'No provider configuration supplied' });
-  }
-
+  // Retrieve current authoritative state from database without overwriting with device's payload
   const { data, error } = await supabaseServer
     .from('payment_devices')
-    .update(updates)
-    .eq('id', device.id)
     .select('device_id,vf_cash_enabled,bank_alahly_enabled,is_busy,busy_session_id')
+    .eq('id', device.id)
     .single();
 
-  if (error) return res.status(503).json({ error: 'Device configuration could not be stored' });
+  if (error || !data) return res.status(503).json({ error: 'Device configuration could not be read' });
 
   const result = {
     status: 'ok',
+    message: 'Configuration is managed authoritatively by Admin3. Device-side mutations are ignored.',
     deviceId: data.device_id,
     vfCashEnabled: Boolean(data.vf_cash_enabled),
     bankAlAhlyEnabled: Boolean(data.bank_alahly_enabled),
     busy: Boolean(data.is_busy),
     busySessionId: data.busy_session_id || null,
   };
-  broadcastRealtimeEvent('payment_device_updated', result);
   return res.json(result);
 });

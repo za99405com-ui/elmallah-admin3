@@ -371,23 +371,69 @@ async function markSessionPaid(
 // ==============================================================================
 // Admin API
 // ==============================================================================
-paymentRouter.get('/admin/payments/settings', requireAuth, async (_req: AuthenticatedRequest, res: Response) => {
-  const { data, error } = await supabaseServer
+async function getAdminPaymentSettings(): Promise<{
+  defaultPaymentPolicy: string;
+  sessionTimeoutSeconds: number;
+  amountTolerance: number;
+  depositRequired: boolean;
+  depositType: 'fixed' | 'percentage';
+  depositValue: number;
+  minimumDeposit: number;
+}> {
+  const { data: legacy } = await supabaseServer
     .from('store_settings')
-    .select('default_payment_policy,payment_session_timeout_seconds,payment_amount_tolerance,deposit_required,deposit_type,deposit_value,minimum_deposit')
+    .select('default_payment_policy,payment_session_timeout_seconds,payment_amount_tolerance')
     .eq('id', 1)
     .maybeSingle();
-  if (error) return res.status(503).json({ error: 'تعذر تحميل إعدادات الدفع' });
-  if (!data) return res.status(404).json({ error: 'إعدادات المتجر غير موجودة' });
-  return res.json({
-    defaultPaymentPolicy: data.default_payment_policy || 'cod_allowed',
-    sessionTimeoutSeconds: Number(data.payment_session_timeout_seconds || 120),
-    amountTolerance: Number(data.payment_amount_tolerance || 10),
-    depositRequired: Boolean(data.deposit_required || data.default_payment_policy === 'deposit_required'),
-    depositType: data.deposit_type || 'fixed',
-    depositValue: Number(data.deposit_value || 100),
-    minimumDeposit: Number(data.minimum_deposit || 50),
-  });
+
+  const defaultPolicy = legacy?.default_payment_policy || 'cod_allowed';
+  const timeoutSeconds = Number(legacy?.payment_session_timeout_seconds || 120);
+  const tolerance = Number(legacy?.payment_amount_tolerance || 10);
+
+  let depositRequired = defaultPolicy === 'deposit_required';
+  let depositType: 'fixed' | 'percentage' = 'fixed';
+  let depositValue = 100;
+  let minimumDeposit = 50;
+
+  try {
+    const { data: v3, error: v3Error } = await supabaseServer
+      .from('store_settings')
+      .select('deposit_required,deposit_type,deposit_value,minimum_deposit')
+      .eq('id', 1)
+      .maybeSingle();
+
+    if (!v3Error && v3) {
+      if (v3.deposit_required !== null && v3.deposit_required !== undefined) {
+        depositRequired = Boolean(v3.deposit_required);
+      }
+      if (v3.deposit_type === 'fixed' || v3.deposit_type === 'percentage') {
+        depositType = v3.deposit_type;
+      }
+      if (v3.deposit_value !== null && v3.deposit_value !== undefined) {
+        depositValue = Number(v3.deposit_value);
+      }
+      if (v3.minimum_deposit !== null && v3.minimum_deposit !== undefined) {
+        minimumDeposit = Number(v3.minimum_deposit);
+      }
+    }
+  } catch (_err) {
+    // V3 columns not available yet; proceed with legacy defaults
+  }
+
+  return {
+    defaultPaymentPolicy: defaultPolicy,
+    sessionTimeoutSeconds: timeoutSeconds,
+    amountTolerance: tolerance,
+    depositRequired,
+    depositType,
+    depositValue,
+    minimumDeposit,
+  };
+}
+
+paymentRouter.get('/admin/payments/settings', requireAuth, async (_req: AuthenticatedRequest, res: Response) => {
+  const settings = await getAdminPaymentSettings();
+  return res.json(settings);
 });
 
 paymentRouter.put(
@@ -417,11 +463,20 @@ paymentRouter.put(
     if (tolerance !== undefined && (!Number.isFinite(tolerance) || tolerance < 0)) {
       return res.status(400).json({ error: 'هامش مطابقة المبلغ غير صالح' });
     }
-    if (depositValue !== undefined && (!Number.isFinite(depositValue) || depositValue < 0)) {
-      return res.status(400).json({ error: 'قيمة العربون غير صالحة' });
+
+    const currentSettings = await getAdminPaymentSettings();
+    const effectiveDepositType = depositType || currentSettings.depositType;
+
+    if (depositValue !== undefined) {
+      if (!Number.isFinite(depositValue) || depositValue < 0) {
+        return res.status(400).json({ error: 'قيمة العربون غير صالحة' });
+      }
+      if (effectiveDepositType === 'percentage' && (depositValue < 0 || depositValue > 100)) {
+        return res.status(400).json({ error: 'نسبة العربون يجب أن تكون بين 0% و100%' });
+      }
     }
     if (minimumDeposit !== undefined && (!Number.isFinite(minimumDeposit) || minimumDeposit < 0)) {
-      return res.status(400).json({ error: 'الحد الأدنى للعربون غير صالح' });
+      return res.status(400).json({ error: 'الحد الأدنى للعربون يجب أن يكون أكبر من أو يساوي الصفر' });
     }
 
     const updates: Record<string, unknown> = {
@@ -439,23 +494,44 @@ paymentRouter.put(
     if (minimumDeposit !== undefined) updates.minimum_deposit = minimumDeposit;
 
     const { data: existing } = await supabaseServer.from('store_settings').select('*').eq('id', 1).maybeSingle();
-    const { data, error } = await supabaseServer
+    let savedData: any = null;
+
+    const { data: updatedV3, error: v3Error } = await supabaseServer
       .from('store_settings')
       .update(updates)
       .eq('id', 1)
-      .select('default_payment_policy,payment_session_timeout_seconds,payment_amount_tolerance,deposit_required,deposit_type,deposit_value,minimum_deposit')
-      .single();
-    if (error) return res.status(503).json({ error: 'تعذر حفظ إعدادات الدفع' });
+      .select('*')
+      .maybeSingle();
 
-    logAuditAction(req.admin, 'update_payment_settings', 'store_settings', '1', existing, data, req.ip);
+    if (v3Error) {
+      // If error due to V3 columns missing before migration, fallback to updating legacy fields only
+      const legacyUpdates: Record<string, unknown> = {};
+      if (updates.default_payment_policy) legacyUpdates.default_payment_policy = updates.default_payment_policy;
+      if (updates.payment_session_timeout_seconds) legacyUpdates.payment_session_timeout_seconds = updates.payment_session_timeout_seconds;
+      if (updates.payment_amount_tolerance !== undefined) legacyUpdates.payment_amount_tolerance = updates.payment_amount_tolerance;
+      legacyUpdates.updated_at = new Date().toISOString();
+
+      const { data: updatedLegacy, error: legacyErr } = await supabaseServer
+        .from('store_settings')
+        .update(legacyUpdates)
+        .eq('id', 1)
+        .select('*')
+        .single();
+      if (legacyErr) return res.status(503).json({ error: 'تعذر حفظ إعدادات الدفع' });
+      savedData = updatedLegacy;
+    } else {
+      savedData = updatedV3;
+    }
+
+    logAuditAction(req.admin, 'update_payment_settings', 'store_settings', '1', existing, savedData, req.ip);
     const result = {
-      defaultPaymentPolicy: data.default_payment_policy,
-      sessionTimeoutSeconds: Number(data.payment_session_timeout_seconds),
-      amountTolerance: Number(data.payment_amount_tolerance),
-      depositRequired: Boolean(data.deposit_required),
-      depositType: data.deposit_type,
-      depositValue: Number(data.deposit_value),
-      minimumDeposit: Number(data.minimum_deposit),
+      defaultPaymentPolicy: savedData.default_payment_policy || policy || currentSettings.defaultPaymentPolicy,
+      sessionTimeoutSeconds: Number(savedData.payment_session_timeout_seconds || timeout || currentSettings.sessionTimeoutSeconds),
+      amountTolerance: Number(savedData.payment_amount_tolerance ?? tolerance ?? currentSettings.amountTolerance),
+      depositRequired: Boolean(savedData.deposit_required ?? depositRequired ?? currentSettings.depositRequired),
+      depositType: savedData.deposit_type || depositType || currentSettings.depositType,
+      depositValue: Number(savedData.deposit_value ?? depositValue ?? currentSettings.depositValue),
+      minimumDeposit: Number(savedData.minimum_deposit ?? minimumDeposit ?? currentSettings.minimumDeposit),
     };
     broadcastRealtimeEvent('payment_settings_updated', result);
     return res.json(result);
@@ -1083,8 +1159,8 @@ paymentRouter.get('/admin/payments/overview', requireAuth, async (_req: Authenti
     customerMethodsResult,
     reviewsResult,
     sessionsResult,
-    settingsResult,
     problemOrdersRes,
+    settings,
   ] = await Promise.all([
     supabaseServer
       .from('payment_devices')
@@ -1112,19 +1188,15 @@ paymentRouter.get('/admin/payments/overview', requireAuth, async (_req: Authenti
       .order('created_at', { ascending: false })
       .limit(100),
     supabaseServer
-      .from('store_settings')
-      .select('default_payment_policy,payment_session_timeout_seconds,payment_amount_tolerance,deposit_required,deposit_type,deposit_value,minimum_deposit')
-      .eq('id', 1)
-      .maybeSingle(),
-    supabaseServer
       .from('orders')
       .select('id,order_number,status,deposit_status,deposit_amount,deposit_paid,total_amount,payment_mode,deposit_method,customer_name,customer_phone,created_at')
       .or('deposit_status.eq.pending,deposit_status.eq.rejected')
       .order('created_at', { ascending: false })
       .limit(50),
+    getAdminPaymentSettings(),
   ]);
 
-  const failed = [devicesResult, reviewsResult, sessionsResult, settingsResult].find((r) => r.error);
+  const failed = [devicesResult, reviewsResult, sessionsResult].find((r) => r.error);
   if (failed?.error) return res.status(503).json({ error: 'تعذر تحميل مركز مراجعة المدفوعات' });
 
   const now = Date.now();
@@ -1216,15 +1288,7 @@ paymentRouter.get('/admin/payments/overview', requireAuth, async (_req: Authenti
     reviews: reviewsResult.data || [],
     sessions: (sessionsResult.data || []).map((s: any) => mapSession(s)),
     problemOrders,
-    settings: {
-      defaultPaymentPolicy: settingsResult.data?.default_payment_policy || 'cod_allowed',
-      sessionTimeoutSeconds: Number(settingsResult.data?.payment_session_timeout_seconds || 120),
-      amountTolerance: Number(settingsResult.data?.payment_amount_tolerance || 10),
-      depositRequired: Boolean(settingsResult.data?.deposit_required || settingsResult.data?.default_payment_policy === 'deposit_required'),
-      depositType: settingsResult.data?.deposit_type || 'fixed',
-      depositValue: Number(settingsResult.data?.deposit_value || 100),
-      minimumDeposit: Number(settingsResult.data?.minimum_deposit || 50),
-    },
+    settings,
   });
 });
 
@@ -1395,7 +1459,12 @@ async function findEligibleSourceForMethod(
   paymentMethodCode?: string | null,
   paymentSourceId?: string | null,
   fallbackProvider?: string | null
-): Promise<{ source: any; provider: PaymentProvider; customerPaymentMethodId: string | null } | null> {
+): Promise<
+  | { source: any; provider: PaymentProvider; customerPaymentMethodId: string | null }
+  | { notFound: true; customerPaymentMethodId: string | null }
+  | { disabled: true; method: any; customerPaymentMethodId: string | null }
+  | null
+> {
   // Query active, non-busy devices:
   // - online = true, is_enabled = true
   // - internet_connected = true, app_running = true, notification_listener_enabled = true
@@ -1457,6 +1526,17 @@ async function findEligibleSourceForMethod(
     method = data;
   }
 
+  // If customerPaymentMethodId or paymentMethodCode was requested:
+  // Reject non-existent or disabled payment methods immediately (must never create a session)
+  if (customerPaymentMethodId || paymentMethodCode) {
+    if (!method) {
+      return { notFound: true, customerPaymentMethodId: customerPaymentMethodId || null };
+    }
+    if (!method.enabled) {
+      return { disabled: true, method, customerPaymentMethodId: method.id };
+    }
+  }
+
   if (method) {
     const { data: mappedSources } = await supabaseServer
       .from('customer_payment_method_sources')
@@ -1495,26 +1575,28 @@ async function findEligibleSourceForMethod(
     }
   }
 
-  // 3. Fallback: provider code resolution
-  const prov = normalizeProvider(paymentMethodCode || fallbackProvider);
-  if (prov) {
-    const { data: src } = await supabaseServer.from('payment_sources').select('*').eq('code', prov).eq('enabled', true).maybeSingle();
-    if (src) {
-      const isDirectlyAssigned = activeAssignedSourceIds.has(src.id);
-      const isLegacyAssigned = activeDeviceList.some((d: any) =>
-        (src.code === 'vf_cash' && d.vf_cash_enabled) ||
-        (src.code === 'bank_alahly' && d.bank_alahly_enabled)
-      );
-      if (isDirectlyAssigned || isLegacyAssigned) {
-        return { source: src, provider: prov, customerPaymentMethodId: method?.id || null };
-      }
-    } else {
-      const isLegacyAssigned = activeDeviceList.some((d: any) =>
-        (prov === 'vf_cash' && d.vf_cash_enabled) ||
-        (prov === 'bank_alahly' && d.bank_alahly_enabled)
-      );
-      if (isLegacyAssigned) {
-        return { source: null, provider: prov, customerPaymentMethodId: method?.id || null };
+  // 3. Fallback: provider code resolution (only when no customer payment method was specified)
+  if (!customerPaymentMethodId && !paymentMethodCode) {
+    const prov = normalizeProvider(fallbackProvider);
+    if (prov) {
+      const { data: src } = await supabaseServer.from('payment_sources').select('*').eq('code', prov).eq('enabled', true).maybeSingle();
+      if (src) {
+        const isDirectlyAssigned = activeAssignedSourceIds.has(src.id);
+        const isLegacyAssigned = activeDeviceList.some((d: any) =>
+          (src.code === 'vf_cash' && d.vf_cash_enabled) ||
+          (src.code === 'bank_alahly' && d.bank_alahly_enabled)
+        );
+        if (isDirectlyAssigned || isLegacyAssigned) {
+          return { source: src, provider: prov, customerPaymentMethodId: null };
+        }
+      } else {
+        const isLegacyAssigned = activeDeviceList.some((d: any) =>
+          (prov === 'vf_cash' && d.vf_cash_enabled) ||
+          (prov === 'bank_alahly' && d.bank_alahly_enabled)
+        );
+        if (isLegacyAssigned) {
+          return { source: null, provider: prov, customerPaymentMethodId: null };
+        }
       }
     }
   }
@@ -1550,10 +1632,26 @@ paymentRouter.post('/payments/sessions', requireIntegrationKey, async (req: Requ
   if (order.status === 'cancelled') return res.status(409).json({ error: 'Cancelled order cannot start payment' });
 
   // Resolve eligible payment source and online non-busy device (FIX 3, FIX 4, FIX 10, FIX 18)
-  const resolved = await findEligibleSourceForMethod(customerPaymentMethodId, paymentMethodCode, sourceId, rawProvider);
-  if (!resolved) {
+  const resolved: any = await findEligibleSourceForMethod(customerPaymentMethodId, paymentMethodCode, sourceId, rawProvider);
+  if (resolved?.disabled) {
+    return res.status(400).json({
+      error: 'payment_method_disabled',
+      orderId,
+      message: 'وسيلة الدفع المحددة معطلة حالياً ولا يمكن إنشاء جلسة دفع لها.',
+    });
+  }
+  if (resolved?.notFound) {
+    return res.status(400).json({
+      error: 'invalid_payment_method',
+      orderId,
+      message: 'وسيلة الدفع المحددة غير صالحة أو غير موجودة.',
+    });
+  }
+  if (!resolved || (!resolved.source && !resolved.provider)) {
     return res.status(503).json({
       error: 'no_payment_device_available',
+      orderId,
+      retryable: true,
       message: 'لا يوجد جهاز دفع أو محفظة متاحين لاستقبال الدفع حالياً. يرجى المحاولة بعد قليل أو اختيار وسيلة دفع أخرى.',
     });
   }
@@ -1619,6 +1717,8 @@ paymentRouter.post('/payments/sessions', requireIntegrationKey, async (req: Requ
     await supabaseServer.from('payment_sessions').delete().eq('id', sessionId);
     return res.status(503).json({
       error: 'no_payment_device_available',
+      orderId,
+      retryable: true,
       message: 'لا يوجد جهاز دفع أو محفظة متاحين لاستقبال الدفع حالياً. يرجى المحاولة بعد قليل أو اختيار وسيلة دفع أخرى.',
     });
   }
@@ -1769,40 +1869,6 @@ paymentRouter.get('/payment-bridge/health', (_req: Request, res: Response) => {
   return res.json({ status: 'ok', version: 'phase2', serverTime: Date.now() });
 });
 
-paymentRouter.post('/payment-bridge/heartbeat', verifyBridgeRequest, async (req: RawBodyRequest, res: Response) => {
-  const device = (req as any).paymentDevice;
-  const now = new Date().toISOString();
-  const { data, error } = await supabaseServer
-    .from('payment_devices')
-    .update({
-      online: true,
-      internet_connected: req.body?.internetConnected !== false,
-      app_running: req.body?.appRunning !== false,
-      notification_listener_enabled: Boolean(req.body?.notificationListenerEnabled),
-      vf_cash_enabled: Boolean(req.body?.vfCashEnabled),
-      bank_alahly_enabled: Boolean(req.body?.bankAlAhlyEnabled),
-      app_version: req.body?.appVersion ? String(req.body.appVersion) : null,
-      last_heartbeat_at: now,
-      updated_at: now,
-    })
-    .eq('id', device.id)
-    .select('device_id,is_busy,busy_session_id,last_heartbeat_at,vf_cash_enabled,bank_alahly_enabled')
-    .single();
-  if (error) return res.status(503).json({ error: 'Heartbeat could not be stored' });
-
-  const result = {
-    status: 'ok',
-    online: true,
-    busy: Boolean(data.is_busy),
-    busySessionId: data.busy_session_id || null,
-    vfCashEnabled: Boolean(data.vf_cash_enabled),
-    bankAlAhlyEnabled: Boolean(data.bank_alahly_enabled),
-    serverTime: Date.now(),
-  };
-  broadcastRealtimeEvent('payment_device_heartbeat', { deviceId: data.device_id, ...result });
-  return res.json(result);
-});
-
 paymentRouter.post('/payment-bridge/events', verifyBridgeRequest, async (req: RawBodyRequest, res: Response) => {
   const device = (req as any).paymentDevice;
   const reportedDeviceId = String(req.body?.deviceId || '').trim();
@@ -1811,11 +1877,47 @@ paymentRouter.post('/payment-bridge/events', verifyBridgeRequest, async (req: Ra
   }
 
   const eventId = String(req.body?.eventId || '').trim();
-  const provider = normalizeProvider(req.body?.provider);
+  const rawPaymentSourceId = req.body?.paymentSourceId ? String(req.body.paymentSourceId).trim() : null;
+  const rawProvider = req.body?.provider ? String(req.body.provider).trim() : '';
   const amountMinor = Number(req.body?.amountMinor);
   const capturedAtMs = Number(req.body?.capturedAt);
-  if (!eventId || !provider || !Number.isSafeInteger(amountMinor) || amountMinor <= 0 || !Number.isFinite(capturedAtMs)) {
+
+  if (!eventId || !Number.isSafeInteger(amountMinor) || amountMinor <= 0 || !Number.isFinite(capturedAtMs)) {
     return res.status(400).json({ error: 'Invalid payment event payload' });
+  }
+
+  // 1. Resolve payment source first if paymentSourceId is provided
+  let resolvedSource: any = null;
+  if (rawPaymentSourceId) {
+    const { data: src } = await supabaseServer
+      .from('payment_sources')
+      .select('*')
+      .eq('id', rawPaymentSourceId)
+      .maybeSingle();
+    resolvedSource = src;
+  }
+
+  // 2. If not resolved by paymentSourceId, try resolving by legacy provider code
+  let provider = normalizeProvider(rawProvider);
+  if (!resolvedSource && provider) {
+    const { data: src } = await supabaseServer
+      .from('payment_sources')
+      .select('*')
+      .eq('code', provider)
+      .maybeSingle();
+    resolvedSource = src;
+  }
+
+  // 3. Derive provider/source code from the resolved source
+  if (!provider && resolvedSource) {
+    provider = normalizeProvider(resolvedSource.code) || resolvedSource.code;
+  }
+
+  // 4. Only reject when neither a valid paymentSourceId nor a usable legacy provider exists
+  if (!resolvedSource && !provider) {
+    return res.status(400).json({
+      error: 'Either a valid paymentSourceId or a supported provider is required',
+    });
   }
 
   const { data: duplicate, error: duplicateError } = await supabaseServer
@@ -1841,25 +1943,6 @@ paymentRouter.post('/payment-bridge/events', verifyBridgeRequest, async (req: Ra
   const notificationPostedAt = notificationPostedAtMs ? new Date(notificationPostedAtMs) : null;
   const receivedAmount = Math.round((amountMinor / 100) * 100) / 100;
   const payerPhone = normalizePhone(req.body?.payerPhone);
-
-  // Resolve payment source if provided or by provider code
-  let resolvedSource: any = null;
-  if (req.body?.paymentSourceId) {
-    const { data: src } = await supabaseServer
-      .from('payment_sources')
-      .select('*')
-      .eq('id', req.body.paymentSourceId)
-      .maybeSingle();
-    resolvedSource = src;
-  }
-  if (!resolvedSource && provider) {
-    const { data: src } = await supabaseServer
-      .from('payment_sources')
-      .select('*')
-      .eq('code', provider)
-      .maybeSingle();
-    resolvedSource = src;
-  }
 
   const eventInsert = {
     event_id: eventId,

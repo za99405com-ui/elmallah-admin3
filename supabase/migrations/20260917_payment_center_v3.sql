@@ -28,7 +28,10 @@ BEGIN
     ) THEN
         ALTER TABLE public.store_settings
             ADD CONSTRAINT chk_store_deposit_value
-            CHECK (deposit_value >= 0);
+            CHECK (
+                (deposit_type = 'percentage' AND deposit_value >= 0 AND deposit_value <= 100) OR
+                (deposit_type = 'fixed' AND deposit_value >= 0)
+            );
     END IF;
 
     IF NOT EXISTS (
@@ -106,7 +109,7 @@ INSERT INTO public.payment_sources (
 (
     'instapay',
     'إنستاباي (InstaPay)',
-    true,
+    false,
     'instapay',
     'InstaPay',
     'regex',
@@ -118,7 +121,7 @@ INSERT INTO public.payment_sources (
 (
     'banque_misr',
     'بنك مصر (Banque Misr)',
-    true,
+    false,
     'bank_transfer',
     'BM',
     'regex',
@@ -223,7 +226,7 @@ VALUES
 (
     'instapay',
     'إنستاباي (InstaPay)',
-    true,
+    false,
     'instapay',
     'تحويل عبر تطبيق إنستاباي إلى عنوان الدفع اللحظي أو رقم الحساب',
     3
@@ -270,12 +273,6 @@ BEGIN
     IF v_c_insta IS NOT NULL AND v_s_insta IS NOT NULL THEN
         INSERT INTO public.customer_payment_method_sources (customer_payment_method_id, payment_source_id, is_primary)
         VALUES (v_c_insta, v_s_insta, true)
-        ON CONFLICT DO NOTHING;
-    END IF;
-
-    IF v_c_insta IS NOT NULL AND v_s_nbe IS NOT NULL THEN
-        INSERT INTO public.customer_payment_method_sources (customer_payment_method_id, payment_source_id, is_primary)
-        VALUES (v_c_insta, v_s_nbe, false)
         ON CONFLICT DO NOTHING;
     END IF;
 
