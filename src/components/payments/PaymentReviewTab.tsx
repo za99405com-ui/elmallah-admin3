@@ -51,7 +51,9 @@ interface PaymentSession {
   expectedAmount: number;
   status: string;
   paymentDestination?: string;
+  expectedPayerPhone?: string;
   createdAt?: string;
+  expiresAt?: string;
 }
 
 interface OverviewResponse {
@@ -101,6 +103,22 @@ const statusLabels: Record<string, string> = {
   cancelled: 'ملغاة',
 };
 
+const cairoDateTime = new Intl.DateTimeFormat('ar-EG', {
+  timeZone: 'Africa/Cairo',
+  year: 'numeric',
+  month: '2-digit',
+  day: '2-digit',
+  hour: '2-digit',
+  minute: '2-digit',
+  second: '2-digit',
+});
+
+function formatCairoDateTime(value?: string | null): string {
+  if (!value) return '—';
+  const date = new Date(value);
+  return Number.isNaN(date.getTime()) ? '—' : cairoDateTime.format(date);
+}
+
 export const PaymentReviewTab: React.FC<PaymentReviewTabProps> = ({ initialTab = 'problems' }) => {
   const [activeSubTab, setActiveSubTab] = useState<
     'problems' | 'reviews' | 'devices' | 'sources' | 'methods' | 'policy'
@@ -137,8 +155,18 @@ export const PaymentReviewTab: React.FC<PaymentReviewTabProps> = ({ initialTab =
 
   useEffect(() => {
     void loadAllData();
-    const timer = window.setInterval(() => void loadAllData(), 15_000);
-    return () => window.clearInterval(timer);
+
+    const refreshIfVisible = () => {
+      if (document.visibilityState === 'visible') void loadAllData();
+    };
+
+    const timer = window.setInterval(refreshIfVisible, 45_000);
+    document.addEventListener('visibilitychange', refreshIfVisible);
+
+    return () => {
+      window.clearInterval(timer);
+      document.removeEventListener('visibilitychange', refreshIfVisible);
+    };
   }, [loadAllData]);
 
   const resolveReview = async (
@@ -430,7 +458,7 @@ export const PaymentReviewTab: React.FC<PaymentReviewTabProps> = ({ initialTab =
                           )}
                         </div>
                         <div className="text-[10px] text-slate-400 mt-1">
-                          {new Date(review.created_at).toLocaleString('ar-EG')}
+                          {formatCairoDateTime(review.created_at)}
                         </div>
                       </div>
 
@@ -480,6 +508,9 @@ export const PaymentReviewTab: React.FC<PaymentReviewTabProps> = ({ initialTab =
                     <th className="p-3 text-right">الطلب</th>
                     <th className="p-3 text-right">المزود / المصدر</th>
                     <th className="p-3 text-right">المبلغ المطلوب</th>
+                    <th className="p-3 text-right">رقم المُحوِّل</th>
+                    <th className="p-3 text-right">بدأت</th>
+                    <th className="p-3 text-right">تنتهي</th>
                     <th className="p-3 text-right">الحالة</th>
                     <th className="p-3 text-right">وجهة الاستقبال</th>
                   </tr>
@@ -492,6 +523,11 @@ export const PaymentReviewTab: React.FC<PaymentReviewTabProps> = ({ initialTab =
                       </td>
                       <td className="p-3">{session.provider}</td>
                       <td className="p-3 font-bold">{session.expectedAmount.toFixed(2)} ج.م</td>
+                      <td dir="ltr" className="p-3 font-mono text-left">
+                        {session.expectedPayerPhone || '—'}
+                      </td>
+                      <td className="p-3 whitespace-nowrap">{formatCairoDateTime(session.createdAt)}</td>
+                      <td className="p-3 whitespace-nowrap">{formatCairoDateTime(session.expiresAt)}</td>
                       <td className="p-3">
                         <span
                           className={`inline-block px-2.5 py-0.5 rounded-full text-[10px] font-bold ${
@@ -512,7 +548,7 @@ export const PaymentReviewTab: React.FC<PaymentReviewTabProps> = ({ initialTab =
                   ))}
                   {sessions.length === 0 && (
                     <tr>
-                      <td colSpan={5} className="p-6 text-center text-slate-400">
+                      <td colSpan={8} className="p-6 text-center text-slate-400">
                         لا توجد جلسات دفع مسجلة حالياً
                       </td>
                     </tr>

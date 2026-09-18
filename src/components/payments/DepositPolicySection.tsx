@@ -48,10 +48,12 @@ export const DepositPolicySection: React.FC<DepositPolicySectionProps> = ({
   );
   const [amountTolerance, setAmountTolerance] = useState(settings.amountTolerance ?? 10);
   const [saving, setSaving] = useState(false);
+  const [isDirty, setIsDirty] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [success, setSuccess] = useState<string | null>(null);
 
   useEffect(() => {
+    if (isDirty) return;
     setDepositEnabled(Boolean(settings.depositEnabled ?? settings.depositRequired));
     setDepositRequired(Boolean(settings.depositRequired));
     setDepositType(settings.depositType || 'fixed');
@@ -59,7 +61,7 @@ export const DepositPolicySection: React.FC<DepositPolicySectionProps> = ({
     setMinimumDeposit(settings.minimumDeposit ?? settings.minDeposit ?? 50);
     setSessionTimeoutSeconds(settings.sessionTimeoutSeconds || 120);
     setAmountTolerance(settings.amountTolerance ?? 10);
-  }, [settings]);
+  }, [settings, isDirty]);
 
   const preview = useMemo(() => {
     const total = 500;
@@ -92,6 +94,7 @@ export const DepositPolicySection: React.FC<DepositPolicySectionProps> = ({
           amountTolerance: Number(amountTolerance),
         }),
       });
+      setIsDirty(false);
       setSuccess('تم حفظ إعدادات الدفع والعربون');
       await onRefresh();
     } catch (err) {
@@ -112,6 +115,11 @@ export const DepositPolicySection: React.FC<DepositPolicySectionProps> = ({
           <p className="text-xs text-slate-500 dark:text-slate-400 mt-1">
             افصل بسهولة بين إتاحة العربون كخيار للعميل وبين إلزامه به.
           </p>
+          {isDirty && (
+            <div className="mt-2 inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg bg-amber-50 dark:bg-amber-950/40 text-amber-700 dark:text-amber-300 text-[10px] font-bold border border-amber-200 dark:border-amber-900">
+              تغييرات غير محفوظة — التحديث التلقائي لن يمسحها
+            </div>
+          )}
         </div>
       </div>
 
@@ -150,6 +158,7 @@ export const DepositPolicySection: React.FC<DepositPolicySectionProps> = ({
                       const checked = e.target.checked;
                       setDepositEnabled(checked);
                       if (!checked) setDepositRequired(false);
+                      setIsDirty(true);
                     }}
                     className="mt-0.5 w-4 h-4 rounded text-cyan-600"
                   />
@@ -179,6 +188,7 @@ export const DepositPolicySection: React.FC<DepositPolicySectionProps> = ({
                       const checked = e.target.checked;
                       setDepositRequired(checked);
                       if (checked) setDepositEnabled(true);
+                      setIsDirty(true);
                     }}
                     className="mt-0.5 w-4 h-4 rounded text-amber-600"
                   />
@@ -205,7 +215,10 @@ export const DepositPolicySection: React.FC<DepositPolicySectionProps> = ({
                   <label className="block font-bold text-slate-700 dark:text-slate-300 mb-1">طريقة الحساب</label>
                   <select
                     value={depositType}
-                    onChange={(e) => setDepositType(e.target.value as 'fixed' | 'percentage')}
+                    onChange={(e) => {
+                      setDepositType(e.target.value as 'fixed' | 'percentage');
+                      setIsDirty(true);
+                    }}
                     className="w-full px-3 py-2 rounded-xl border border-slate-200 dark:border-slate-800 bg-slate-50 dark:bg-slate-950"
                   >
                     <option value="fixed">مبلغ ثابت</option>
@@ -220,7 +233,10 @@ export const DepositPolicySection: React.FC<DepositPolicySectionProps> = ({
                     type="number"
                     min="0"
                     value={depositValue}
-                    onChange={(e) => setDepositValue(Number(e.target.value))}
+                    onChange={(e) => {
+                      setDepositValue(Number(e.target.value));
+                      setIsDirty(true);
+                    }}
                     className="w-full px-3 py-2 rounded-xl border border-slate-200 dark:border-slate-800 bg-slate-50 dark:bg-slate-950 font-bold"
                   />
                 </div>
@@ -230,7 +246,10 @@ export const DepositPolicySection: React.FC<DepositPolicySectionProps> = ({
                     type="number"
                     min="0"
                     value={minimumDeposit}
-                    onChange={(e) => setMinimumDeposit(Number(e.target.value))}
+                    onChange={(e) => {
+                      setMinimumDeposit(Number(e.target.value));
+                      setIsDirty(true);
+                    }}
                     className="w-full px-3 py-2 rounded-xl border border-slate-200 dark:border-slate-800 bg-slate-50 dark:bg-slate-950 font-bold"
                   />
                 </div>
@@ -251,7 +270,10 @@ export const DepositPolicySection: React.FC<DepositPolicySectionProps> = ({
                   min="30"
                   max="600"
                   value={sessionTimeoutSeconds}
-                  onChange={(e) => setSessionTimeoutSeconds(Number(e.target.value))}
+                  onChange={(e) => {
+                    setSessionTimeoutSeconds(Number(e.target.value));
+                    setIsDirty(true);
+                  }}
                   className="w-full px-3 py-2 rounded-xl border border-slate-200 dark:border-slate-800 bg-slate-50 dark:bg-slate-950"
                 />
               </div>
@@ -261,7 +283,10 @@ export const DepositPolicySection: React.FC<DepositPolicySectionProps> = ({
                   type="number"
                   min="0"
                   value={amountTolerance}
-                  onChange={(e) => setAmountTolerance(Number(e.target.value))}
+                  onChange={(e) => {
+                    setAmountTolerance(Number(e.target.value));
+                    setIsDirty(true);
+                  }}
                   className="w-full px-3 py-2 rounded-xl border border-slate-200 dark:border-slate-800 bg-slate-50 dark:bg-slate-950"
                 />
               </div>
@@ -275,7 +300,7 @@ export const DepositPolicySection: React.FC<DepositPolicySectionProps> = ({
               className="inline-flex items-center gap-2 px-6 py-2.5 bg-cyan-600 hover:bg-cyan-700 text-white rounded-xl text-xs font-bold disabled:opacity-50 shadow-sm"
             >
               <Save className="w-4 h-4" />
-              {saving ? 'جاري الحفظ...' : 'حفظ الإعدادات'}
+              {saving ? 'جاري الحفظ...' : isDirty ? 'حفظ التغييرات' : 'حفظ الإعدادات'}
             </button>
           </div>
         </div>
