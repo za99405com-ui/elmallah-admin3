@@ -297,62 +297,6 @@ export const PaymentReviewTab: React.FC<PaymentReviewTabProps> = ({ initialTab =
           )}
         </button>
 
-        <button
-          onClick={() => setActiveSubTab('devices')}
-          className={`flex items-center gap-2 px-4 py-2.5 rounded-xl transition-all whitespace-nowrap ${
-            activeSubTab === 'devices'
-              ? 'bg-white dark:bg-slate-900 text-slate-900 dark:text-white shadow-sm font-black'
-              : 'text-slate-600 dark:text-slate-400 hover:text-slate-900 dark:hover:text-white'
-          }`}
-        >
-          <MonitorSmartphone className="w-4 h-4 text-indigo-500" />
-          <span>أجهزة الدفع</span>
-          <span className="px-2 py-0.5 rounded-full text-[10px] font-semibold bg-slate-200 dark:bg-slate-800 text-slate-700 dark:text-slate-300">
-            {onlineDevicesCount}/{devices.length}
-          </span>
-        </button>
-
-        <button
-          onClick={() => setActiveSubTab('sources')}
-          className={`flex items-center gap-2 px-4 py-2.5 rounded-xl transition-all whitespace-nowrap ${
-            activeSubTab === 'sources'
-              ? 'bg-white dark:bg-slate-900 text-slate-900 dark:text-white shadow-sm font-black'
-              : 'text-slate-600 dark:text-slate-400 hover:text-slate-900 dark:hover:text-white'
-          }`}
-        >
-          <Layers className="w-4 h-4 text-emerald-500" />
-          <span>مصادر استقبال الدفع</span>
-          <span className="px-2 py-0.5 rounded-full text-[10px] font-semibold bg-slate-200 dark:bg-slate-800 text-slate-700 dark:text-slate-300">
-            {sources.length}
-          </span>
-        </button>
-
-        <button
-          onClick={() => setActiveSubTab('methods')}
-          className={`flex items-center gap-2 px-4 py-2.5 rounded-xl transition-all whitespace-nowrap ${
-            activeSubTab === 'methods'
-              ? 'bg-white dark:bg-slate-900 text-slate-900 dark:text-white shadow-sm font-black'
-              : 'text-slate-600 dark:text-slate-400 hover:text-slate-900 dark:hover:text-white'
-          }`}
-        >
-          <CreditCard className="w-4 h-4 text-blue-500" />
-          <span>طرق الدفع للعميل</span>
-          <span className="px-2 py-0.5 rounded-full text-[10px] font-semibold bg-slate-200 dark:bg-slate-800 text-slate-700 dark:text-slate-300">
-            {customerMethods.length}
-          </span>
-        </button>
-
-        <button
-          onClick={() => setActiveSubTab('policy')}
-          className={`flex items-center gap-2 px-4 py-2.5 rounded-xl transition-all whitespace-nowrap ${
-            activeSubTab === 'policy'
-              ? 'bg-white dark:bg-slate-900 text-slate-900 dark:text-white shadow-sm font-black'
-              : 'text-slate-600 dark:text-slate-400 hover:text-slate-900 dark:hover:text-white'
-          }`}
-        >
-          <Settings className="w-4 h-4 text-slate-500" />
-          <span>العربون والجلسات</span>
-        </button>
       </div>
 
       {/* Tab Contents */}
