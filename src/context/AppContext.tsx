@@ -1011,6 +1011,7 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
         title: 'خطأ في إضافة المنتج',
         description: err instanceof Error ? err.message : 'تعذر حفظ المنتج في الخادم',
       });
+      throw err;
     }
   };
 
@@ -1029,6 +1030,7 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
         title: 'خطأ في تعديل المنتج',
         description: err instanceof Error ? err.message : 'تعذر تعديل المنتج',
       });
+      throw err;
     }
   };
 
