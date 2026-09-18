@@ -35,6 +35,9 @@ export interface PaymentDevice {
   notificationListenerEnabled: boolean;
   busy: boolean;
   busySessionId?: string;
+  activeSessions?: number;
+  maxConcurrentSessions?: number;
+  availableSlots?: number;
   lastHeartbeatAt?: string;
   lastEventAt?: string;
   appVersion?: string;
@@ -82,6 +85,8 @@ export const PaymentDevicesSection: React.FC<PaymentDevicesSectionProps> = ({
   const [newDeviceId, setNewDeviceId] = useState('');
   const [newDeviceName, setNewDeviceName] = useState('');
   const [newFallbackDestination, setNewFallbackDestination] = useState('');
+  const [newMaxConcurrentSessions, setNewMaxConcurrentSessions] = useState(3);
+  const [managingMaxConcurrentSessions, setManagingMaxConcurrentSessions] = useState(3);
   const [newAssignments, setNewAssignments] = useState<AssignmentDraft>(() =>
     Object.fromEntries(sources.map((source) => [source.id, { enabled: false, destination: '', destinationLabel: '' }]))
   );
@@ -104,6 +109,7 @@ export const PaymentDevicesSection: React.FC<PaymentDevicesSectionProps> = ({
   const openAssignments = (device: PaymentDevice) => {
     setManagingDevice(device);
     setAssignmentDraft(ensureDraftShape(assignmentsForDevice(device, sources)));
+    setManagingMaxConcurrentSessions(Math.max(1, Number(device.maxConcurrentSessions || 3)));
     setError(null);
     setSuccess(null);
   };
@@ -136,10 +142,16 @@ export const PaymentDevicesSection: React.FC<PaymentDevicesSectionProps> = ({
     setLoading(true);
     setError(null);
     try {
-      await adminRequest(`/api/admin/payments/devices/${managingDevice.id}/sources`, {
-        method: 'PUT',
-        body: JSON.stringify({ assignments: serializeAssignments(assignmentDraft) }),
-      });
+      await Promise.all([
+        adminRequest(`/api/admin/payments/devices/${managingDevice.id}/sources`, {
+          method: 'PUT',
+          body: JSON.stringify({ assignments: serializeAssignments(assignmentDraft) }),
+        }),
+        adminRequest(`/api/admin/payments/devices/${managingDevice.id}`, {
+          method: 'PATCH',
+          body: JSON.stringify({ maxConcurrentSessions: managingMaxConcurrentSessions }),
+        }),
+      ]);
       setSuccess('تم حفظ مصادر الجهاز وأرقام التحويل الخاصة بكل مصدر');
       setManagingDevice(null);
       await onRefresh();
@@ -161,6 +173,7 @@ export const PaymentDevicesSection: React.FC<PaymentDevicesSectionProps> = ({
           deviceId: newDeviceId.trim(),
           name: newDeviceName.trim(),
           paymentDestination: newFallbackDestination.trim(),
+          maxConcurrentSessions: newMaxConcurrentSessions,
         }),
       })) as { provisioningSecret: string; device: { id: string } };
 
@@ -178,6 +191,7 @@ export const PaymentDevicesSection: React.FC<PaymentDevicesSectionProps> = ({
       setNewDeviceId('');
       setNewDeviceName('');
       setNewFallbackDestination('');
+      setNewMaxConcurrentSessions(3);
       setNewAssignments(
         Object.fromEntries(sources.map((source) => [source.id, { enabled: false, destination: '', destinationLabel: '' }]))
       );
@@ -374,16 +388,30 @@ export const PaymentDevicesSection: React.FC<PaymentDevicesSectionProps> = ({
                   className="w-full px-3 py-2 rounded-xl border border-slate-200 dark:border-slate-800 bg-slate-50 dark:bg-slate-950"
                 />
               </div>
-              <div className="sm:col-span-2">
+              <div>
                 <label className="block font-bold text-slate-700 dark:text-slate-300 mb-1">
                   وجهة احتياطية قديمة — اختياري
                 </label>
                 <input
                   value={newFallbackDestination}
                   onChange={(e) => setNewFallbackDestination(e.target.value)}
-                  placeholder="يفضل تركها فارغة واستخدام رقم منفصل لكل مصدر بالأسفل"
+                  placeholder="يفضل تركها فارغة"
                   className="w-full px-3 py-2 rounded-xl border border-slate-200 dark:border-slate-800 bg-slate-50 dark:bg-slate-950 font-mono"
                 />
+              </div>
+              <div>
+                <label className="block font-bold text-slate-700 dark:text-slate-300 mb-1">
+                  أقصى عمليات دفع متزامنة
+                </label>
+                <input
+                  type="number"
+                  min={1}
+                  max={10}
+                  value={newMaxConcurrentSessions}
+                  onChange={(e) => setNewMaxConcurrentSessions(Math.min(10, Math.max(1, Number(e.target.value) || 1)))}
+                  className="w-full px-3 py-2 rounded-xl border border-slate-200 dark:border-slate-800 bg-slate-50 dark:bg-slate-950 font-bold"
+                />
+                <p className="text-[10px] text-slate-400 mt-1">الافتراضي 3 جلسات على نفس الهاتف.</p>
               </div>
             </div>
 
@@ -418,6 +446,24 @@ export const PaymentDevicesSection: React.FC<PaymentDevicesSectionProps> = ({
               <button onClick={() => setManagingDevice(null)} className="text-slate-400 hover:text-slate-600">
                 <X className="w-5 h-5" />
               </button>
+            </div>
+            <div className="rounded-xl border border-slate-200 dark:border-slate-800 bg-slate-50 dark:bg-slate-950/40 p-3">
+              <label className="block text-xs font-black text-slate-800 dark:text-slate-200 mb-1">
+                أقصى عمليات دفع متزامنة على هذا الهاتف
+              </label>
+              <div className="flex items-center gap-3">
+                <input
+                  type="number"
+                  min={1}
+                  max={10}
+                  value={managingMaxConcurrentSessions}
+                  onChange={(e) => setManagingMaxConcurrentSessions(Math.min(10, Math.max(1, Number(e.target.value) || 1)))}
+                  className="w-24 px-3 py-2 rounded-xl border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-900 font-bold text-xs"
+                />
+                <span className="text-[10px] text-slate-500">
+                  الجهاز يقبل جلسات جديدة حتى يصل لهذا الحد.
+                </span>
+              </div>
             </div>
             {assignmentEditor(assignmentDraft, setAssignmentDraft)}
             <div className="flex justify-end gap-2 pt-3 border-t border-slate-100 dark:border-slate-800">
@@ -466,9 +512,15 @@ export const PaymentDevicesSection: React.FC<PaymentDevicesSectionProps> = ({
 
               <div className="space-y-2 pt-2 border-t border-slate-100 dark:border-slate-800 text-xs">
                 <div className="flex justify-between">
-                  <span className="text-slate-500">حالة الجهاز:</span>
+                  <span className="text-slate-500">الجلسات النشطة:</span>
                   <strong className={device.busy ? 'text-amber-600' : 'text-emerald-600'}>
-                    {device.busy ? 'مشغول بجلسة' : 'متاح'}
+                    {Number(device.activeSessions || 0)} / {Number(device.maxConcurrentSessions || 3)}
+                  </strong>
+                </div>
+                <div className="flex justify-between">
+                  <span className="text-slate-500">حالة الاستقبال:</span>
+                  <strong className={device.busy ? 'text-amber-600' : 'text-emerald-600'}>
+                    {device.busy ? 'وصل للحد الأقصى' : `متاح (${Number(device.availableSlots ?? 3)} مكان)`}
                   </strong>
                 </div>
                 <div className="flex justify-between">
@@ -477,6 +529,19 @@ export const PaymentDevicesSection: React.FC<PaymentDevicesSectionProps> = ({
                     {device.notificationListenerEnabled ? 'نشطة' : 'غير نشطة'}
                   </strong>
                 </div>
+                {device.lastHeartbeatAt && (
+                  <div className="flex justify-between gap-3">
+                    <span className="text-slate-500">آخر نبضة:</span>
+                    <strong className="text-slate-700 dark:text-slate-300 text-[10px]">
+                      {new Intl.DateTimeFormat('ar-EG', {
+                        timeZone: 'Africa/Cairo',
+                        hour: '2-digit',
+                        minute: '2-digit',
+                        second: '2-digit',
+                      }).format(new Date(device.lastHeartbeatAt))}
+                    </strong>
+                  </div>
+                )}
                 <div className="pt-2 border-t border-slate-100 dark:border-slate-800">
                   <div className="flex items-center justify-between mb-2">
                     <span className="font-bold text-slate-700 dark:text-slate-300">مصادر وأرقام التحويل</span>
