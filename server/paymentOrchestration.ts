@@ -1599,27 +1599,39 @@ async function findEligibleSourceForMethod(
     return null;
   }
 
-  // 3. Fallback: provider code resolution (only when neither customer payment method nor paymentSourceId was specified)
+  // 3. Fallback: legacy provider code resolution.
+  // Once V3 payment_sources exists, its enabled state is authoritative.
+  // Legacy device booleans are used only before the V3 table exists.
   const prov = normalizeProvider(fallbackProvider);
   if (prov) {
-    const { data: src } = await supabaseServer.from('payment_sources').select('*').eq('code', prov).eq('enabled', true).maybeSingle();
-    if (src) {
+    const { data: src, error: srcError } = await supabaseServer
+      .from('payment_sources')
+      .select('*')
+      .eq('code', prov)
+      .eq('enabled', true)
+      .maybeSingle();
+
+    if (!srcError) {
+      if (!src) return null;
+
       const isDirectlyAssigned = activeAssignedSourceIds.has(src.id);
-      const isLegacyAssigned = activeDeviceList.some((d: any) =>
-        (src.code === 'vf_cash' && d.vf_cash_enabled) ||
-        (src.code === 'bank_alahly' && d.bank_alahly_enabled)
-      );
-      if (isDirectlyAssigned || isLegacyAssigned) {
+      if (isDirectlyAssigned) {
         return { source: src, provider: prov, customerPaymentMethodId: null };
       }
-    } else {
-      const isLegacyAssigned = activeDeviceList.some((d: any) =>
-        (prov === 'vf_cash' && d.vf_cash_enabled) ||
-        (prov === 'bank_alahly' && d.bank_alahly_enabled)
-      );
-      if (isLegacyAssigned) {
-        return { source: null, provider: prov, customerPaymentMethodId: null };
-      }
+
+      return null;
+    }
+
+    if (!isMissingRelationError(srcError, 'payment_sources')) {
+      return null;
+    }
+
+    const isLegacyAssigned = activeDeviceList.some((d: any) =>
+      (prov === 'vf_cash' && d.vf_cash_enabled) ||
+      (prov === 'bank_alahly' && d.bank_alahly_enabled)
+    );
+    if (isLegacyAssigned) {
+      return { source: null, provider: prov, customerPaymentMethodId: null };
     }
   }
 
@@ -1891,6 +1903,31 @@ paymentRouter.get('/payment-bridge/health', (_req: Request, res: Response) => {
   return res.json({ status: 'ok', version: 'phase2', serverTime: Date.now() });
 });
 
+function isMissingRelationError(err: any, relation: string): boolean {
+  if (!err) return false;
+  const code = String(err.code || '');
+  const relationName = relation.toLowerCase();
+  const combined = [
+    String(err.message || ''),
+    String(err.details || ''),
+    String(err.hint || ''),
+  ].join(' ').toLowerCase();
+
+  return (
+    code === '42P01' ||
+    code === 'PGRST205' ||
+    (
+      combined.includes(relationName) &&
+      (
+        combined.includes('schema cache') ||
+        combined.includes('does not exist') ||
+        combined.includes('could not find the table') ||
+        combined.includes('relation')
+      )
+    )
+  );
+}
+
 function isMissingV3ColumnError(err: any): boolean {
   if (!err) return false;
   const code = String(err.code || '');
@@ -1938,7 +1975,8 @@ paymentRouter.post('/payment-bridge/events', verifyBridgeRequest, async (req: Ra
   let resolvedSource: any = null;
   let provider: string = '';
 
-  // 1. If paymentSourceId is supplied: validate existence, enablement, and device assignment
+  // 1. If paymentSourceId is supplied: validate existence, enablement, and device assignment.
+  // Before the V3 tables exist, a request may fall back to a valid legacy provider.
   if (rawPaymentSourceId) {
     const { data: src, error: srcErr } = await supabaseServer
       .from('payment_sources')
@@ -1946,51 +1984,65 @@ paymentRouter.post('/payment-bridge/events', verifyBridgeRequest, async (req: Ra
       .eq('id', rawPaymentSourceId)
       .maybeSingle();
 
-    if (srcErr || !src) {
-      return res.status(400).json({
-        error: 'invalid_payment_source',
-        message: 'Specified paymentSourceId does not exist or is invalid',
-      });
-    }
+    if (srcErr) {
+      if (!isMissingRelationError(srcErr, 'payment_sources')) {
+        return res.status(503).json({ error: 'Payment source service unavailable' });
+      }
 
-    if (!src.enabled) {
-      return res.status(400).json({
-        error: 'payment_source_disabled',
-        message: 'Specified payment source is disabled',
-      });
-    }
+      provider = normalizeProvider(rawProvider);
+      const legacyAssigned =
+        (provider === 'vf_cash' && Boolean(device.vf_cash_enabled)) ||
+        (provider === 'bank_alahly' && Boolean(device.bank_alahly_enabled));
 
-    // Verify source is assigned and enabled for the authenticated payment device
-    let isDirectlyAssigned = false;
-    try {
+      if (!provider || !legacyAssigned) {
+        return res.status(400).json({
+          error: 'invalid_payment_source',
+          message: 'V3 payment source is unavailable and no assigned legacy provider can be used',
+        });
+      }
+    } else {
+      if (!src) {
+        return res.status(400).json({
+          error: 'invalid_payment_source',
+          message: 'Specified paymentSourceId does not exist or is invalid',
+        });
+      }
+
+      if (!src.enabled) {
+        return res.status(400).json({
+          error: 'payment_source_disabled',
+          message: 'Specified payment source is disabled',
+        });
+      }
+
       const { data: devSource, error: devSourceErr } = await supabaseServer
         .from('payment_device_sources')
         .select('enabled')
         .eq('device_id', device.id)
         .eq('payment_source_id', src.id)
         .maybeSingle();
-      if (!devSourceErr && devSource && devSource.enabled) {
-        isDirectlyAssigned = true;
+
+      let assigned = Boolean(!devSourceErr && devSource?.enabled);
+      if (devSourceErr && isMissingRelationError(devSourceErr, 'payment_device_sources')) {
+        assigned =
+          (src.code === 'vf_cash' && Boolean(device.vf_cash_enabled)) ||
+          (src.code === 'bank_alahly' && Boolean(device.bank_alahly_enabled));
+      } else if (devSourceErr) {
+        return res.status(503).json({ error: 'Payment source assignment service unavailable' });
       }
-    } catch (_err) {
-      // Handled if payment_device_sources is not yet available
+
+      if (!assigned) {
+        return res.status(400).json({
+          error: 'payment_source_not_assigned',
+          message: 'Payment source is not assigned or enabled for this device',
+        });
+      }
+
+      resolvedSource = src;
+      provider = normalizeProvider(src.code) || src.code;
     }
-
-    const isLegacyAssigned =
-      (src.code === 'vf_cash' && Boolean(device.vf_cash_enabled)) ||
-      (src.code === 'bank_alahly' && Boolean(device.bank_alahly_enabled));
-
-    if (!isDirectlyAssigned && !isLegacyAssigned) {
-      return res.status(400).json({
-        error: 'payment_source_not_assigned',
-        message: 'Payment source is not assigned or enabled for this device',
-      });
-    }
-
-    resolvedSource = src;
-    provider = normalizeProvider(src.code) || src.code;
   } else {
-    // 2. Legacy provider fallback remains temporarily supported
+    // 2. Legacy provider fallback remains temporarily supported.
     provider = normalizeProvider(rawProvider);
     if (!provider) {
       return res.status(400).json({
@@ -1999,18 +2051,67 @@ paymentRouter.post('/payment-bridge/events', verifyBridgeRequest, async (req: Ra
       });
     }
 
-    try {
-      const { data: src } = await supabaseServer
-        .from('payment_sources')
-        .select('*')
-        .eq('code', provider)
-        .eq('enabled', true)
-        .maybeSingle();
-      if (src) {
-        resolvedSource = src;
+    const { data: src, error: srcErr } = await supabaseServer
+      .from('payment_sources')
+      .select('*')
+      .eq('code', provider)
+      .eq('enabled', true)
+      .maybeSingle();
+
+    if (srcErr) {
+      if (!isMissingRelationError(srcErr, 'payment_sources')) {
+        return res.status(503).json({ error: 'Payment source service unavailable' });
       }
-    } catch (_err) {
-      // Table may not exist pre-migration
+
+      const legacyAssigned =
+        (provider === 'vf_cash' && Boolean(device.vf_cash_enabled)) ||
+        (provider === 'bank_alahly' && Boolean(device.bank_alahly_enabled));
+
+      if (!legacyAssigned) {
+        return res.status(400).json({
+          error: 'payment_source_not_assigned',
+          message: 'Legacy provider is not enabled for this device',
+        });
+      }
+    } else {
+      // V3 exists: source enabled state and relational assignment are authoritative.
+      if (!src) {
+        return res.status(400).json({
+          error: 'payment_source_disabled',
+          message: 'Payment source is disabled or unavailable',
+        });
+      }
+
+      const { data: devSource, error: devSourceErr } = await supabaseServer
+        .from('payment_device_sources')
+        .select('enabled')
+        .eq('device_id', device.id)
+        .eq('payment_source_id', src.id)
+        .maybeSingle();
+
+      if (devSourceErr) {
+        if (!isMissingRelationError(devSourceErr, 'payment_device_sources')) {
+          return res.status(503).json({ error: 'Payment source assignment service unavailable' });
+        }
+
+        const legacyAssigned =
+          (src.code === 'vf_cash' && Boolean(device.vf_cash_enabled)) ||
+          (src.code === 'bank_alahly' && Boolean(device.bank_alahly_enabled));
+
+        if (!legacyAssigned) {
+          return res.status(400).json({
+            error: 'payment_source_not_assigned',
+            message: 'Payment source is not assigned or enabled for this device',
+          });
+        }
+      } else if (!devSource?.enabled) {
+        return res.status(400).json({
+          error: 'payment_source_not_assigned',
+          message: 'Payment source is not assigned or enabled for this device',
+        });
+      }
+
+      resolvedSource = src;
     }
   }
 
