@@ -1475,7 +1475,7 @@ paymentRouter.get('/admin/payments/overview', requireAuth, async (_req: Authenti
       overviewSessions.find(
         (session: any) =>
           session.order_id === ord.id &&
-          ['needs_review', 'expired_needs_review', 'underpaid', 'amount_mismatch', 'late_payment', 'waiting'].includes(
+          ['needs_review', 'expired_needs_review', 'underpaid', 'amount_mismatch', 'late_payment', 'waiting', 'expired'].includes(
             String(session.status)
           )
       ) ||
