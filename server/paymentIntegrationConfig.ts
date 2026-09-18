@@ -160,10 +160,10 @@ async function getStorePaymentSettings(): Promise<{
 paymentIntegrationConfigRouter.get('/payments/config', requireIntegrationKey, async (_req: Request, res: Response) => {
   const settings = await getStorePaymentSettings();
 
-  const [devicesRes, methodsRes, methodSourcesRes, deviceSourcesRes] = await Promise.all([
+  const [devicesRes, methodsRes, methodSourcesRes, deviceSourcesRes, waitingSessionsRes] = await Promise.all([
     supabaseServer
       .from('payment_devices')
-      .select('id,device_id,payment_destination,vf_cash_enabled,bank_alahly_enabled,is_enabled,online,internet_connected,app_running,notification_listener_enabled,is_busy,last_heartbeat_at')
+      .select('id,device_id,payment_destination,vf_cash_enabled,bank_alahly_enabled,is_enabled,online,internet_connected,app_running,notification_listener_enabled,is_busy,max_concurrent_sessions,last_heartbeat_at')
       .eq('is_enabled', true),
     supabaseServer
       .from('customer_payment_methods')
@@ -176,17 +176,30 @@ paymentIntegrationConfigRouter.get('/payments/config', requireIntegrationKey, as
       .from('payment_device_sources')
       .select('*')
       .eq('enabled', true),
+    supabaseServer
+      .from('payment_sessions')
+      .select('device_id')
+      .eq('status', 'waiting')
+      .gt('expires_at', new Date().toISOString()),
   ]);
 
   const freshAfter = Date.now() - 45_000;
+  const activeCounts = new Map<string, number>();
+  for (const session of waitingSessionsRes.data || []) {
+    if (!session.device_id) continue;
+    activeCounts.set(session.device_id, (activeCounts.get(session.device_id) || 0) + 1);
+  }
+
   const eligibleDevices = (devicesRes.data || []).filter((device: any) => {
     const heartbeat = device.last_heartbeat_at ? new Date(device.last_heartbeat_at).getTime() : 0;
+    const maxSessions = Math.max(1, Number(device.max_concurrent_sessions || 3));
+    const activeSessions = activeCounts.get(device.id) || 0;
     return Boolean(
       device.online &&
       device.internet_connected &&
       device.app_running &&
       device.notification_listener_enabled &&
-      !device.is_busy &&
+      activeSessions < maxSessions &&
       heartbeat >= freshAfter
     );
   });
