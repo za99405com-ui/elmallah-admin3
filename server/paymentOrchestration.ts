@@ -691,6 +691,9 @@ paymentRouter.post(
       source_package: Array.isArray(req.body?.sourcePackages) && req.body.sourcePackages.length > 0
         ? String(req.body.sourcePackages[0]).trim()
         : (req.body?.sourcePackage ? String(req.body.sourcePackage).trim() : null),
+      source_packages: Array.isArray(req.body?.sourcePackages)
+        ? req.body.sourcePackages.map((value: unknown) => String(value).trim()).filter(Boolean)
+        : (req.body?.sourcePackage ? [String(req.body.sourcePackage).trim()] : []),
       source_sender: req.body?.sourceSender ? String(req.body.sourceSender).trim() : null,
       title_contains: req.body?.titleContains ? String(req.body.titleContains).trim() : null,
       body_contains: req.body?.bodyContains ? String(req.body.bodyContains).trim() : null,
@@ -750,6 +753,7 @@ paymentRouter.patch(
         ? req.body.sourcePackages.map((v: unknown) => String(v).trim()).filter(Boolean)
         : [];
       updates.source_package = packages[0] || null;
+      updates.source_packages = packages;
     }
     if (req.body?.sourceSender !== undefined) updates.source_sender = req.body.sourceSender ? String(req.body.sourceSender).trim() : null;
     if (req.body?.titleContains !== undefined) updates.title_contains = req.body.titleContains ? String(req.body.titleContains).trim() : null;
@@ -917,13 +921,18 @@ paymentRouter.put(
 
     // 4. Remove ONLY assignments that are no longer in sourceIds
     if (sourceIds.length === 0) {
-      await supabaseServer.from('payment_device_sources').delete().eq('device_id', deviceId);
+      const { error: pruneError } = await supabaseServer
+        .from('payment_device_sources')
+        .delete()
+        .eq('device_id', deviceId);
+      if (pruneError) return res.status(503).json({ error: 'تعذر إزالة مصادر الجهاز القديمة' });
     } else {
-      await supabaseServer
+      const { error: pruneError } = await supabaseServer
         .from('payment_device_sources')
         .delete()
         .eq('device_id', deviceId)
         .not('payment_source_id', 'in', `(${sourceIds.join(',')})`);
+      if (pruneError) return res.status(503).json({ error: 'تعذر تحديث مصادر الجهاز القديمة' });
     }
 
     // 5. Update legacy boolean flags on payment_devices
@@ -936,7 +945,7 @@ paymentRouter.put(
       bankAlAhlyEnabled = codes.has('bank_alahly');
     }
 
-    await supabaseServer
+    const { error: legacyFlagsError } = await supabaseServer
       .from('payment_devices')
       .update({
         vf_cash_enabled: vfCashEnabled,
@@ -944,6 +953,9 @@ paymentRouter.put(
         updated_at: new Date().toISOString(),
       })
       .eq('id', deviceId);
+    if (legacyFlagsError) {
+      return res.status(503).json({ error: 'تم حفظ المصادر لكن تعذر تحديث حالة الجهاز القديمة' });
+    }
 
     logAuditAction(
       req.admin,
@@ -994,6 +1006,8 @@ paymentRouter.get('/admin/payments/customer-methods', requireAuth, async (_req: 
       sortOrder: Number(m.sort_order || 0),
       sources: assignedSources,
       sourceIds: assignedSources.map((s: any) => s.id),
+      primarySourceId: assignedSources.find((s: any) => s.isPrimary)?.id || null,
+      secondarySourceIds: assignedSources.filter((s: any) => !s.isPrimary).map((s: any) => s.id),
       createdAt: m.created_at,
       updatedAt: m.updated_at,
     };
@@ -1045,13 +1059,19 @@ paymentRouter.post(
     if (error) return res.status(503).json({ error: 'تعذر إنشاء طريقة الدفع' });
 
     if (sourceIds.length > 0) {
-      await supabaseServer.from('customer_payment_method_sources').insert(
-        sourceIds.map((sid, idx) => ({
-          customer_payment_method_id: data.id,
-          payment_source_id: sid,
-          is_primary: idx === 0,
-        }))
-      );
+      const { error: mappingError } = await supabaseServer
+        .from('customer_payment_method_sources')
+        .insert(
+          sourceIds.map((sid, idx) => ({
+            customer_payment_method_id: data.id,
+            payment_source_id: sid,
+            is_primary: idx === 0,
+          }))
+        );
+      if (mappingError) {
+        await supabaseServer.from('customer_payment_methods').delete().eq('id', data.id);
+        return res.status(503).json({ error: 'تعذر ربط طريقة الدفع بمصادر الاستقبال' });
+      }
     }
 
     logAuditAction(req.admin, 'create_customer_payment_method', 'customer_payment_method', data.id, null, { ...row, sourceIds }, req.ip);
@@ -1099,15 +1119,27 @@ paymentRouter.patch(
     if (error) return res.status(503).json({ error: 'تعذر تحديث طريقة الدفع' });
 
     if (Array.isArray(req.body?.sourceIds)) {
-      await supabaseServer.from('customer_payment_method_sources').delete().eq('customer_payment_method_id', req.params.id);
+      const { error: clearMappingError } = await supabaseServer
+        .from('customer_payment_method_sources')
+        .delete()
+        .eq('customer_payment_method_id', req.params.id);
+      if (clearMappingError) {
+        return res.status(503).json({ error: 'تم حفظ الطريقة لكن تعذر تحديث مصادرها' });
+      }
+
       if (req.body.sourceIds.length > 0) {
-        await supabaseServer.from('customer_payment_method_sources').insert(
-          req.body.sourceIds.map((sid: string, idx: number) => ({
-            customer_payment_method_id: req.params.id,
-            payment_source_id: sid,
-            is_primary: idx === 0,
-          }))
-        );
+        const { error: insertMappingError } = await supabaseServer
+          .from('customer_payment_method_sources')
+          .insert(
+            req.body.sourceIds.map((sid: string, idx: number) => ({
+              customer_payment_method_id: req.params.id,
+              payment_source_id: sid,
+              is_primary: idx === 0,
+            }))
+          );
+        if (insertMappingError) {
+          return res.status(503).json({ error: 'تم حفظ الطريقة لكن تعذر ربط مصادر الدفع الجديدة' });
+        }
       }
     }
 
@@ -1289,12 +1321,12 @@ paymentRouter.get('/admin/payments/overview', requireAuth, async (_req: Authenti
       .from('payment_review_items')
       .select('*')
       .order('created_at', { ascending: false })
-      .limit(100),
+      .limit(50),
     supabaseServer
       .from('payment_sessions')
       .select('*')
       .order('created_at', { ascending: false })
-      .limit(100),
+      .limit(50),
     supabaseServer
       .from('orders')
       .select('id,order_number,status,deposit_status,deposit_amount,deposit_paid,total_amount,payment_mode,deposit_method,customer_name,customer_phone,created_at')
