@@ -1912,7 +1912,23 @@ paymentRouter.post('/payments/sessions', requireIntegrationKey, async (req: Requ
 
   const { data: complete, error: reloadError } = await supabaseServer
     .from('payment_sessions').select('*').eq('id', sessionId).single();
-  if (reloadError) return res.status(503).json({ error: 'Payment session reservation failed' });
+  if (reloadError || !complete) {
+    await releaseDeviceForSession(sessionId);
+    await supabaseServer.from('payment_sessions').delete().eq('id', sessionId);
+    return res.status(503).json({ error: 'Payment session reservation failed' });
+  }
+
+  const reservedDestination = String(complete.payment_destination || '').trim();
+  if (!reservedDestination) {
+    await releaseDeviceForSession(sessionId);
+    await supabaseServer.from('payment_sessions').delete().eq('id', sessionId);
+    return res.status(503).json({
+      error: 'payment_destination_missing',
+      orderId,
+      retryable: true,
+      message: 'الجهاز المتاح لا يحتوي على رقم أو عنوان تحويل لهذه الطريقة. يرجى ضبط وجهة الدفع للجهاز من لوحة التحكم.',
+    });
+  }
 
   const result = {
     ...mapSession(complete),
