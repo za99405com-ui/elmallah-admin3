@@ -75,62 +75,97 @@ export async function verifyPaymentBridge(req: RawBridgeRequest, res: Response, 
 }
 
 export async function fetchDeviceRules(deviceRowId: string, device: any) {
-  // Query assigned sources from payment_device_sources
+  // Read the device-source assignment together with source defaults.
+  // Parser/app overrides belong to the assignment so one phone cannot overwrite
+  // another phone's notification format for the same payment source.
   const { data: assignments, error } = await supabaseServer
     .from('payment_device_sources')
     .select(`
-      enabled,
+      *,
       payment_source:payment_sources(*)
     `)
     .eq('device_id', deviceRowId)
     .eq('enabled', true);
 
-  let sources: any[] = [];
+  let resolved: Array<{ assignment: any | null; source: any }> = [];
+
   if (!error && assignments) {
-    // If the table exists and returned results (including empty array []),
-    // return only the sources assigned and enabled for this device.
-    sources = assignments
-      .map((a: any) => a.payment_source)
-      .filter((s: any) => Boolean(s));
+    resolved = assignments
+      .map((assignment: any) => ({
+        assignment,
+        source: assignment.payment_source,
+      }))
+      .filter((item: any) => Boolean(item.source));
   } else if (error) {
-    // Graceful fallback ONLY if table does not exist or errored (legacy database state before migration)
+    // Graceful fallback only for the legacy schema before V3.
     const codes: string[] = [];
     if (device.vf_cash_enabled) codes.push('vf_cash');
     if (device.bank_alahly_enabled) codes.push('bank_alahly');
+
     if (codes.length > 0) {
       const { data: fallbackSources } = await supabaseServer
         .from('payment_sources')
         .select('*')
         .in('code', codes)
         .eq('enabled', true);
-      sources = fallbackSources || [];
+
+      resolved = (fallbackSources || []).map((source: any) => ({
+        assignment: null,
+        source,
+      }));
     }
   }
 
-  // Sort by priority descending, then code ascending
-  sources.sort((a, b) => (b.priority ?? 100) - (a.priority ?? 100));
+  resolved.sort(
+    (a, b) => Number(b.source?.priority ?? 100) - Number(a.source?.priority ?? 100)
+  );
 
-  const fingerprint = sources.map((s) => `${s.id}:${s.updated_at || s.code}`).join('|');
-  const rulesVersion = crypto.createHash('sha256').update(fingerprint || 'empty').digest('hex').substring(0, 16);
+  const fingerprint = resolved
+    .map(({ assignment, source }) =>
+      [
+        source.id,
+        source.updated_at || source.code,
+        assignment?.updated_at || '',
+        assignment?.parser_type || '',
+        Array.isArray(assignment?.source_packages)
+          ? assignment.source_packages.join(',')
+          : '',
+      ].join(':')
+    )
+    .join('|');
 
-  const rules = sources.map((s) => ({
-    id: s.id,
-    code: s.code,
-    name: s.display_name,
-    enabled: Boolean(s.enabled),
-    channel: s.channel,
-    packageNames: Array.isArray(s.source_packages) && s.source_packages.length > 0
+  const rulesVersion = crypto
+    .createHash('sha256')
+    .update(fingerprint || 'empty')
+    .digest('hex')
+    .substring(0, 16);
+
+  const rules = resolved.map(({ assignment, source: s }) => {
+    const assignmentPackages = Array.isArray(assignment?.source_packages)
+      ? assignment.source_packages.filter((value: unknown) => String(value).trim())
+      : [];
+    const sourcePackages = Array.isArray(s.source_packages) && s.source_packages.length > 0
       ? s.source_packages
-      : (s.source_package ? [s.source_package] : []),
-    sourceSender: s.source_sender || undefined,
-    titleContains: s.title_contains || undefined,
-    bodyContains: s.body_contains || undefined,
-    amountRegex: s.amount_regex || undefined,
-    payerPhoneRegex: s.payer_phone_regex || undefined,
-    accountIdentifierRegex: s.account_identifier_regex || undefined,
-    priority: Number(s.priority ?? 100),
-    parserType: s.parser_type || 'regex',
-  }));
+      : (s.source_package ? [s.source_package] : []);
+
+    return {
+      id: s.id,
+      code: s.code,
+      name: s.display_name,
+      enabled: Boolean(s.enabled),
+      channel: s.channel,
+      packageNames: assignmentPackages.length > 0 ? assignmentPackages : sourcePackages,
+      sourceSender: assignment?.source_sender ?? s.source_sender ?? undefined,
+      titleContains: assignment?.title_contains ?? s.title_contains ?? undefined,
+      bodyContains: assignment?.body_contains ?? s.body_contains ?? undefined,
+      amountRegex: assignment?.amount_regex ?? s.amount_regex ?? undefined,
+      payerPhoneRegex: assignment?.payer_phone_regex ?? s.payer_phone_regex ?? undefined,
+      accountIdentifierRegex:
+        assignment?.account_identifier_regex ?? s.account_identifier_regex ?? undefined,
+      priority: Number(s.priority ?? 100),
+      parserType: assignment?.parser_type ?? s.parser_type ?? 'regex',
+    };
+  });
 
   return { rulesVersion, rules };
 }
@@ -155,7 +190,7 @@ paymentBridgeControlRouter.post('/payment-bridge/source-config', verifyPaymentBr
 
   const { data: assignment, error: assignmentError } = await supabaseServer
     .from('payment_device_sources')
-    .select('payment_source_id,enabled,payment_sources(*)')
+    .select('*,payment_sources(*)')
     .eq('device_id', device.id)
     .eq('payment_source_id', sourceId)
     .eq('enabled', true)
@@ -191,14 +226,9 @@ paymentBridgeControlRouter.post('/payment-bridge/source-config', verifyPaymentBr
     }
   }
 
-  const existingPackages = Array.isArray(source.source_packages)
-    ? source.source_packages.map((value: unknown) => String(value).trim()).filter(Boolean)
-    : (source.source_package ? [String(source.source_package).trim()] : []);
-  const mergedPackages = Array.from(new Set([...existingPackages, ...packageNames])).slice(0, 20);
-
-  const updates: Record<string, unknown> = {
-    source_package: mergedPackages[0] || packageNames[0],
-    source_packages: mergedPackages,
+  const now = new Date().toISOString();
+  const assignmentUpdates: Record<string, unknown> = {
+    source_packages: packageNames,
     source_sender: optionalText(req.body?.sourceSender, 250),
     title_contains: optionalText(req.body?.titleContains, 500),
     body_contains: optionalText(req.body?.bodyContains, 500),
@@ -206,27 +236,66 @@ paymentBridgeControlRouter.post('/payment-bridge/source-config', verifyPaymentBr
     payer_phone_regex: payerPhoneRegex,
     account_identifier_regex: accountIdentifierRegex,
     parser_type: parserType,
-    updated_at: new Date().toISOString(),
+    updated_at: now,
   };
 
   let { error: updateError } = await supabaseServer
-    .from('payment_sources')
-    .update(updates)
-    .eq('id', sourceId);
+    .from('payment_device_sources')
+    .update(assignmentUpdates)
+    .eq('device_id', device.id)
+    .eq('payment_source_id', sourceId);
 
-  // Pre-migration compatibility: source_packages is additive. The first selected
-  // package still persists in source_package until V3 is applied.
-  if (updateError && (String(updateError.code || '') === '42703' || String(updateError.code || '') === 'PGRST204')) {
-    const legacyUpdates = { ...updates };
-    delete legacyUpdates.source_packages;
-    const retry = await supabaseServer
+  // Compatibility path for the legacy / partially migrated schema. Once the
+  // per-device parser columns exist, parser configuration is never written to
+  // the global source by this endpoint.
+  if (
+    updateError &&
+    (String(updateError.code || '') === '42703' ||
+      String(updateError.code || '') === 'PGRST204')
+  ) {
+    const existingPackages = Array.isArray(source.source_packages)
+      ? source.source_packages.map((value: unknown) => String(value).trim()).filter(Boolean)
+      : (source.source_package ? [String(source.source_package).trim()] : []);
+    const mergedPackages = Array.from(new Set([...existingPackages, ...packageNames])).slice(0, 20);
+
+    const legacyUpdates: Record<string, unknown> = {
+      source_package: mergedPackages[0] || packageNames[0],
+      source_packages: mergedPackages,
+      source_sender: assignmentUpdates.source_sender,
+      title_contains: assignmentUpdates.title_contains,
+      body_contains: assignmentUpdates.body_contains,
+      amount_regex: amountRegex,
+      payer_phone_regex: payerPhoneRegex,
+      account_identifier_regex: accountIdentifierRegex,
+      parser_type: parserType,
+      updated_at: now,
+    };
+
+    let retry = await supabaseServer
       .from('payment_sources')
       .update(legacyUpdates)
       .eq('id', sourceId);
+
+    if (
+      retry.error &&
+      (String(retry.error.code || '') === '42703' ||
+        String(retry.error.code || '') === 'PGRST204')
+    ) {
+      delete legacyUpdates.source_packages;
+      retry = await supabaseServer
+        .from('payment_sources')
+        .update(legacyUpdates)
+        .eq('id', sourceId);
+    }
+
     updateError = retry.error;
   }
 
-  if (updateError) return res.status(503).json({ error: 'Could not save payment source parser configuration' });
+  if (updateError) {
+    return res.status(503).json({
+      error: 'Could not save payment source parser configuration',
+    });
+  }
 
   const { rulesVersion, rules } = await fetchDeviceRules(device.id, device);
   return res.json({
