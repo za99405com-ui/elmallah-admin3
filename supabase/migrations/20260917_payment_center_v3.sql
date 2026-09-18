@@ -154,8 +154,17 @@ CREATE TABLE IF NOT EXISTS public.payment_device_sources (
     payment_source_id UUID NOT NULL REFERENCES public.payment_sources(id) ON DELETE CASCADE,
     destination TEXT NULL,
     destination_label TEXT NULL,
+    source_packages TEXT[] NOT NULL DEFAULT '{}'::TEXT[],
+    source_sender TEXT NULL,
+    title_contains TEXT NULL,
+    body_contains TEXT NULL,
+    amount_regex TEXT NULL,
+    payer_phone_regex TEXT NULL,
+    account_identifier_regex TEXT NULL,
+    parser_type TEXT NULL,
     enabled BOOLEAN NOT NULL DEFAULT true,
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     UNIQUE (device_id, payment_source_id)
 );
 
@@ -165,7 +174,16 @@ CREATE INDEX IF NOT EXISTS idx_payment_device_sources_lookup
 -- Existing installations may already have payment_device_sources.
 ALTER TABLE IF EXISTS public.payment_device_sources
     ADD COLUMN IF NOT EXISTS destination TEXT NULL,
-    ADD COLUMN IF NOT EXISTS destination_label TEXT NULL;
+    ADD COLUMN IF NOT EXISTS destination_label TEXT NULL,
+    ADD COLUMN IF NOT EXISTS source_packages TEXT[] NOT NULL DEFAULT '{}'::TEXT[],
+    ADD COLUMN IF NOT EXISTS source_sender TEXT NULL,
+    ADD COLUMN IF NOT EXISTS title_contains TEXT NULL,
+    ADD COLUMN IF NOT EXISTS body_contains TEXT NULL,
+    ADD COLUMN IF NOT EXISTS amount_regex TEXT NULL,
+    ADD COLUMN IF NOT EXISTS payer_phone_regex TEXT NULL,
+    ADD COLUMN IF NOT EXISTS account_identifier_regex TEXT NULL,
+    ADD COLUMN IF NOT EXISTS parser_type TEXT NULL,
+    ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT now();
 
 -- Backward-compatible initial destination: inherit the device's old single destination.
 UPDATE public.payment_device_sources pds
