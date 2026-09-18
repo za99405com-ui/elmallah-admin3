@@ -74,15 +74,8 @@ export const ProblemOrdersSection: React.FC<ProblemOrdersSectionProps> = ({
         });
       } else if (problem.sessionId) {
         if (action === 'confirm_paid') {
-          // If no review item exists, create and resolve or update order status
           await adminRequest(`/api/admin/payments/sessions/${problem.sessionId}/confirm-manual`, {
             method: 'POST',
-          }).catch(async () => {
-            // Fallback cancel session
-            await adminRequest(`/api/payments/sessions/${problem.sessionId}/cancel`, {
-              method: 'POST',
-              body: JSON.stringify({ reason: 'admin_manual_resolution' }),
-            });
           });
         } else {
           await adminRequest(`/api/payments/sessions/${problem.sessionId}/cancel`, {
@@ -90,6 +83,8 @@ export const ProblemOrdersSection: React.FC<ProblemOrdersSectionProps> = ({
             body: JSON.stringify({ reason: 'admin_cancelled_problem_order' }),
           });
         }
+      } else {
+        throw new Error('لا توجد جلسة دفع أو حالة مراجعة مرتبطة بهذا الطلب');
       }
 
       setSuccess(`تم تنفيذ الإجراء بنجاح للطلب ${problem.orderNumber || problem.orderId}`);
