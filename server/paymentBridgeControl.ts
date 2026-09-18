@@ -100,7 +100,7 @@ export async function fetchDeviceRules(deviceRowId: string, device: any) {
     // Graceful fallback only for the legacy schema before V3.
     const codes: string[] = [];
     if (device.vf_cash_enabled) codes.push('vf_cash');
-    if (device.bank_alahly_enabled) codes.push('bank_alahly');
+    if (device.bank_alahly_enabled) codes.push('instapay');
 
     if (codes.length > 0) {
       const { data: fallbackSources } = await supabaseServer
@@ -115,6 +115,9 @@ export async function fetchDeviceRules(deviceRowId: string, device: any) {
       }));
     }
   }
+
+  // The merchant-facing Bridge intentionally exposes only two logical sources.
+  resolved = resolved.filter(({ source }) => ['vf_cash', 'instapay'].includes(String(source?.code || '')));
 
   resolved.sort(
     (a, b) => Number(b.source?.priority ?? 100) - Number(a.source?.priority ?? 100)
@@ -151,7 +154,7 @@ export async function fetchDeviceRules(deviceRowId: string, device: any) {
     return {
       id: s.id,
       code: s.code,
-      name: s.display_name,
+      name: s.code === 'vf_cash' ? 'فودافون كاش' : s.code === 'instapay' ? 'إنستا باي' : s.display_name,
       enabled: Boolean(s.enabled),
       channel: s.channel,
       packageNames: assignmentPackages.length > 0 ? assignmentPackages : sourcePackages,
@@ -164,6 +167,9 @@ export async function fetchDeviceRules(deviceRowId: string, device: any) {
         assignment?.account_identifier_regex ?? s.account_identifier_regex ?? undefined,
       priority: Number(s.priority ?? 100),
       parserType: assignment?.parser_type ?? s.parser_type ?? 'regex',
+      appName: assignment?.app_name ?? undefined,
+      sampleSenderTitle: assignment?.sample_sender_title ?? undefined,
+      sampleMessage: assignment?.sample_message ?? undefined,
     };
   });
 
@@ -236,6 +242,9 @@ paymentBridgeControlRouter.post('/payment-bridge/source-config', verifyPaymentBr
     payer_phone_regex: payerPhoneRegex,
     account_identifier_regex: accountIdentifierRegex,
     parser_type: parserType,
+    app_name: optionalText(req.body?.appName, 250),
+    sample_sender_title: optionalText(req.body?.sampleSenderTitle, 250),
+    sample_message: optionalText(req.body?.sampleMessage, 5000),
     updated_at: now,
   };
 
