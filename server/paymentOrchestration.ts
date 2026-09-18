@@ -583,6 +583,301 @@ paymentRouter.put(
 );
 
 // ------------------------------------------------------------------------------
+// Simplified unified payment controls
+// ------------------------------------------------------------------------------
+async function getSimplePaymentSettings() {
+  const [settings, methodsRes] = await Promise.all([
+    getAdminPaymentSettings(),
+    supabaseServer
+      .from('customer_payment_methods')
+      .select('code,enabled')
+      .in('code', ['vodafone_cash', 'instapay', 'cash_on_delivery']),
+  ]);
+
+  const methodEnabled = new Map(
+    (methodsRes.data || []).map((row: any) => [String(row.code), Boolean(row.enabled)])
+  );
+
+  const deposit = Boolean(settings.depositEnabled || settings.depositRequired);
+  const cashOnDelivery = methodEnabled.has('cash_on_delivery')
+    ? Boolean(methodEnabled.get('cash_on_delivery'))
+    : !deposit;
+
+  return {
+    vodafoneCash: Boolean(methodEnabled.get('vodafone_cash')),
+    instaPay: Boolean(methodEnabled.get('instapay')),
+    deposit: deposit && !cashOnDelivery,
+    cashOnDelivery: cashOnDelivery || !deposit,
+    depositType: settings.depositType,
+    depositValue: settings.depositValue,
+    minimumDeposit: settings.minimumDeposit,
+    sessionTimeoutSeconds: settings.sessionTimeoutSeconds,
+  };
+}
+
+paymentRouter.get(
+  '/admin/payments/simple-settings',
+  requireAuth,
+  async (_req: AuthenticatedRequest, res: Response) => {
+    return res.json(await getSimplePaymentSettings());
+  }
+);
+
+paymentRouter.put(
+  '/admin/payments/simple-settings',
+  requireAuth,
+  requireRole(['super_admin', 'manager']),
+  async (req: AuthenticatedRequest, res: Response) => {
+    const current = await getSimplePaymentSettings();
+    const changed = String(req.body?.changed || '');
+
+    const vodafoneCash =
+      req.body?.vodafoneCash === undefined ? current.vodafoneCash : Boolean(req.body.vodafoneCash);
+    const instaPay =
+      req.body?.instaPay === undefined ? current.instaPay : Boolean(req.body.instaPay);
+
+    let deposit = req.body?.deposit === undefined ? current.deposit : Boolean(req.body.deposit);
+    let cashOnDelivery =
+      req.body?.cashOnDelivery === undefined
+        ? current.cashOnDelivery
+        : Boolean(req.body.cashOnDelivery);
+
+    // Deposit and cash-on-delivery are one exclusive order policy.
+    if (deposit === cashOnDelivery) {
+      if (changed === 'cashOnDelivery') {
+        deposit = !cashOnDelivery;
+      } else {
+        cashOnDelivery = !deposit;
+      }
+    }
+
+    const depositType =
+      req.body?.depositType === 'percentage' ? 'percentage' : 'fixed';
+    const depositValue =
+      req.body?.depositValue === undefined ? current.depositValue : Number(req.body.depositValue);
+    const minimumDeposit =
+      req.body?.minimumDeposit === undefined
+        ? current.minimumDeposit
+        : Number(req.body.minimumDeposit);
+
+    if (!Number.isFinite(depositValue) || depositValue < 0) {
+      return res.status(400).json({ error: 'قيمة العربون غير صالحة' });
+    }
+    if (depositType === 'percentage' && depositValue > 100) {
+      return res.status(400).json({ error: 'نسبة العربون يجب ألا تتجاوز 100%' });
+    }
+    if (!Number.isFinite(minimumDeposit) || minimumDeposit < 0) {
+      return res.status(400).json({ error: 'الحد الأدنى للعربون غير صالح' });
+    }
+
+    const now = new Date().toISOString();
+
+    const [methodsRes, sourcesRes, devicesRes] = await Promise.all([
+      supabaseServer
+        .from('customer_payment_methods')
+        .select('id,code,enabled')
+        .in('code', ['vodafone_cash', 'instapay', 'cash_on_delivery', 'bank_transfer']),
+      supabaseServer
+        .from('payment_sources')
+        .select('id,code,enabled')
+        .in('code', ['vf_cash', 'instapay', 'bank_alahly', 'banque_misr']),
+      supabaseServer
+        .from('payment_devices')
+        .select('id')
+        .eq('is_enabled', true),
+    ]);
+
+    if (methodsRes.error || sourcesRes.error || devicesRes.error) {
+      return res.status(503).json({ error: 'تعذر تحميل روابط منظومة الدفع' });
+    }
+
+    const methodsByCode = new Map((methodsRes.data || []).map((m: any) => [m.code, m]));
+    const sourcesByCode = new Map((sourcesRes.data || []).map((s: any) => [s.code, s]));
+
+    const methodUpdates = [
+      ['vodafone_cash', vodafoneCash],
+      ['instapay', instaPay],
+      ['cash_on_delivery', cashOnDelivery],
+      ['bank_transfer', false],
+    ] as const;
+
+    for (const [code, enabled] of methodUpdates) {
+      const method = methodsByCode.get(code);
+      if (!method) continue;
+      const { error } = await supabaseServer
+        .from('customer_payment_methods')
+        .update({ enabled, updated_at: now })
+        .eq('id', method.id);
+      if (error) return res.status(503).json({ error: 'تعذر تحديث طرق الدفع للعميل' });
+    }
+
+    const sourceUpdates = [
+      ['vf_cash', vodafoneCash],
+      ['instapay', instaPay],
+      // Hidden legacy sources stay disabled in the simplified two-source model.
+      ['bank_alahly', false],
+      ['banque_misr', false],
+    ] as const;
+
+    for (const [code, enabled] of sourceUpdates) {
+      const source = sourcesByCode.get(code);
+      if (!source) continue;
+      const { error } = await supabaseServer
+        .from('payment_sources')
+        .update({ enabled, updated_at: now })
+        .eq('id', source.id);
+      if (error) return res.status(503).json({ error: 'تعذر تحديث مصادر جسر المدفوعات' });
+    }
+
+    // Keep customer methods mapped to exactly one matching bridge source.
+    const mappingPairs = [
+      ['vodafone_cash', 'vf_cash'],
+      ['instapay', 'instapay'],
+    ] as const;
+
+    for (const [methodCode, sourceCode] of mappingPairs) {
+      const method = methodsByCode.get(methodCode);
+      const source = sourcesByCode.get(sourceCode);
+      if (!method || !source) continue;
+
+      const { error: clearError } = await supabaseServer
+        .from('customer_payment_method_sources')
+        .delete()
+        .eq('customer_payment_method_id', method.id);
+      if (clearError) return res.status(503).json({ error: 'تعذر توحيد روابط طرق الدفع' });
+
+      const { error: insertError } = await supabaseServer
+        .from('customer_payment_method_sources')
+        .insert({
+          customer_payment_method_id: method.id,
+          payment_source_id: source.id,
+          is_primary: true,
+        });
+      if (insertError) return res.status(503).json({ error: 'تعذر ربط طريقة الدفع بمصدر الرسائل' });
+    }
+
+    const codMethod = methodsByCode.get('cash_on_delivery');
+    if (codMethod) {
+      await supabaseServer
+        .from('customer_payment_method_sources')
+        .delete()
+        .eq('customer_payment_method_id', codMethod.id);
+    }
+    const bankMethod = methodsByCode.get('bank_transfer');
+    if (bankMethod) {
+      await supabaseServer
+        .from('customer_payment_method_sources')
+        .delete()
+        .eq('customer_payment_method_id', bankMethod.id);
+    }
+
+    // Every enabled bridge device receives the same two logical sources.
+    const visibleSourceIds = [
+      sourcesByCode.get('vf_cash')?.id,
+      sourcesByCode.get('instapay')?.id,
+    ].filter(Boolean) as string[];
+    const legacySourceIds = [
+      sourcesByCode.get('bank_alahly')?.id,
+      sourcesByCode.get('banque_misr')?.id,
+    ].filter(Boolean) as string[];
+
+    for (const device of devicesRes.data || []) {
+      if (legacySourceIds.length > 0) {
+        await supabaseServer
+          .from('payment_device_sources')
+          .delete()
+          .eq('device_id', device.id)
+          .in('payment_source_id', legacySourceIds);
+      }
+
+      for (const sourceId of visibleSourceIds) {
+        const { data: existingAssignment } = await supabaseServer
+          .from('payment_device_sources')
+          .select('id')
+          .eq('device_id', device.id)
+          .eq('payment_source_id', sourceId)
+          .maybeSingle();
+
+        if (!existingAssignment) {
+          const { error: assignmentError } = await supabaseServer
+            .from('payment_device_sources')
+            .insert({
+              device_id: device.id,
+              payment_source_id: sourceId,
+              enabled: true,
+            });
+          if (assignmentError) {
+            return res.status(503).json({ error: 'تعذر ربط مصادر الرسائل بالجهاز' });
+          }
+        } else {
+          await supabaseServer
+            .from('payment_device_sources')
+            .update({ enabled: true, updated_at: now })
+            .eq('id', existingAssignment.id);
+        }
+      }
+
+      const { error: deviceError } = await supabaseServer
+        .from('payment_devices')
+        .update({
+          vf_cash_enabled: vodafoneCash,
+          // Legacy field retained for compatibility; it mirrors logical InstaPay availability.
+          bank_alahly_enabled: instaPay,
+          updated_at: now,
+        })
+        .eq('id', device.id);
+      if (deviceError) return res.status(503).json({ error: 'تعذر تحديث حالة جهاز الدفع' });
+    }
+
+    const { data: beforeSettings } = await supabaseServer
+      .from('store_settings')
+      .select('*')
+      .eq('id', 1)
+      .maybeSingle();
+
+    const { error: settingsError } = await supabaseServer
+      .from('store_settings')
+      .update({
+        default_payment_policy: deposit ? 'deposit_required' : 'cod_allowed',
+        deposit_enabled: deposit,
+        deposit_required: deposit,
+        deposit_type: depositType,
+        deposit_value: depositValue,
+        minimum_deposit: minimumDeposit,
+        updated_at: now,
+      })
+      .eq('id', 1);
+
+    if (settingsError) {
+      return res.status(503).json({ error: 'تعذر تحديث سياسة العربون والدفع عند الاستلام' });
+    }
+
+    const result = {
+      vodafoneCash,
+      instaPay,
+      deposit,
+      cashOnDelivery,
+      depositType,
+      depositValue,
+      minimumDeposit,
+      sessionTimeoutSeconds: current.sessionTimeoutSeconds,
+    };
+
+    logAuditAction(
+      req.admin,
+      'update_simple_payment_settings',
+      'store_settings',
+      '1',
+      beforeSettings,
+      result,
+      req.ip
+    );
+    broadcastRealtimeEvent('payment_settings_updated', result);
+    return res.json(result);
+  }
+);
+
+// ------------------------------------------------------------------------------
 // Payment Sources CRUD
 // ------------------------------------------------------------------------------
 paymentRouter.get('/admin/payments/sources', requireAuth, async (_req: AuthenticatedRequest, res: Response) => {
