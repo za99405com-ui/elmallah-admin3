@@ -196,7 +196,16 @@ BEGIN
          WHERE bank_alahly_enabled = true
         ON CONFLICT (device_id, payment_source_id) DO NOTHING;
     END IF;
-END $$;
+END $;
+
+-- Seeded legacy assignments are created after the first compatibility backfill,
+-- so run the destination inheritance once more for those newly-created rows.
+UPDATE public.payment_device_sources pds
+   SET destination = d.payment_destination
+  FROM public.payment_devices d
+ WHERE pds.device_id = d.id
+   AND NULLIF(trim(COALESCE(pds.destination, '')), '') IS NULL
+   AND NULLIF(trim(COALESCE(d.payment_destination, '')), '') IS NOT NULL;
 
 -- ------------------------------------------------------------------------------
 -- 4. Customer-facing Payment Methods & Mappings
