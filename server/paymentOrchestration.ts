@@ -1738,12 +1738,20 @@ paymentRouter.post('/payments/sessions', requireIntegrationKey, async (req: Requ
   const paymentMethodCode = req.body?.paymentMethodCode ? String(req.body.paymentMethodCode).trim() : null;
   const sourceId = req.body?.paymentSourceId ? String(req.body.paymentSourceId).trim() : null;
   const rawProvider = String(req.body?.provider || '').trim();
+  const paymentIntentRaw = String(req.body?.paymentIntent || '').trim();
+  const paymentIntent =
+    paymentIntentRaw === 'full_payment' || paymentIntentRaw === 'deposit'
+      ? paymentIntentRaw
+      : null;
 
   const expectedAmount = Number(req.body?.expectedAmount);
   const customerId = req.body?.customerId ? String(req.body.customerId) : null;
   const customerPhone = normalizePhone(req.body?.customerPhone);
 
   if (!orderId) return res.status(400).json({ error: 'orderId is required' });
+  if (paymentIntentRaw && !paymentIntent) {
+    return res.status(400).json({ error: 'paymentIntent must be full_payment or deposit' });
+  }
   if (!Number.isFinite(expectedAmount) || expectedAmount <= 0) {
     return res.status(400).json({ error: 'expectedAmount must be a positive number' });
   }
@@ -1784,16 +1792,22 @@ paymentRouter.post('/payments/sessions', requireIntegrationKey, async (req: Requ
 
   const { source: resolvedSource, provider, customerPaymentMethodId: resolvedMethodId } = resolved;
 
-  // Check for an existing waiting session for this order and provider
-  const { data: existing } = await supabaseServer
+  // Reuse only a waiting session that matches the same method/amount/intent.
+  const { data: existingRows } = await supabaseServer
     .from('payment_sessions')
     .select('*')
     .eq('order_id', orderId)
     .eq('provider', provider)
     .eq('status', 'waiting')
     .order('created_at', { ascending: false })
-    .limit(1)
-    .maybeSingle();
+    .limit(10);
+
+  const existing = (existingRows || []).find((row: any) => {
+    const sameAmount = Math.abs(Number(row.expected_amount) - expectedAmount) < 0.005;
+    const sameIntent = !paymentIntent || !row.payment_intent || row.payment_intent === paymentIntent;
+    const sameMethod = !resolvedMethodId || !row.customer_payment_method_id || row.customer_payment_method_id === resolvedMethodId;
+    return sameAmount && sameIntent && sameMethod;
+  });
   if (existing) {
     return res.json({ ...mapSession(existing), clientToken: existing.client_token });
   }
@@ -1812,27 +1826,44 @@ paymentRouter.post('/payments/sessions', requireIntegrationKey, async (req: Requ
   const createdAt = new Date();
   const expiresAt = new Date(createdAt.getTime() + timeoutSeconds * 1000);
 
-  const { data: session, error: insertError } = await supabaseServer
+  const sessionRow: Record<string, unknown> = {
+    id: sessionId,
+    client_token: clientToken,
+    order_id: orderId,
+    customer_id: customerId || order.customer_id || null,
+    customer_phone: customerPhone || normalizePhone(order.customer_phone),
+    provider,
+    payment_source_id: resolvedSource?.id || null,
+    customer_payment_method_id: resolvedMethodId || null,
+    payment_intent: paymentIntent,
+    expected_amount: Math.round(expectedAmount * 100) / 100,
+    amount_tolerance: tolerance,
+    status: 'waiting',
+    expires_at: expiresAt.toISOString(),
+    created_at: createdAt.toISOString(),
+    updated_at: createdAt.toISOString(),
+  };
+
+  let insertResult = await supabaseServer
     .from('payment_sessions')
-    .insert({
-      id: sessionId,
-      client_token: clientToken,
-      order_id: orderId,
-      customer_id: customerId || order.customer_id || null,
-      customer_phone: customerPhone || normalizePhone(order.customer_phone),
-      provider,
-      payment_source_id: resolvedSource?.id || null,
-      customer_payment_method_id: resolvedMethodId || null,
-      expected_amount: Math.round(expectedAmount * 100) / 100,
-      amount_tolerance: tolerance,
-      status: 'waiting',
-      expires_at: expiresAt.toISOString(),
-      created_at: createdAt.toISOString(),
-      updated_at: createdAt.toISOString(),
-    })
+    .insert(sessionRow)
     .select('*')
     .single();
-  if (insertError) return res.status(503).json({ error: 'Could not create payment session' });
+
+  if (insertResult.error && isMissingV3ColumnError(insertResult.error)) {
+    const legacyRow = { ...sessionRow };
+    delete legacyRow.payment_intent;
+    delete legacyRow.payment_source_id;
+    delete legacyRow.customer_payment_method_id;
+    insertResult = await supabaseServer
+      .from('payment_sessions')
+      .insert(legacyRow)
+      .select('*')
+      .single();
+  }
+
+  const session = insertResult.data;
+  if (insertResult.error || !session) return res.status(503).json({ error: 'Could not create payment session' });
 
   const { data: reserved, error: reserveError } = await supabaseServer.rpc('reserve_payment_device', {
     p_session_id: sessionId,
@@ -1857,7 +1888,7 @@ paymentRouter.post('/payments/sessions', requireIntegrationKey, async (req: Requ
     ...mapSession(complete),
     clientToken,
     timeoutSeconds,
-    instructions: resolvedSource?.destination ? `يرجى التحويل إلى: ${resolvedSource.destination}` : undefined,
+    instructions: complete?.payment_destination ? `يرجى التحويل إلى: ${complete.payment_destination}` : undefined,
   };
   broadcastRealtimeEvent('payment_session_created', mapSession(complete));
   return res.status(201).json(result);
