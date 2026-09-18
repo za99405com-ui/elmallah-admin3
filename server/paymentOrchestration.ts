@@ -801,7 +801,7 @@ paymentRouter.delete(
 paymentRouter.get('/admin/payments/devices/:id/sources', requireAuth, async (req: AuthenticatedRequest, res: Response) => {
   const { data, error } = await supabaseServer
     .from('payment_device_sources')
-    .select('id,device_id,payment_source_id,enabled,created_at,payment_sources(*)')
+    .select('id,device_id,payment_source_id,destination,destination_label,enabled,created_at,payment_sources(*)')
     .eq('device_id', req.params.id);
   if (error) return res.status(503).json({ error: 'تعذر تحميل مصادر الجهاز' });
   return res.json(data || []);
@@ -813,7 +813,26 @@ paymentRouter.put(
   requireRole(['super_admin', 'manager']),
   async (req: AuthenticatedRequest, res: Response) => {
     const deviceId = req.params.id;
-    const sourceIds: string[] = Array.isArray(req.body?.sourceIds) ? req.body.sourceIds : [];
+    const requestedAssignments = Array.isArray(req.body?.assignments)
+      ? req.body.assignments
+          .map((item: any) => ({
+            sourceId: String(item?.sourceId || '').trim(),
+            destination: String(item?.destination || '').trim(),
+            destinationLabel: String(item?.destinationLabel || '').trim(),
+          }))
+          .filter((item: any) => item.sourceId)
+      : (Array.isArray(req.body?.sourceIds) ? req.body.sourceIds : [])
+          .map((sourceId: unknown) => ({
+            sourceId: String(sourceId).trim(),
+            destination: '',
+            destinationLabel: '',
+          }))
+          .filter((item: any) => item.sourceId);
+
+    const uniqueAssignments = Array.from(
+      new Map(requestedAssignments.map((item: any) => [item.sourceId, item])).values()
+    ) as Array<{ sourceId: string; destination: string; destinationLabel: string }>;
+    const sourceIds = uniqueAssignments.map((item) => item.sourceId);
 
     // 1. Validate that device exists
     const { data: device, error: devError } = await supabaseServer
@@ -838,16 +857,19 @@ paymentRouter.put(
       }
     }
 
-    // 3. Upsert desired assignments
+    // 3. Upsert desired assignments, including the destination for this device + source.
     if (sourceIds.length > 0) {
-      const upsertRows = sourceIds.map((sid) => ({
+      const upsertRows = uniqueAssignments.map((assignment) => ({
         device_id: deviceId,
-        payment_source_id: sid,
+        payment_source_id: assignment.sourceId,
+        destination: assignment.destination || null,
+        destination_label: assignment.destinationLabel || null,
         enabled: true,
       }));
-      await supabaseServer
+      const { error: upsertError } = await supabaseServer
         .from('payment_device_sources')
         .upsert(upsertRows, { onConflict: 'device_id,payment_source_id' });
+      if (upsertError) return res.status(503).json({ error: 'تعذر حفظ أرقام/وجهات مصادر الجهاز' });
     }
 
     // 4. Remove ONLY assignments that are no longer in sourceIds
@@ -880,8 +902,22 @@ paymentRouter.put(
       })
       .eq('id', deviceId);
 
-    logAuditAction(req.admin, 'assign_device_sources', 'payment_device', deviceId, null, { sourceIds, vfCashEnabled, bankAlAhlyEnabled }, req.ip);
-    return res.json({ success: true, assignedCount: sourceIds.length, vfCashEnabled, bankAlAhlyEnabled });
+    logAuditAction(
+      req.admin,
+      'assign_device_sources',
+      'payment_device',
+      deviceId,
+      null,
+      { assignments: uniqueAssignments, vfCashEnabled, bankAlAhlyEnabled },
+      req.ip
+    );
+    return res.json({
+      success: true,
+      assignedCount: sourceIds.length,
+      assignments: uniqueAssignments,
+      vfCashEnabled,
+      bankAlAhlyEnabled,
+    });
   }
 );
 
@@ -1182,6 +1218,7 @@ paymentRouter.get('/admin/payments/overview', requireAuth, async (_req: Authenti
     deviceSourcesResult,
     sourcesResult,
     customerMethodsResult,
+    customerMethodSourcesResult,
     reviewsResult,
     sessionsResult,
     problemOrdersRes,
@@ -1193,7 +1230,7 @@ paymentRouter.get('/admin/payments/overview', requireAuth, async (_req: Authenti
       .order('created_at', { ascending: true }),
     supabaseServer
       .from('payment_device_sources')
-      .select('device_id,payment_source_id,enabled,payment_sources(*)'),
+      .select('device_id,payment_source_id,destination,destination_label,enabled,payment_sources(*)'),
     supabaseServer
       .from('payment_sources')
       .select('*')
@@ -1202,6 +1239,9 @@ paymentRouter.get('/admin/payments/overview', requireAuth, async (_req: Authenti
       .from('customer_payment_methods')
       .select('*')
       .order('sort_order', { ascending: true }),
+    supabaseServer
+      .from('customer_payment_method_sources')
+      .select('customer_payment_method_id,payment_source_id,is_primary,payment_sources(*)'),
     supabaseServer
       .from('payment_review_items')
       .select('*')
@@ -1231,7 +1271,11 @@ paymentRouter.get('/admin/payments/overview', requireAuth, async (_req: Authenti
   for (const ds of deviceSourcesResult.data || []) {
     if (ds.enabled && ds.payment_sources) {
       const list = deviceSourcesMap.get(ds.device_id) || [];
-      list.push(ds.payment_sources);
+      list.push({
+        ...ds.payment_sources,
+        assignmentDestination: ds.destination || null,
+        assignmentDestinationLabel: ds.destination_label || null,
+      });
       deviceSourcesMap.set(ds.device_id, list);
     }
   }
@@ -1257,6 +1301,13 @@ paymentRouter.get('/admin/payments/overview', requireAuth, async (_req: Authenti
       appVersion: d.app_version || undefined,
       sources: assignedSources,
       assignedSourceIds: assignedSources.map((s: any) => s.id),
+      sourceAssignments: assignedSources.map((s: any) => ({
+        sourceId: s.id,
+        sourceName: s.display_name,
+        sourceCode: s.code,
+        destination: s.assignmentDestination || '',
+        destinationLabel: s.assignmentDestinationLabel || '',
+      })),
     };
   });
 
@@ -1282,15 +1333,28 @@ paymentRouter.get('/admin/payments/overview', requireAuth, async (_req: Authenti
     notes: s.notes || null,
   }));
 
-  const customerMethods = (customerMethodsResult.data || []).map((m: any) => ({
-    id: m.id,
-    code: m.code,
-    displayName: m.display_name,
-    enabled: Boolean(m.enabled),
-    channel: m.channel,
-    instructions: m.instructions || null,
-    sortOrder: Number(m.sort_order || 0),
-  }));
+  const customerMethods = (customerMethodsResult.data || []).map((m: any) => {
+    const mappings = (customerMethodSourcesResult.data || [])
+      .filter((ms: any) => ms.customer_payment_method_id === m.id)
+      .map((ms: any) => ({
+        sourceId: ms.payment_source_id,
+        isPrimary: Boolean(ms.is_primary),
+        source: ms.payment_sources || null,
+      }));
+    return {
+      id: m.id,
+      code: m.code,
+      displayName: m.display_name,
+      enabled: Boolean(m.enabled),
+      channel: m.channel,
+      instructions: m.instructions || null,
+      sortOrder: Number(m.sort_order || 0),
+      sourceIds: mappings.map((x: any) => x.sourceId),
+      primarySourceId: mappings.find((x: any) => x.isPrimary)?.sourceId || null,
+      secondarySourceIds: mappings.filter((x: any) => !x.isPrimary).map((x: any) => x.sourceId),
+      sources: mappings.map((x: any) => x.source).filter(Boolean),
+    };
+  });
 
   const problemOrders = (problemOrdersRes.data || []).map((ord: any) => ({
     id: ord.id,
@@ -1328,8 +1392,8 @@ paymentRouter.post(
     const deviceId = String(req.body?.deviceId || '').trim();
     const name = String(req.body?.name || '').trim();
     const paymentDestination = String(req.body?.paymentDestination || '').trim();
-    if (!deviceId || !name || !paymentDestination) {
-      return res.status(400).json({ error: 'معرّف الجهاز والاسم ورقم/حساب التحصيل مطلوبة' });
+    if (!deviceId || !name) {
+      return res.status(400).json({ error: 'معرّف الجهاز والاسم مطلوبان' });
     }
 
     const provisioningSecret = String(req.body?.provisioningSecret || '').trim() || crypto.randomBytes(32).toString('hex');
