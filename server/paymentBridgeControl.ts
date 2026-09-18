@@ -100,7 +100,7 @@ export async function fetchDeviceRules(deviceRowId: string, device: any) {
     // Graceful fallback only for the legacy schema before V3.
     const codes: string[] = [];
     if (device.vf_cash_enabled) codes.push('vf_cash');
-    if (device.bank_alahly_enabled) codes.push('bank_alahly');
+    if (device.bank_alahly_enabled) codes.push('instapay');
 
     if (codes.length > 0) {
       const { data: fallbackSources } = await supabaseServer
@@ -115,6 +115,9 @@ export async function fetchDeviceRules(deviceRowId: string, device: any) {
       }));
     }
   }
+
+  // The merchant-facing Bridge intentionally exposes only two logical sources.
+  resolved = resolved.filter(({ source }) => ['vf_cash', 'instapay'].includes(String(source?.code || '')));
 
   resolved.sort(
     (a, b) => Number(b.source?.priority ?? 100) - Number(a.source?.priority ?? 100)
@@ -151,7 +154,7 @@ export async function fetchDeviceRules(deviceRowId: string, device: any) {
     return {
       id: s.id,
       code: s.code,
-      name: s.display_name,
+      name: s.code === 'vf_cash' ? 'فودافون كاش' : s.code === 'instapay' ? 'إنستا باي' : s.display_name,
       enabled: Boolean(s.enabled),
       channel: s.channel,
       packageNames: assignmentPackages.length > 0 ? assignmentPackages : sourcePackages,
