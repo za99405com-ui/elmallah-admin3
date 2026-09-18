@@ -164,7 +164,7 @@ export const PaymentReviewTab: React.FC<PaymentReviewTabProps> = ({ initialTab =
     return (
       <div className="min-h-[50vh] flex flex-col items-center justify-center gap-3 text-slate-500">
         <Loader2 className="w-7 h-7 animate-spin text-cyan-600" />
-        <span className="text-xs font-bold">جاري تحميل مركز إدارة المدفوعات والربط...</span>
+        <span className="text-xs font-bold">جاري تحميل مركز المدفوعات...</span>
       </div>
     );
   }
@@ -193,10 +193,10 @@ export const PaymentReviewTab: React.FC<PaymentReviewTabProps> = ({ initialTab =
             </div>
             <div>
               <h1 className="text-lg sm:text-xl font-black text-slate-900 dark:text-white">
-                مركز المدفوعات المتكامل (Payment Architecture v3)
+                مركز المدفوعات والمراجعة
               </h1>
               <p className="text-xs text-slate-500 dark:text-slate-400 mt-0.5">
-                إدارة أجهزة الاستقبال (Bridge)، ومصادر الدفع، وقواعد العربون، والمطابقة الآلية للطلبات.
+                إدارة طرق الدفع والأجهزة المتصلة والعربون ومراجعة التحويلات في مكان واحد.
               </p>
             </div>
           </div>
@@ -265,7 +265,7 @@ export const PaymentReviewTab: React.FC<PaymentReviewTabProps> = ({ initialTab =
           }`}
         >
           <MonitorSmartphone className="w-4 h-4 text-indigo-500" />
-          <span>أجهزة الدفع (Bridge)</span>
+          <span>أجهزة الدفع</span>
           <span className="px-2 py-0.5 rounded-full text-[10px] font-semibold bg-slate-200 dark:bg-slate-800 text-slate-700 dark:text-slate-300">
             {onlineDevicesCount}/{devices.length}
           </span>
@@ -280,7 +280,7 @@ export const PaymentReviewTab: React.FC<PaymentReviewTabProps> = ({ initialTab =
           }`}
         >
           <Layers className="w-4 h-4 text-emerald-500" />
-          <span>مصادر وقواعد الدفع</span>
+          <span>مصادر استقبال الدفع</span>
           <span className="px-2 py-0.5 rounded-full text-[10px] font-semibold bg-slate-200 dark:bg-slate-800 text-slate-700 dark:text-slate-300">
             {sources.length}
           </span>
@@ -295,7 +295,7 @@ export const PaymentReviewTab: React.FC<PaymentReviewTabProps> = ({ initialTab =
           }`}
         >
           <CreditCard className="w-4 h-4 text-blue-500" />
-          <span>طرق دفع العملاء</span>
+          <span>طرق الدفع للعميل</span>
           <span className="px-2 py-0.5 rounded-full text-[10px] font-semibold bg-slate-200 dark:bg-slate-800 text-slate-700 dark:text-slate-300">
             {customerMethods.length}
           </span>
@@ -310,7 +310,7 @@ export const PaymentReviewTab: React.FC<PaymentReviewTabProps> = ({ initialTab =
           }`}
         >
           <Settings className="w-4 h-4 text-slate-500" />
-          <span>سياسة العربون والمهل</span>
+          <span>العربون والجلسات</span>
         </button>
       </div>
 

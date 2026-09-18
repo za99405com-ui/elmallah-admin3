@@ -378,6 +378,7 @@ export interface PaymentSource {
   destination?: string | null;
   parserType: 'regex' | 'json' | 'keyword' | 'smart';
   sourcePackage?: string | null;
+  sourcePackages?: string[];
   sourceSender?: string | null;
   titleContains?: string | null;
   bodyContains?: string | null;
@@ -394,6 +395,8 @@ export interface PaymentDeviceSource {
   id: string;
   deviceId: string;
   paymentSourceId: string;
+  destination?: string | null;
+  destinationLabel?: string | null;
   enabled: boolean;
   source?: PaymentSource;
 }

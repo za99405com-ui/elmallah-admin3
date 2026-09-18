@@ -1,5 +1,5 @@
 import React, { useState } from 'react';
-import { Plus, Edit2, Trash2, CheckCircle, XCircle, Layers, ArrowUpRight, Shield, AlertCircle } from 'lucide-react';
+import { Plus, Edit2, Trash2, CheckCircle, Layers, Shield, AlertCircle } from 'lucide-react';
 import { PaymentSource } from '../../types';
 
 interface PaymentSourcesSectionProps {
@@ -22,9 +22,9 @@ export const PaymentSourcesSection: React.FC<PaymentSourcesSectionProps> = ({
   // Form states
   const [code, setCode] = useState('');
   const [displayName, setDisplayName] = useState('');
-  const [channel, setChannel] = useState<'wallet' | 'bank' | 'pos' | 'other'>('wallet');
+  const [channel, setChannel] = useState<'wallet' | 'bank_transfer' | 'instapay' | 'other'>('wallet');
   const [destination, setDestination] = useState('');
-  const [parserType, setParserType] = useState<'regex' | 'json' | 'delimiter'>('regex');
+  const [parserType, setParserType] = useState<'regex' | 'json' | 'keyword' | 'smart'>('regex');
   const [sourcePackage, setSourcePackage] = useState('');
   const [sourceSender, setSourceSender] = useState('');
   const [titleContains, setTitleContains] = useState('');
@@ -35,6 +35,7 @@ export const PaymentSourcesSection: React.FC<PaymentSourcesSectionProps> = ({
   const [priority, setPriority] = useState(100);
   const [notes, setNotes] = useState('');
   const [enabled, setEnabled] = useState(true);
+  const [showAdvanced, setShowAdvanced] = useState(false);
 
   const resetForm = () => {
     setCode('');
@@ -52,6 +53,7 @@ export const PaymentSourcesSection: React.FC<PaymentSourcesSectionProps> = ({
     setPriority(100);
     setNotes('');
     setEnabled(true);
+    setShowAdvanced(false);
     setIsCreating(false);
     setIsEditing(null);
     setError(null);
@@ -75,6 +77,7 @@ export const PaymentSourcesSection: React.FC<PaymentSourcesSectionProps> = ({
     setPriority(source.priority);
     setNotes(source.notes || '');
     setEnabled(source.enabled);
+    setShowAdvanced(false);
   };
 
   const handleSubmit = async (e: React.FormEvent) => {
@@ -159,10 +162,10 @@ export const PaymentSourcesSection: React.FC<PaymentSourcesSectionProps> = ({
         <div>
           <h2 className="text-base sm:text-lg font-black text-slate-900 dark:text-white flex items-center gap-2">
             <Layers className="w-5 h-5 text-cyan-600 dark:text-cyan-400" />
-            مصادر الدفع وقواعد الاستقبال (Payment Sources)
+            مصادر استقبال المدفوعات
           </h2>
           <p className="text-xs text-slate-500 dark:text-slate-400 mt-1">
-            تعريف قنوات الدفع (محافظ، تحويلات بنكية، إنستاباي) وقواعد استخلاص المبالغ وأرقام المحافظ من الإشعارات تلقائياً.
+            عرّف فودافون كاش أو إنستاباي أو أي بنك، ثم اربطه بالأجهزة. إعداد التطبيق ونماذج الرسائل يمكن ضبطه من برنامج Bridge.
           </p>
         </div>
         <button
@@ -241,20 +244,20 @@ export const PaymentSourcesSection: React.FC<PaymentSourcesSectionProps> = ({
                 onChange={(e) => setChannel(e.target.value as any)}
                 className="w-full px-3 py-2 rounded-xl border border-slate-200 dark:border-slate-800 bg-slate-50 dark:bg-slate-950 text-slate-900 dark:text-white text-xs focus:ring-2 focus:ring-cyan-500"
               >
-                <option value="wallet">محفظة إلكترونية (Wallet)</option>
-                <option value="bank">حساب بنكي (Bank Transfer)</option>
-                <option value="pos">نقطة بيع / بطاقة (POS / Card)</option>
-                <option value="other">أخرى (Other)</option>
+                <option value="wallet">محفظة إلكترونية</option>
+                <option value="instapay">إنستاباي</option>
+                <option value="bank_transfer">تحويل بنكي</option>
+                <option value="other">أخرى</option>
               </select>
             </div>
 
             <div>
-              <label className="block font-bold text-slate-700 dark:text-slate-300 mb-1">الوجهة / رقم المحفظة الافتراضي</label>
+              <label className="block font-bold text-slate-700 dark:text-slate-300 mb-1">وجهة احتياطية عامة — اختياري</label>
               <input
                 type="text"
                 value={destination}
                 onChange={(e) => setDestination(e.target.value)}
-                placeholder="010xxxxxxxx أو رقم IBAN"
+                placeholder="يفضل تركها فارغة؛ الرقم الأساسي يحدد لكل جهاز"
                 className="w-full px-3 py-2 rounded-xl border border-slate-200 dark:border-slate-800 bg-slate-50 dark:bg-slate-950 text-slate-900 dark:text-white font-mono text-xs focus:ring-2 focus:ring-cyan-500"
               />
             </div>
@@ -267,7 +270,7 @@ export const PaymentSourcesSection: React.FC<PaymentSourcesSectionProps> = ({
                 onChange={(e) => setPriority(Number(e.target.value))}
                 className="w-full px-3 py-2 rounded-xl border border-slate-200 dark:border-slate-800 bg-slate-50 dark:bg-slate-950 text-slate-900 dark:text-white text-xs focus:ring-2 focus:ring-cyan-500"
               />
-              <span className="text-[10px] text-slate-400">الأعلى رقماً يُعرض أولاً للعميل</span>
+              <span className="text-[10px] text-slate-400">الأعلى أولوية في التوجيه الداخلي، وليس ترتيب طرق الدفع للعميل.</span>
             </div>
 
             <div className="flex items-center gap-3 pt-5">
@@ -283,79 +286,111 @@ export const PaymentSourcesSection: React.FC<PaymentSourcesSectionProps> = ({
             </div>
           </div>
 
-          {/* Bridge Parser Rules Sub-Section */}
           <div className="pt-3 border-t border-slate-100 dark:border-slate-800">
-            <h4 className="text-xs font-black text-cyan-700 dark:text-cyan-300 mb-2 flex items-center gap-1.5">
-              <Shield className="w-3.5 h-3.5" />
-              قواعد قراءة إشعارات أندرويد (Bridge Parser Rules)
-            </h4>
-            <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3 text-xs">
-              <div>
-                <label className="block font-medium text-slate-600 dark:text-slate-400 mb-1">اسم حزمة التطبيق (Package)</label>
-                <input
-                  type="text"
-                  value={sourcePackage}
-                  onChange={(e) => setSourcePackage(e.target.value)}
-                  placeholder="com.vf.cash, eg.gov.instapay"
-                  className="w-full px-3 py-1.5 rounded-xl border border-slate-200 dark:border-slate-800 bg-slate-50 dark:bg-slate-950 text-slate-900 dark:text-white font-mono text-xs"
-                />
+            <button
+              type="button"
+              onClick={() => setShowAdvanced((value) => !value)}
+              className="w-full flex items-center justify-between gap-3 rounded-xl border border-slate-200 dark:border-slate-800 bg-slate-50 dark:bg-slate-950/40 px-3 py-2.5 text-right"
+            >
+              <div className="flex items-center gap-2">
+                <Shield className="w-4 h-4 text-cyan-600 dark:text-cyan-400" />
+                <div>
+                  <div className="text-xs font-black text-slate-900 dark:text-white">إعدادات قراءة الإشعارات المتقدمة</div>
+                  <div className="text-[10px] text-slate-500 mt-0.5">
+                    استخدمها فقط عند الحاجة. الاختيار الأسهل يتم من تطبيق Bridge عبر «اختيار التطبيق + نموذج رسالة».
+                  </div>
+                </div>
               </div>
+              <span className="text-[10px] font-bold text-cyan-600 dark:text-cyan-400">
+                {showAdvanced ? 'إخفاء' : 'إظهار'}
+              </span>
+            </button>
 
-              <div>
-                <label className="block font-medium text-slate-600 dark:text-slate-400 mb-1">مرسل الرسالة (Source Sender)</label>
-                <input
-                  type="text"
-                  value={sourceSender}
-                  onChange={(e) => setSourceSender(e.target.value)}
-                  placeholder="VF-Cash, NBE, InstaPay"
-                  className="w-full px-3 py-1.5 rounded-xl border border-slate-200 dark:border-slate-800 bg-slate-50 dark:bg-slate-950 text-slate-900 dark:text-white font-mono text-xs"
-                />
+            {showAdvanced && (
+              <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3 text-xs mt-3">
+                <div>
+                  <label className="block font-medium text-slate-600 dark:text-slate-400 mb-1">Package التطبيق</label>
+                  <input
+                    type="text"
+                    value={sourcePackage}
+                    onChange={(e) => setSourcePackage(e.target.value)}
+                    placeholder="com.example.payment"
+                    className="w-full px-3 py-1.5 rounded-xl border border-slate-200 dark:border-slate-800 bg-slate-50 dark:bg-slate-950 font-mono text-xs"
+                  />
+                </div>
+                <div>
+                  <label className="block font-medium text-slate-600 dark:text-slate-400 mb-1">مرسل الإشعار</label>
+                  <input
+                    type="text"
+                    value={sourceSender}
+                    onChange={(e) => setSourceSender(e.target.value)}
+                    placeholder="VF-Cash, NBE..."
+                    className="w-full px-3 py-1.5 rounded-xl border border-slate-200 dark:border-slate-800 bg-slate-50 dark:bg-slate-950 font-mono text-xs"
+                  />
+                </div>
+                <div>
+                  <label className="block font-medium text-slate-600 dark:text-slate-400 mb-1">نوع المعالجة</label>
+                  <select
+                    value={parserType}
+                    onChange={(e) => setParserType(e.target.value as 'regex' | 'json' | 'keyword' | 'smart')}
+                    className="w-full px-3 py-1.5 rounded-xl border border-slate-200 dark:border-slate-800 bg-slate-50 dark:bg-slate-950 text-xs"
+                  >
+                    <option value="regex">Regex</option>
+                    <option value="smart">Smart</option>
+                    <option value="keyword">Keyword</option>
+                    <option value="json">JSON</option>
+                  </select>
+                </div>
+                <div>
+                  <label className="block font-medium text-slate-600 dark:text-slate-400 mb-1">العنوان يحتوي على</label>
+                  <input
+                    value={titleContains}
+                    onChange={(e) => setTitleContains(e.target.value)}
+                    className="w-full px-3 py-1.5 rounded-xl border border-slate-200 dark:border-slate-800 bg-slate-50 dark:bg-slate-950 text-xs"
+                  />
+                </div>
+                <div>
+                  <label className="block font-medium text-slate-600 dark:text-slate-400 mb-1">النص يحتوي على</label>
+                  <input
+                    value={bodyContains}
+                    onChange={(e) => setBodyContains(e.target.value)}
+                    className="w-full px-3 py-1.5 rounded-xl border border-slate-200 dark:border-slate-800 bg-slate-50 dark:bg-slate-950 text-xs"
+                  />
+                </div>
+                <div>
+                  <label className="block font-medium text-slate-600 dark:text-slate-400 mb-1">Regex المبلغ</label>
+                  <input
+                    value={amountRegex}
+                    onChange={(e) => setAmountRegex(e.target.value)}
+                    className="w-full px-3 py-1.5 rounded-xl border border-slate-200 dark:border-slate-800 bg-slate-50 dark:bg-slate-950 font-mono text-xs"
+                  />
+                </div>
+                <div>
+                  <label className="block font-medium text-slate-600 dark:text-slate-400 mb-1">Regex هاتف المحول</label>
+                  <input
+                    value={payerPhoneRegex}
+                    onChange={(e) => setPayerPhoneRegex(e.target.value)}
+                    className="w-full px-3 py-1.5 rounded-xl border border-slate-200 dark:border-slate-800 bg-slate-50 dark:bg-slate-950 font-mono text-xs"
+                  />
+                </div>
+                <div>
+                  <label className="block font-medium text-slate-600 dark:text-slate-400 mb-1">Regex معرف الحساب</label>
+                  <input
+                    value={accountIdentifierRegex}
+                    onChange={(e) => setAccountIdentifierRegex(e.target.value)}
+                    className="w-full px-3 py-1.5 rounded-xl border border-slate-200 dark:border-slate-800 bg-slate-50 dark:bg-slate-950 font-mono text-xs"
+                  />
+                </div>
+                <div>
+                  <label className="block font-medium text-slate-600 dark:text-slate-400 mb-1">ملاحظات داخلية</label>
+                  <input
+                    value={notes}
+                    onChange={(e) => setNotes(e.target.value)}
+                    className="w-full px-3 py-1.5 rounded-xl border border-slate-200 dark:border-slate-800 bg-slate-50 dark:bg-slate-950 text-xs"
+                  />
+                </div>
               </div>
-
-              <div>
-                <label className="block font-medium text-slate-600 dark:text-slate-400 mb-1">العنوان يحتوي على (Title Contains)</label>
-                <input
-                  type="text"
-                  value={titleContains}
-                  onChange={(e) => setTitleContains(e.target.value)}
-                  placeholder="تم استلام، تحويل ناجح"
-                  className="w-full px-3 py-1.5 rounded-xl border border-slate-200 dark:border-slate-800 bg-slate-50 dark:bg-slate-950 text-slate-900 dark:text-white text-xs"
-                />
-              </div>
-
-              <div>
-                <label className="block font-medium text-slate-600 dark:text-slate-400 mb-1">نص الرسالة يحتوي على (Body Contains)</label>
-                <input
-                  type="text"
-                  value={bodyContains}
-                  onChange={(e) => setBodyContains(e.target.value)}
-                  placeholder="تم إيداع، تحويل لك"
-                  className="w-full px-3 py-1.5 rounded-xl border border-slate-200 dark:border-slate-800 bg-slate-50 dark:bg-slate-950 text-slate-900 dark:text-white text-xs"
-                />
-              </div>
-
-              <div>
-                <label className="block font-medium text-slate-600 dark:text-slate-400 mb-1">Regex استخلاص المبلغ</label>
-                <input
-                  type="text"
-                  value={amountRegex}
-                  onChange={(e) => setAmountRegex(e.target.value)}
-                  placeholder="مبلغ\s*([\d,.]+)\s*جنيه"
-                  className="w-full px-3 py-1.5 rounded-xl border border-slate-200 dark:border-slate-800 bg-slate-50 dark:bg-slate-950 text-slate-900 dark:text-white font-mono text-xs"
-                />
-              </div>
-
-              <div>
-                <label className="block font-medium text-slate-600 dark:text-slate-400 mb-1">Regex استخلاص هاتف المحول</label>
-                <input
-                  type="text"
-                  value={payerPhoneRegex}
-                  onChange={(e) => setPayerPhoneRegex(e.target.value)}
-                  placeholder="من\s*(01\d{9})"
-                  className="w-full px-3 py-1.5 rounded-xl border border-slate-200 dark:border-slate-800 bg-slate-50 dark:bg-slate-950 text-slate-900 dark:text-white font-mono text-xs"
-                />
-              </div>
-            </div>
+            )}
           </div>
 
           <div className="flex items-center justify-end gap-2 pt-3 border-t border-slate-100 dark:border-slate-800">
@@ -427,12 +462,18 @@ export const PaymentSourcesSection: React.FC<PaymentSourcesSectionProps> = ({
               <div className="flex items-center justify-between">
                 <span>القناة:</span>
                 <span className="font-semibold text-slate-900 dark:text-slate-200">
-                  {source.channel === 'wallet' ? 'محفظة كاش' : source.channel === 'bank' ? 'حساب بنكي' : source.channel}
+                  {source.channel === 'wallet'
+                    ? 'محفظة إلكترونية'
+                    : source.channel === 'instapay'
+                    ? 'إنستاباي'
+                    : source.channel === 'bank_transfer'
+                    ? 'تحويل بنكي'
+                    : 'أخرى'}
                 </span>
               </div>
               {source.destination && (
                 <div className="flex items-center justify-between">
-                  <span>رقم الاستقبال:</span>
+                  <span>وجهة احتياطية:</span>
                   <span className="font-mono font-bold text-slate-900 dark:text-white text-[11px]">{source.destination}</span>
                 </div>
               )}

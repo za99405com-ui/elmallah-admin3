@@ -93,6 +93,7 @@ async function getStorePaymentSettings(): Promise<{
   default_payment_policy: string;
   payment_session_timeout_seconds: number;
   payment_amount_tolerance: number;
+  deposit_enabled: boolean;
   deposit_required: boolean;
   deposit_type: 'fixed' | 'percentage';
   deposit_value: number;
@@ -110,6 +111,7 @@ async function getStorePaymentSettings(): Promise<{
   const tolerance = Number(legacy?.payment_amount_tolerance || 10);
 
   let depositRequired = defaultPolicy === 'deposit_required';
+  let depositEnabled = depositRequired;
   let depositType: 'fixed' | 'percentage' = 'fixed';
   let depositValue = 100;
   let minimumDeposit = 50;
@@ -118,11 +120,14 @@ async function getStorePaymentSettings(): Promise<{
   try {
     const { data: v3, error: v3Error } = await supabaseServer
       .from('store_settings')
-      .select('deposit_required,deposit_type,deposit_value,minimum_deposit')
+      .select('deposit_enabled,deposit_required,deposit_type,deposit_value,minimum_deposit')
       .eq('id', 1)
       .maybeSingle();
 
     if (!v3Error && v3) {
+      if (v3.deposit_enabled !== null && v3.deposit_enabled !== undefined) {
+        depositEnabled = Boolean(v3.deposit_enabled);
+      }
       if (v3.deposit_required !== null && v3.deposit_required !== undefined) {
         depositRequired = Boolean(v3.deposit_required);
       }
@@ -144,6 +149,7 @@ async function getStorePaymentSettings(): Promise<{
     default_payment_policy: defaultPolicy,
     payment_session_timeout_seconds: timeoutSeconds,
     payment_amount_tolerance: tolerance,
+    deposit_enabled: depositEnabled || depositRequired,
     deposit_required: depositRequired,
     deposit_type: depositType,
     deposit_value: depositValue,
@@ -157,7 +163,7 @@ paymentIntegrationConfigRouter.get('/payments/config', requireIntegrationKey, as
   const [devicesRes, methodsRes, methodSourcesRes, deviceSourcesRes] = await Promise.all([
     supabaseServer
       .from('payment_devices')
-      .select('id,device_id,vf_cash_enabled,bank_alahly_enabled,is_enabled,online,internet_connected,app_running,notification_listener_enabled,is_busy,last_heartbeat_at')
+      .select('id,device_id,payment_destination,vf_cash_enabled,bank_alahly_enabled,is_enabled,online,internet_connected,app_running,notification_listener_enabled,is_busy,last_heartbeat_at')
       .eq('is_enabled', true),
     supabaseServer
       .from('customer_payment_methods')
@@ -168,7 +174,7 @@ paymentIntegrationConfigRouter.get('/payments/config', requireIntegrationKey, as
       .select('customer_payment_method_id,payment_source_id,is_primary,payment_sources(*)'),
     supabaseServer
       .from('payment_device_sources')
-      .select('device_id,payment_source_id,enabled')
+      .select('*')
       .eq('enabled', true),
   ]);
 
@@ -185,16 +191,26 @@ paymentIntegrationConfigRouter.get('/payments/config', requireIntegrationKey, as
     );
   });
 
-  // Map which payment source IDs have at least one eligible device
+  // A method is available only when at least one healthy device can also
+  // provide a destination for the assigned payment source.
   const eligibleSourceIds = new Set<string>();
   for (const d of eligibleDevices) {
-    const assigned = (deviceSourcesRes.data || []).filter((ds: any) => ds.device_id === d.id);
+    const assigned = (deviceSourcesRes.data || []).filter(
+      (ds: any) => ds.device_id === d.id && ds.enabled !== false
+    );
     for (const a of assigned) {
-      eligibleSourceIds.add(a.payment_source_id);
+      const hasDestination = Boolean(
+        String(a.destination || '').trim() ||
+        String(d.payment_destination || '').trim()
+      );
+      if (hasDestination) eligibleSourceIds.add(a.payment_source_id);
     }
-    // Also include legacy boolean flags
-    if (d.vf_cash_enabled) eligibleSourceIds.add('vf_cash_legacy');
-    if (d.bank_alahly_enabled) eligibleSourceIds.add('bank_alahly_legacy');
+
+    // Legacy compatibility before per-source destinations are migrated.
+    if (String(d.payment_destination || '').trim()) {
+      if (d.vf_cash_enabled) eligibleSourceIds.add('vf_cash_legacy');
+      if (d.bank_alahly_enabled) eligibleSourceIds.add('bank_alahly_legacy');
+    }
   }
 
   const rawMethods = methodsRes.data || [];
@@ -274,9 +290,11 @@ paymentIntegrationConfigRouter.get('/payments/config', requireIntegrationKey, as
   }
 
   const isDepositRequired = Boolean(settings.deposit_required || settings.default_payment_policy === 'deposit_required');
+  const isDepositEnabled = Boolean(settings.deposit_enabled || isDepositRequired);
 
   return res.json({
     depositPolicy: {
+      enabled: isDepositEnabled,
       required: isDepositRequired,
       type: settings.deposit_type || 'fixed',
       value: Number(settings.deposit_value || 100),
@@ -334,7 +352,8 @@ paymentIntegrationConfigRouter.post('/payments/calculate-deposit', requireIntegr
     }
   }
 
-  // Precedence: customer allow => no deposit; customer deny => deposit required; otherwise global settings
+  // Deposit availability and mandatory policy are separate concepts.
+  // Customer COD override affects mandatory status, not whether an optional deposit may be offered.
   let depositRequired = false;
   if (effectiveOverride === 'allow') {
     depositRequired = false;
@@ -344,9 +363,12 @@ paymentIntegrationConfigRouter.post('/payments/calculate-deposit', requireIntegr
     depositRequired = Boolean(settings?.deposit_required || settings?.default_payment_policy === 'deposit_required');
   }
 
-  if (!depositRequired || totalAmount === 0) {
+  const depositEnabled = Boolean(settings?.deposit_enabled || depositRequired);
+
+  if (!depositEnabled || totalAmount === 0) {
     return res.json({
-      depositRequired: false,
+      depositEnabled: false,
+      depositRequired,
       depositType: settings?.deposit_type || 'fixed',
       depositAmount: 0,
       remainingAmount: totalAmount,
@@ -354,7 +376,7 @@ paymentIntegrationConfigRouter.post('/payments/calculate-deposit', requireIntegr
     });
   }
 
-  // FIX 15: Validate deposit calculation parameters
+  // Validate deposit calculation parameters
   const depositType = settings?.deposit_type === 'percentage' ? 'percentage' : 'fixed';
   let depositValue = Number(settings?.deposit_value ?? 100);
   if (!Number.isFinite(depositValue) || depositValue < 0) depositValue = 0;
@@ -376,7 +398,8 @@ paymentIntegrationConfigRouter.post('/payments/calculate-deposit', requireIntegr
   const remainingAmount = Math.max(0, Math.round((totalAmount - depositAmount) * 100) / 100);
 
   return res.json({
-    depositRequired: true,
+    depositEnabled: true,
+    depositRequired,
     depositType,
     depositAmount,
     remainingAmount,

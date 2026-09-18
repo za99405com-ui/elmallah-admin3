@@ -3039,7 +3039,22 @@ router.get('/settings', async (_req: Request, res: Response) => {
 });
 
 router.post('/orders', async (req: Request, res: Response) => {
-  const { customerName, customerPhone, customerAddress, city, district, deliveryRegionId, items, couponCode, depositMethod, depositReference, notes, paymentMode } = req.body;
+  const {
+    customerName,
+    customerPhone,
+    customerAddress,
+    city,
+    district,
+    deliveryRegionId,
+    items,
+    couponCode,
+    depositMethod,
+    depositReference,
+    notes,
+    paymentMode,
+    paymentIntent,
+    paymentMethodCode,
+  } = req.body;
   const clientIp = req.ip || 'unknown';
   const cleanPhone = customerPhone ? String(customerPhone).trim().replace(/[^0-9+]/g, '') : '';
   const rateLimitKeys = [`order:ip:${clientIp}`]; if (cleanPhone) rateLimitKeys.push(`order:phone:${cleanPhone}`);
@@ -3062,6 +3077,14 @@ router.post('/orders', async (req: Request, res: Response) => {
     });
   }
 
+  if (
+    paymentIntent !== undefined &&
+    paymentIntent !== 'full_payment' &&
+    paymentIntent !== 'deposit'
+  ) {
+    return res.status(400).json({ error: 'نوع السداد الإلكتروني غير صالح' });
+  }
+
   const effectivePaymentMode: 'deposit_online' | 'cash_on_delivery' =
     paymentMode || (depositMethod === 'cash_on_delivery' ? 'cash_on_delivery' : 'deposit_online');
 
@@ -3075,15 +3098,20 @@ router.post('/orders', async (req: Request, res: Response) => {
 
   const allowedOnlineMethods = ['card', 'vodafone_cash', 'instapay', 'orange_cash', 'etisalat_cash', 'bank_transfer', 'cash', 'other'];
 
-  if (paymentMode === 'deposit_online') {
-    if (!depositMethod) {
-      return res.status(400).json({ error: 'يرجى اختيار طريقة دفع العربون (الكارت البنكي، إنستاباي، فودافون كاش، ...)' });
+  const effectiveOnlineMethod =
+    typeof paymentMethodCode === 'string' && paymentMethodCode.trim()
+      ? paymentMethodCode.trim()
+      : depositMethod;
+
+  if (effectivePaymentMode === 'deposit_online') {
+    if (!effectiveOnlineMethod) {
+      return res.status(400).json({ error: 'يرجى اختيار طريقة الدفع الإلكتروني' });
     }
-    if (depositMethod === 'cash_on_delivery') {
-      return res.status(400).json({ error: 'طريقة الدفع غير متوافقة مع اختيار العربون الإلكتروني' });
+    if (effectiveOnlineMethod === 'cash_on_delivery') {
+      return res.status(400).json({ error: 'طريقة الدفع عند الاستلام لا تنشئ جلسة دفع إلكتروني' });
     }
-    if (!allowedOnlineMethods.includes(depositMethod)) {
-      return res.status(400).json({ error: 'طريقة دفع العربون غير صالحة' });
+    if (!allowedOnlineMethods.includes(effectiveOnlineMethod)) {
+      return res.status(400).json({ error: 'طريقة الدفع الإلكتروني المحددة غير صالحة' });
     }
   }
 
@@ -3140,6 +3168,12 @@ router.post('/orders', async (req: Request, res: Response) => {
   let remainingAmount = totalAmount;
   let finalDepositMethod: string = 'instapay';
   let finalDepositReference: string | null = null;
+  const resolvedPaymentIntent =
+    effectivePaymentMode === 'cash_on_delivery'
+      ? undefined
+      : paymentIntent === 'full_payment'
+        ? 'full_payment'
+        : 'deposit';
 
   if (effectivePaymentMode === 'cash_on_delivery') {
     depositAmount = 0;
@@ -3147,15 +3181,52 @@ router.post('/orders', async (req: Request, res: Response) => {
     remainingAmount = totalAmount;
     finalDepositMethod = 'cash_on_delivery';
     finalDepositReference = null;
+  } else if (resolvedPaymentIntent === 'full_payment') {
+    // A full online payment is independent from whether the deposit option is enabled.
+    depositAmount = totalAmount;
+    depositStatus = 'pending';
+    remainingAmount = 0;
+    finalDepositMethod = effectiveOnlineMethod || 'other';
+    finalDepositReference = depositReference ? String(depositReference).trim() : null;
   } else {
-    const depositPct = Number(settings.deposit_percentage || 20);
-    const minDeposit = Number(settings.min_deposit_amount || 50);
-    if (depositPct > 0) {
-      depositAmount = Math.min(totalAmount, Math.max(minDeposit, Math.round((totalAmount * depositPct) / 100)));
+    const depositRequiredByPolicy =
+      Boolean(settings.deposit_required) ||
+      settings.default_payment_policy === 'deposit_required';
+    const depositEnabled =
+      settings.deposit_enabled !== undefined && settings.deposit_enabled !== null
+        ? Boolean(settings.deposit_enabled)
+        : depositRequiredByPolicy;
+
+    if (!depositEnabled) {
+      return res.status(409).json({ error: 'خيار دفع العربون غير مفعّل حالياً' });
     }
+
+    const depositType =
+      settings.deposit_type === 'percentage' || settings.deposit_type === 'fixed'
+        ? settings.deposit_type
+        : 'percentage';
+    let depositValue =
+      settings.deposit_value !== undefined && settings.deposit_value !== null
+        ? Number(settings.deposit_value)
+        : Number(settings.deposit_percentage || 20);
+    let minDeposit =
+      settings.minimum_deposit !== undefined && settings.minimum_deposit !== null
+        ? Number(settings.minimum_deposit)
+        : Number(settings.min_deposit_amount || 50);
+
+    if (!Number.isFinite(depositValue) || depositValue < 0) depositValue = 0;
+    if (!Number.isFinite(minDeposit) || minDeposit < 0) minDeposit = 0;
+    if (depositType === 'percentage') {
+      depositValue = Math.min(100, depositValue);
+      depositAmount = Math.max(minDeposit, Math.round((totalAmount * depositValue) / 100));
+    } else {
+      depositAmount = Math.max(minDeposit, depositValue);
+    }
+
+    depositAmount = Math.min(totalAmount, Math.round(depositAmount * 100) / 100);
     remainingAmount = Math.max(0, Math.round((totalAmount - depositAmount) * 100) / 100);
     depositStatus = 'pending';
-    finalDepositMethod = depositMethod || 'instapay';
+    finalDepositMethod = effectiveOnlineMethod || 'other';
     finalDepositReference = depositReference ? String(depositReference).trim() : null;
   }
 
@@ -3188,13 +3259,18 @@ router.post('/orders', async (req: Request, res: Response) => {
     depositAmount,
     depositStatus,
     paymentMode: effectivePaymentMode,
+    paymentIntent: resolvedPaymentIntent,
+    paymentMethodCode: effectiveOnlineMethod || finalDepositMethod,
     customerPhone: cleanPhone,
   }, req.ip);
   broadcastRealtimeEvent('new_order', createdOrder);
 
-  const successMessage = effectivePaymentMode === 'cash_on_delivery'
-    ? 'تم استلام طلبك بنجاح بنظام الدفع عند الاستلام وجاري تجهيز الصيد الطازج'
-    : 'تم استلام طلبك بنجاح وجاري مراجعة العربون وتجهيز الصيد الطازج';
+  const successMessage =
+    effectivePaymentMode === 'cash_on_delivery'
+      ? 'تم استلام طلبك بنجاح بنظام الدفع عند الاستلام'
+      : resolvedPaymentIntent === 'full_payment'
+        ? 'تم تسجيل الطلب وجاري إكمال سداد المبلغ بالكامل'
+        : 'تم تسجيل الطلب وجاري إكمال دفع العربون';
 
   return res.status(201).json({ success: true, message: successMessage, order: createdOrder });
 });
