@@ -296,19 +296,24 @@ async function confirmOrderPayment(
   const isManual = confirmedBy !== 'payment-orchestration';
   const auditNote = isManual
     ? `تأكيد يدوي من لوحة الإدارة بواسطة ${confirmedBy} / event ${eventId} / فرق ${Number(session.amount_difference || 0).toFixed(2)} ج.م`
-    : `تأكيد آلي من Payment Orchestration / event ${eventId} / فرق ${Number(session.amount_difference || 0).toFixed(2)} ج.م`;
+    : `تأكيد آلي من Payment Orchestration / ${session.payment_intent === 'full_payment' ? 'سداد كامل' : 'عربون'} / event ${eventId} / فرق ${Number(session.amount_difference || 0).toFixed(2)} ج.م`;
 
-  // FIX 22: Derive deposit_method generically from payment source / channel rather than hardcoded vf_cash
+  // Record the customer-facing payment method, not the internal notification source.
   let depositMethod = provider === 'vf_cash' ? 'vodafone_cash' : provider === 'bank_alahly' ? 'bank_transfer' : String(provider);
-  if (session.payment_source_id) {
+  if (session.customer_payment_method_id) {
+    const { data: method } = await supabaseServer
+      .from('customer_payment_methods')
+      .select('code')
+      .eq('id', session.customer_payment_method_id)
+      .maybeSingle();
+    if (method?.code) depositMethod = String(method.code);
+  } else if (session.payment_source_id) {
     const { data: src } = await supabaseServer
       .from('payment_sources')
       .select('code,channel')
       .eq('id', session.payment_source_id)
       .maybeSingle();
-    if (src) {
-      depositMethod = src.code || src.channel || depositMethod;
-    }
+    if (src) depositMethod = src.code || src.channel || depositMethod;
   }
 
   const { error } = await supabaseServer
