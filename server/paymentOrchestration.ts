@@ -1460,22 +1460,61 @@ paymentRouter.get('/admin/payments/overview', requireAuth, async (_req: Authenti
     };
   });
 
-  const problemOrders = (problemOrdersRes.data || []).map((ord: any) => ({
-    id: ord.id,
-    orderNumber: ord.order_number || ord.id,
-    customerName: ord.customer_name || 'عميل غير مسجل',
-    customerPhone: ord.customer_phone || '-',
-    totalAmount: Number(ord.total_amount || 0),
-    depositExpected: Number(ord.deposit_amount || 0),
-    depositPaid: Number(ord.deposit_paid || 0),
-    difference: Number(ord.deposit_paid || 0) - Number(ord.deposit_amount || 0),
-    orderStatus: ord.status,
-    depositStatus: ord.deposit_status,
-    paymentMode: ord.payment_mode || 'deposit_online',
-    paymentMethod: ord.deposit_method || 'electronic',
-    problemReason: ord.deposit_status === 'pending' ? 'بانتظار تأكيد العربون' : 'عربون مرفوض',
-    createdAt: ord.created_at,
-  }));
+  const overviewReviews = reviewsResult.data || [];
+  const overviewSessions = sessionsResult.data || [];
+
+  // Normalize problem-order payload for the admin UI and attach the identifiers
+  // required by manual actions. The UI expects reviewItemId/sessionId plus
+  // expectedDeposit/paidAmount; returning only the raw order fields made the
+  // confirmation dialog close without issuing any POST request.
+  const problemOrders = (problemOrdersRes.data || []).map((ord: any) => {
+    const linkedReview = overviewReviews.find(
+      (review: any) => review.order_id === ord.id && review.status === 'open'
+    );
+    const linkedSession =
+      overviewSessions.find(
+        (session: any) =>
+          session.order_id === ord.id &&
+          ['needs_review', 'expired_needs_review', 'underpaid', 'amount_mismatch', 'late_payment', 'waiting'].includes(
+            String(session.status)
+          )
+      ) ||
+      overviewSessions.find((session: any) => session.order_id === ord.id);
+
+    const expectedDeposit = Number(ord.deposit_amount || 0);
+    const paidAmount = Number(ord.deposit_paid || 0);
+
+    return {
+      id: ord.id,
+      orderId: ord.id,
+      orderNumber: ord.order_number || ord.id,
+      customerName: ord.customer_name || 'عميل غير مسجل',
+      customerPhone: ord.customer_phone || '-',
+      totalAmount: Number(ord.total_amount || 0),
+      expectedDeposit,
+      paidAmount,
+      // Keep the legacy aliases temporarily for older clients.
+      depositExpected: expectedDeposit,
+      depositPaid: paidAmount,
+      difference: paidAmount - expectedDeposit,
+      orderStatus: ord.status,
+      depositStatus: ord.deposit_status,
+      paymentMode: ord.payment_mode || 'deposit_online',
+      paymentMethod: ord.deposit_method || 'electronic',
+      problemReason:
+        linkedReview?.reason ||
+        (ord.deposit_status === 'pending' ? 'pending_deposit' : 'rejected_deposit'),
+      problemDetails:
+        linkedReview?.details && typeof linkedReview.details === 'object'
+          ? JSON.stringify(linkedReview.details)
+          : undefined,
+      reviewItemId: linkedReview?.id || undefined,
+      reviewId: linkedReview?.id || null,
+      sessionId: linkedSession?.id || linkedReview?.session_id || undefined,
+      sessionStatus: linkedSession?.status || null,
+      createdAt: ord.created_at,
+    };
+  });
 
   return res.json({
     devices,
@@ -1579,6 +1618,90 @@ paymentRouter.patch(
     logAuditAction(req.admin, 'update_payment_device', 'payment_device', req.params.id, existing, auditUpdates, req.ip);
     broadcastRealtimeEvent('payment_device_updated', data);
     return res.json(data);
+  }
+);
+
+paymentRouter.post(
+  '/admin/payments/sessions/:id/confirm-manual',
+  requireAuth,
+  requireRole(['super_admin', 'manager', 'operator']),
+  async (req: AuthenticatedRequest, res: Response) => {
+    const { data: session, error: sessionError } = await supabaseServer
+      .from('payment_sessions')
+      .select('*')
+      .eq('id', req.params.id)
+      .maybeSingle();
+
+    if (sessionError) return res.status(503).json({ error: 'تعذر تحميل جلسة الدفع' });
+    if (!session) return res.status(404).json({ error: 'جلسة الدفع غير موجودة' });
+
+    if (session.status === 'paid') {
+      return res.json(mapSession(session));
+    }
+
+    if (session.status === 'cancelled') {
+      return res.status(409).json({ error: 'لا يمكن اعتماد جلسة دفع ملغاة' });
+    }
+
+    const received = Number(
+      req.body?.receivedAmount ?? session.matched_amount ?? session.expected_amount
+    );
+    if (!Number.isFinite(received) || received <= 0) {
+      return res.status(400).json({ error: 'مبلغ الدفع غير صالح' });
+    }
+
+    const provider = normalizeProvider(session.provider);
+    if (!provider) {
+      return res.status(400).json({ error: 'مزود الدفع غير صالح' });
+    }
+
+    const expected = Number(session.expected_amount || 0);
+    const difference = received - expected;
+    const now = new Date().toISOString();
+
+    const { data: paid, error: paidError } = await supabaseServer
+      .from('payment_sessions')
+      .update({
+        status: 'paid',
+        matched_amount: received,
+        amount_difference: difference,
+        paid_at: now,
+        updated_at: now,
+      })
+      .eq('id', session.id)
+      .select('*')
+      .single();
+
+    if (paidError) {
+      return res.status(503).json({ error: 'تعذر اعتماد جلسة الدفع يدوياً' });
+    }
+
+    await releaseDeviceForSession(String(session.id));
+
+    const adminActor = req.admin?.email || req.admin?.id || 'admin';
+    const eventPublicId = `manual-${session.id}-${Date.now()}`;
+    await confirmOrderPayment(
+      { ...paid, amount_difference: difference },
+      received,
+      provider,
+      eventPublicId,
+      adminActor
+    );
+
+    const mapped = mapSession(paid);
+    broadcastSessionEvent(String(session.id), 'payment_confirmed', mapped);
+    broadcastRealtimeEvent('payment_session_paid', mapped);
+    logAuditAction(
+      req.admin,
+      'confirm_payment_session_manual',
+      'payment_session',
+      String(session.id),
+      session,
+      paid,
+      req.ip
+    );
+
+    return res.json(mapped);
   }
 );
 
