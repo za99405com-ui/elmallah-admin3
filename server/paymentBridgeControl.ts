@@ -91,7 +91,7 @@ export async function fetchDeviceRules(deviceRowId: string, device: any) {
     // return only the sources assigned and enabled for this device.
     sources = assignments
       .map((a: any) => a.payment_source)
-      .filter((s: any) => s && s.enabled);
+      .filter((s: any) => Boolean(s));
   } else if (error) {
     // Graceful fallback ONLY if table does not exist or errored (legacy database state before migration)
     const codes: string[] = [];
