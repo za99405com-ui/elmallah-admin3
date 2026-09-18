@@ -47,6 +47,7 @@ export const ProductsTab: React.FC = () => {
   const [price, setPrice] = useState<number>(50);
   const [imageUrl, setImageUrl] = useState<string>(SEAFOOD_SAMPLE_IMAGES[0].url);
   const [isUploading, setIsUploading] = useState<boolean>(false);
+  const [isSavingProduct, setIsSavingProduct] = useState<boolean>(false);
   const [variants, setVariants] = useState<Array<{ id?: string; title: string; weightKg: number; pieceCount: number; price: number }>>([]);
 
   const fileInputRef = useRef<HTMLInputElement>(null);
@@ -160,9 +161,9 @@ export const ProductsTab: React.FC = () => {
     }
   };
 
-  const handleSubmit = (e: React.FormEvent) => {
+  const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!name.trim()) return;
+    if (!name.trim() || isSavingProduct) return;
 
     const matchedCategory = categories.find((c) => c.id === categoryId);
     const categoryName = matchedCategory ? matchedCategory.name : 'عام';
@@ -176,32 +177,41 @@ export const ProductsTab: React.FC = () => {
       price: Number(v.price) || price,
     }));
 
-    if (editingProduct) {
-      updateProduct(editingProduct.id, {
-        name,
-        description,
-        categoryId,
-        categoryName,
-        pricingUnit,
-        price,
-        imageUrl,
-        variants: formattedVariants,
-      });
-    } else {
-      addProduct({
-        name,
-        description,
-        categoryId,
-        categoryName,
-        pricingUnit,
-        price,
-        imageUrl,
-        isFreshOnly: true,
-        variants: formattedVariants,
-      });
-    }
+    setIsSavingProduct(true);
+    try {
+      if (editingProduct) {
+        await updateProduct(editingProduct.id, {
+          name,
+          description,
+          categoryId,
+          categoryName,
+          pricingUnit,
+          price,
+          imageUrl,
+          variants: formattedVariants,
+        });
+      } else {
+        await addProduct({
+          name,
+          description,
+          categoryId,
+          categoryName,
+          pricingUnit,
+          price,
+          imageUrl,
+          isFreshOnly: true,
+          variants: formattedVariants,
+        });
+      }
 
-    setIsModalOpen(false);
+      // Close only after the server has durably accepted the product.
+      setIsModalOpen(false);
+    } catch {
+      // AppContext already shows the server error toast.
+      // Keep the form open so the entered product is not lost.
+    } finally {
+      setIsSavingProduct(false);
+    }
   };
 
   const filteredProducts = products.filter((p) => {
@@ -614,15 +624,21 @@ export const ProductsTab: React.FC = () => {
                 <button
                   type="button"
                   onClick={() => setIsModalOpen(false)}
-                  className="px-3 py-1.5 rounded-lg border border-slate-200 dark:border-slate-700 text-xs font-bold"
+                  disabled={isSavingProduct}
+                  className="px-3 py-1.5 rounded-lg border border-slate-200 dark:border-slate-700 text-xs font-bold disabled:opacity-50"
                 >
                   إلغاء
                 </button>
                 <button
                   type="submit"
-                  className="px-4 py-1.5 rounded-lg bg-cyan-500 text-slate-950 text-xs font-bold hover:bg-cyan-400"
+                  disabled={isSavingProduct || isUploading}
+                  className="px-4 py-1.5 rounded-lg bg-cyan-500 text-slate-950 text-xs font-bold hover:bg-cyan-400 disabled:opacity-50 disabled:cursor-not-allowed"
                 >
-                  {editingProduct ? 'حفظ التعديلات' : 'إضافة الصنف'}
+                  {isSavingProduct
+                    ? 'جاري الحفظ...'
+                    : editingProduct
+                      ? 'حفظ التعديلات'
+                      : 'إضافة الصنف'}
                 </button>
               </div>
             </form>
