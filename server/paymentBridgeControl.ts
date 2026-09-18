@@ -191,7 +191,7 @@ paymentBridgeControlRouter.post('/payment-bridge/source-config', verifyPaymentBr
     }
   }
 
-  const updates = {
+  const updates: Record<string, unknown> = {
     source_package: packageNames[0],
     source_packages: packageNames,
     source_sender: optionalText(req.body?.sourceSender, 250),
@@ -204,10 +204,22 @@ paymentBridgeControlRouter.post('/payment-bridge/source-config', verifyPaymentBr
     updated_at: new Date().toISOString(),
   };
 
-  const { error: updateError } = await supabaseServer
+  let { error: updateError } = await supabaseServer
     .from('payment_sources')
     .update(updates)
     .eq('id', sourceId);
+
+  // Pre-migration compatibility: source_packages is additive. The first selected
+  // package still persists in source_package until V3 is applied.
+  if (updateError && (String(updateError.code || '') === '42703' || String(updateError.code || '') === 'PGRST204')) {
+    const legacyUpdates = { ...updates };
+    delete legacyUpdates.source_packages;
+    const retry = await supabaseServer
+      .from('payment_sources')
+      .update(legacyUpdates)
+      .eq('id', sourceId);
+    updateError = retry.error;
+  }
 
   if (updateError) return res.status(503).json({ error: 'Could not save payment source parser configuration' });
 
