@@ -2057,6 +2057,92 @@ paymentRouter.get('/payments/sessions/:id/status', async (req: Request, res: Res
   return res.json(mapSession(session));
 });
 
+paymentRouter.patch('/payments/sessions/:id/payer-phone', async (req: Request, res: Response) => {
+  const session = await loadClientSession(req, res);
+  if (!session) return;
+  if (session.status !== 'waiting') {
+    return res.status(409).json({ error: 'لا يمكن تعديل رقم المحول بعد انتهاء جلسة الدفع' });
+  }
+
+  const expectedPayerPhone = normalizePhone(req.body?.payerPhone);
+  if (!expectedPayerPhone || !isValidEgyptianMobile(expectedPayerPhone)) {
+    return res.status(400).json({ error: 'يرجى إدخال رقم موبايل مصري صحيح للمحفظة التي سيتم التحويل منها' });
+  }
+
+  if (session.device_id) {
+    const { data: duplicateSession, error: duplicateError } = await supabaseServer
+      .from('payment_sessions')
+      .select('id')
+      .eq('device_id', session.device_id)
+      .eq('status', 'waiting')
+      .eq('expected_payer_phone', expectedPayerPhone)
+      .neq('id', session.id)
+      .gt('expires_at', new Date().toISOString())
+      .limit(1)
+      .maybeSingle();
+
+    if (duplicateError) {
+      return res.status(503).json({ error: 'تعذر التحقق من رقم المحول حالياً' });
+    }
+    if (duplicateSession) {
+      return res.status(409).json({
+        error: 'هذا الرقم مرتبط بجلسة دفع نشطة أخرى على نفس جهاز الاستقبال. أنهِ الجلسة الأخرى أو استخدم رقم تحويل مختلف.',
+      });
+    }
+  }
+
+  const now = new Date().toISOString();
+  const { data: updated, error } = await supabaseServer
+    .from('payment_sessions')
+    .update({
+      expected_payer_phone: expectedPayerPhone,
+      payer_phone_confirmed_at: now,
+      updated_at: now,
+    })
+    .eq('id', session.id)
+    .eq('status', 'waiting')
+    .select('*')
+    .single();
+
+  if (error) return res.status(503).json({ error: 'تعذر حفظ رقم المحول' });
+
+  const mapped = mapSession(updated);
+  broadcastSessionEvent(String(session.id), 'payment_session_updated', mapped);
+  return res.json(mapped);
+});
+
+paymentRouter.post('/payments/sessions/:id/client-cancel', async (req: Request, res: Response) => {
+  const session = await loadClientSession(req, res);
+  if (!session) return;
+  if (session.status === 'paid') {
+    return res.status(409).json({ error: 'تم تأكيد الدفع بالفعل ولا يمكن إلغاء الجلسة' });
+  }
+  if (session.status === 'cancelled') return res.json(mapSession(session));
+
+  const now = new Date().toISOString();
+  const { data: updated, error } = await supabaseServer
+    .from('payment_sessions')
+    .update({
+      status: 'cancelled',
+      cancelled_at: now,
+      cancellation_reason: String(req.body?.reason || 'customer_cancelled'),
+      updated_at: now,
+    })
+    .eq('id', session.id)
+    .neq('status', 'paid')
+    .select('*')
+    .single();
+
+  if (error) return res.status(503).json({ error: 'تعذر إلغاء جلسة الدفع' });
+
+  await releaseDeviceForSession(String(session.id));
+  const mapped = mapSession(updated);
+  broadcastSessionEvent(String(session.id), 'payment_session_updated', mapped);
+  broadcastRealtimeEvent('payment_session_updated', mapped);
+  return res.json(mapped);
+});
+
+
 paymentRouter.get('/payments/sessions/:id/events', async (req: Request, res: Response) => {
   const session = await loadClientSession(req, res);
   if (!session) return;
@@ -2470,23 +2556,51 @@ paymentRouter.post('/payment-bridge/events', verifyBridgeRequest, async (req: Ra
     return capturedAtMs >= created - 15_000 && capturedAtMs <= expires + LATE_MATCH_WINDOW_MS;
   });
 
-  // If busy_session_id is known on the device and not already in candidates, check it as well
-  if (device.busy_session_id && !candidates.some((c) => c.id === device.busy_session_id)) {
-    const { data: busySession } = await supabaseServer
-      .from('payment_sessions')
-      .select('*')
-      .eq('id', device.busy_session_id)
-      .in('status', ['waiting', 'expired', 'expired_needs_review', 'needs_review'])
-      .maybeSingle();
+  if (payerPhone && candidates.length > 0) {
+    const exactExpectedPhone = candidates.filter(
+      (session: any) => normalizePhone(session.expected_payer_phone) === payerPhone
+    );
 
-    if (busySession) {
-      const created = new Date(busySession.created_at).getTime();
-      const expires = new Date(busySession.expires_at).getTime();
-      const providerMatches =
-        normalizeProvider(busySession.provider) === provider ||
-        (resolvedSource && busySession.payment_source_id === resolvedSource.id);
-      if (providerMatches && capturedAtMs >= created - 15_000 && capturedAtMs <= expires + LATE_MATCH_WINDOW_MS) {
-        candidates.push(busySession);
+    if (exactExpectedPhone.length > 0) {
+      candidates = exactExpectedPhone;
+    } else {
+      const sessionsWithoutExpectedPhone = candidates.filter(
+        (session: any) => !normalizePhone(session.expected_payer_phone)
+      );
+
+      if (sessionsWithoutExpectedPhone.length > 0) {
+        candidates = sessionsWithoutExpectedPhone;
+      } else {
+        await supabaseServer
+          .from('payment_bridge_events')
+          .update({
+            match_status: 'no_match',
+            processing_notes: {
+              reason: 'payer_phone_mismatch',
+              payerPhone,
+              candidateSessionIds: candidates.slice(0, 5).map((session: any) => session.id),
+            },
+          })
+          .eq('id', eventRow.id);
+
+        await createReviewItem({
+          reason: 'no_match',
+          eventId: eventRow.id,
+          receivedAmount,
+          details: {
+            reason: 'payer_phone_mismatch',
+            payerPhone,
+            candidateSessionIds: candidates.slice(0, 5).map((session: any) => session.id),
+          },
+        });
+
+        return res.json({
+          status: 'accepted',
+          eventId,
+          matchStatus: 'NO_MATCH',
+          message: 'Payer phone did not match an active session',
+          serverTimestamp: Date.now(),
+        });
       }
     }
   }
@@ -2514,12 +2628,20 @@ paymentRouter.post('/payment-bridge/events', verifyBridgeRequest, async (req: Ra
         const tolerance = Number(session.amount_tolerance || 0);
         const diff = receivedAmount - expected;
         const absDiff = Math.abs(diff);
-        const phone = normalizePhone(session.customer_phone);
-        const phoneBoost = payerPhone && phone && payerPhone === phone ? 10_000 : 0;
-        const busyBoost = session.id === device.busy_session_id ? 1_500 : 0;
+        const expectedPayerPhone = normalizePhone(session.expected_payer_phone);
+        const orderPhone = normalizePhone(session.customer_phone);
+        const expectedPhoneBoost =
+          payerPhone && expectedPayerPhone && payerPhone === expectedPayerPhone ? 20_000 : 0;
+        const weakOrderPhoneBoost =
+          !expectedPayerPhone && payerPhone && orderPhone && payerPhone === orderPhone ? 250 : 0;
         const timeDistance = Math.abs(capturedAtMs - new Date(session.created_at).getTime());
         const amountScore = absDiff <= tolerance || diff < 0 ? Math.max(0, 5_000 - absDiff * 100) : 0;
-        return { session, score: phoneBoost + busyBoost + amountScore - timeDistance / 1000, absDiff, tolerance };
+        return {
+          session,
+          score: expectedPhoneBoost + weakOrderPhoneBoost + amountScore - timeDistance / 1000,
+          absDiff,
+          tolerance,
+        };
       })
       .sort((a, b) => b.score - a.score);
 
