@@ -438,10 +438,23 @@ BEGIN
                  WHERE pds.device_id = d.id
                    AND pds.payment_source_id = v_source.id
                    AND pds.enabled = true
+                   AND COALESCE(
+                        NULLIF(trim(pds.destination), ''),
+                        NULLIF(trim(d.payment_destination), ''),
+                        NULLIF(trim(v_source.destination), '')
+                   ) IS NOT NULL
             ))
-            -- Or legacy fallback boolean flags
-            OR (v_clean_provider IN ('vf_cash', 'vodafone_cash') AND d.vf_cash_enabled = true)
-            OR (v_clean_provider IN ('bank_alahly', 'nbe') AND d.bank_alahly_enabled = true)
+            -- Or legacy fallback boolean flags, only with a usable destination.
+            OR (
+                v_clean_provider IN ('vf_cash', 'vodafone_cash')
+                AND d.vf_cash_enabled = true
+                AND COALESCE(NULLIF(trim(d.payment_destination), ''), NULLIF(trim(v_source.destination), '')) IS NOT NULL
+            )
+            OR (
+                v_clean_provider IN ('bank_alahly', 'nbe')
+                AND d.bank_alahly_enabled = true
+                AND COALESCE(NULLIF(trim(d.payment_destination), ''), NULLIF(trim(v_source.destination), '')) IS NOT NULL
+            )
        )
      ORDER BY d.last_heartbeat_at DESC, d.created_at ASC
      FOR UPDATE SKIP LOCKED
