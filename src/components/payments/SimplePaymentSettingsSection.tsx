@@ -70,7 +70,7 @@ export const SimplePaymentSettingsSection: React.FC<SimplePaymentSettingsSection
   const load = async () => {
     try {
       setError(null);
-      const data = await adminRequest<SimplePaymentState>('/api/admin/payments/simple-settings');
+      const data = (await adminRequest('/api/admin/payments/simple-settings')) as SimplePaymentState;
       setState(data);
     } catch (err) {
       setError(err instanceof Error ? err.message : 'تعذر تحميل إعدادات الدفع');
@@ -86,10 +86,10 @@ export const SimplePaymentSettingsSection: React.FC<SimplePaymentSettingsSection
       setBusyKey(changed);
       setError(null);
       setSaved(null);
-      const result = await adminRequest<SimplePaymentState>('/api/admin/payments/simple-settings', {
+      const result = (await adminRequest('/api/admin/payments/simple-settings', {
         method: 'PUT',
         body: JSON.stringify({ ...next, changed }),
-      });
+      })) as SimplePaymentState;
       setState(result);
       setSaved('تم حفظ إعدادات الدفع وربطها بالمتجر وتطبيق جسر المدفوعات.');
       await onRefresh?.();
