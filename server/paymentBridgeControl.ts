@@ -167,6 +167,9 @@ export async function fetchDeviceRules(deviceRowId: string, device: any) {
         assignment?.account_identifier_regex ?? s.account_identifier_regex ?? undefined,
       priority: Number(s.priority ?? 100),
       parserType: assignment?.parser_type ?? s.parser_type ?? 'regex',
+      appName: assignment?.app_name ?? undefined,
+      sampleSenderTitle: assignment?.sample_sender_title ?? undefined,
+      sampleMessage: assignment?.sample_message ?? undefined,
     };
   });
 
@@ -239,6 +242,9 @@ paymentBridgeControlRouter.post('/payment-bridge/source-config', verifyPaymentBr
     payer_phone_regex: payerPhoneRegex,
     account_identifier_regex: accountIdentifierRegex,
     parser_type: parserType,
+    app_name: optionalText(req.body?.appName, 250),
+    sample_sender_title: optionalText(req.body?.sampleSenderTitle, 250),
+    sample_message: optionalText(req.body?.sampleMessage, 5000),
     updated_at: now,
   };
 
