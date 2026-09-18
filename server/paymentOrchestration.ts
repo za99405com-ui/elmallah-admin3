@@ -73,6 +73,9 @@ function mapSession(row: Record<string, any>) {
     customerId: row.customer_id || undefined,
     customerPhone: row.customer_phone || undefined,
     provider: row.provider,
+    paymentSourceId: row.payment_source_id || undefined,
+    customerPaymentMethodId: row.customer_payment_method_id || undefined,
+    paymentIntent: row.payment_intent || undefined,
     expectedAmount: Number(row.expected_amount),
     amountTolerance: Number(row.amount_tolerance || 0),
     currency: row.currency || 'EGP',
@@ -375,6 +378,7 @@ async function getAdminPaymentSettings(): Promise<{
   defaultPaymentPolicy: string;
   sessionTimeoutSeconds: number;
   amountTolerance: number;
+  depositEnabled: boolean;
   depositRequired: boolean;
   depositType: 'fixed' | 'percentage';
   depositValue: number;
@@ -391,6 +395,7 @@ async function getAdminPaymentSettings(): Promise<{
   const tolerance = Number(legacy?.payment_amount_tolerance || 10);
 
   let depositRequired = defaultPolicy === 'deposit_required';
+  let depositEnabled = depositRequired;
   let depositType: 'fixed' | 'percentage' = 'fixed';
   let depositValue = 100;
   let minimumDeposit = 50;
@@ -398,11 +403,14 @@ async function getAdminPaymentSettings(): Promise<{
   try {
     const { data: v3, error: v3Error } = await supabaseServer
       .from('store_settings')
-      .select('deposit_required,deposit_type,deposit_value,minimum_deposit')
+      .select('deposit_enabled,deposit_required,deposit_type,deposit_value,minimum_deposit')
       .eq('id', 1)
       .maybeSingle();
 
     if (!v3Error && v3) {
+      if (v3.deposit_enabled !== null && v3.deposit_enabled !== undefined) {
+        depositEnabled = Boolean(v3.deposit_enabled);
+      }
       if (v3.deposit_required !== null && v3.deposit_required !== undefined) {
         depositRequired = Boolean(v3.deposit_required);
       }
@@ -424,6 +432,7 @@ async function getAdminPaymentSettings(): Promise<{
     defaultPaymentPolicy: defaultPolicy,
     sessionTimeoutSeconds: timeoutSeconds,
     amountTolerance: tolerance,
+    depositEnabled: depositEnabled || depositRequired,
     depositRequired,
     depositType,
     depositValue,
@@ -444,6 +453,7 @@ paymentRouter.put(
     const policy = req.body?.defaultPaymentPolicy;
     const timeout = Number(req.body?.sessionTimeoutSeconds);
     const tolerance = Number(req.body?.amountTolerance);
+    const depositEnabled = req.body?.depositEnabled !== undefined ? Boolean(req.body.depositEnabled) : undefined;
     const depositRequired = req.body?.depositRequired !== undefined ? Boolean(req.body.depositRequired) : undefined;
     const depositType = req.body?.depositType;
     const depositValue = req.body?.depositValue !== undefined ? Number(req.body.depositValue) : undefined;
@@ -485,9 +495,15 @@ paymentRouter.put(
     if (policy) updates.default_payment_policy = policy;
     if (timeout) updates.payment_session_timeout_seconds = timeout;
     if (tolerance !== undefined) updates.payment_amount_tolerance = tolerance;
+    if (depositEnabled !== undefined) updates.deposit_enabled = depositEnabled;
     if (depositRequired !== undefined) {
       updates.deposit_required = depositRequired;
-      if (depositRequired && !policy) updates.default_payment_policy = 'deposit_required';
+      if (depositRequired) {
+        updates.deposit_enabled = true;
+        if (!policy) updates.default_payment_policy = 'deposit_required';
+      } else if (!policy && currentSettings.defaultPaymentPolicy === 'deposit_required') {
+        updates.default_payment_policy = 'cod_allowed';
+      }
     }
     if (depositType) updates.deposit_type = depositType;
     if (depositValue !== undefined) updates.deposit_value = depositValue;
@@ -528,6 +544,7 @@ paymentRouter.put(
       defaultPaymentPolicy: savedData.default_payment_policy || policy || currentSettings.defaultPaymentPolicy,
       sessionTimeoutSeconds: Number(savedData.payment_session_timeout_seconds || timeout || currentSettings.sessionTimeoutSeconds),
       amountTolerance: Number(savedData.payment_amount_tolerance ?? tolerance ?? currentSettings.amountTolerance),
+      depositEnabled: Boolean(savedData.deposit_enabled ?? depositEnabled ?? currentSettings.depositEnabled ?? currentSettings.depositRequired),
       depositRequired: Boolean(savedData.deposit_required ?? depositRequired ?? currentSettings.depositRequired),
       depositType: savedData.deposit_type || depositType || currentSettings.depositType,
       depositValue: Number(savedData.deposit_value ?? depositValue ?? currentSettings.depositValue),
@@ -645,6 +662,9 @@ paymentRouter.post(
       enabled: req.body?.enabled !== false,
       parser_type: parserType,
       source_package: req.body?.sourcePackage ? String(req.body.sourcePackage).trim() : null,
+      source_packages: Array.isArray(req.body?.sourcePackages)
+        ? req.body.sourcePackages.map((v: unknown) => String(v).trim()).filter(Boolean)
+        : (req.body?.sourcePackage ? [String(req.body.sourcePackage).trim()] : []),
       source_sender: req.body?.sourceSender ? String(req.body.sourceSender).trim() : null,
       title_contains: req.body?.titleContains ? String(req.body.titleContains).trim() : null,
       body_contains: req.body?.bodyContains ? String(req.body.bodyContains).trim() : null,
@@ -699,6 +719,11 @@ paymentRouter.patch(
       updates.parser_type = pt;
     }
     if (req.body?.sourcePackage !== undefined) updates.source_package = req.body.sourcePackage ? String(req.body.sourcePackage).trim() : null;
+    if (req.body?.sourcePackages !== undefined) {
+      updates.source_packages = Array.isArray(req.body.sourcePackages)
+        ? req.body.sourcePackages.map((v: unknown) => String(v).trim()).filter(Boolean)
+        : [];
+    }
     if (req.body?.sourceSender !== undefined) updates.source_sender = req.body.sourceSender ? String(req.body.sourceSender).trim() : null;
     if (req.body?.titleContains !== undefined) updates.title_contains = req.body.titleContains ? String(req.body.titleContains).trim() : null;
     if (req.body?.bodyContains !== undefined) updates.body_contains = req.body.bodyContains ? String(req.body.bodyContains).trim() : null;
@@ -1246,6 +1271,9 @@ paymentRouter.get('/admin/payments/overview', requireAuth, async (_req: Authenti
     parserType: s.parser_type || 'regex',
     sourceSender: s.source_sender || null,
     sourcePackage: s.source_package || null,
+    sourcePackages: Array.isArray(s.source_packages) && s.source_packages.length > 0
+      ? s.source_packages
+      : (s.source_package ? [s.source_package] : []),
     titleContains: s.title_contains || null,
     bodyContains: s.body_contains || null,
     amountRegex: s.amount_regex || null,
@@ -1939,10 +1967,19 @@ function isMissingV3ColumnError(err: any): boolean {
   const mentionsV3Columns =
     message.includes('payment_source_id') ||
     message.includes('account_identifier') ||
+    message.includes('payment_intent') ||
+    message.includes('deposit_enabled') ||
+    message.includes('source_packages') ||
     details.includes('payment_source_id') ||
     details.includes('account_identifier') ||
+    details.includes('payment_intent') ||
+    details.includes('deposit_enabled') ||
+    details.includes('source_packages') ||
     hint.includes('payment_source_id') ||
-    hint.includes('account_identifier');
+    hint.includes('account_identifier') ||
+    hint.includes('payment_intent') ||
+    hint.includes('deposit_enabled') ||
+    hint.includes('source_packages');
 
   if (mentionsV3Columns) {
     return true;
