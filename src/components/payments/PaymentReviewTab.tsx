@@ -23,6 +23,7 @@ import { PaymentDevicesSection, PaymentDevice } from './PaymentDevicesSection';
 import { CustomerMethodsSection } from './CustomerMethodsSection';
 import { ProblemOrdersSection, ProblemOrder } from './ProblemOrdersSection';
 import { DepositPolicySection, DepositPolicySettings } from './DepositPolicySection';
+import { SimplePaymentSettingsSection } from './SimplePaymentSettingsSection';
 
 type ReviewReason =
   | 'no_match'
@@ -68,7 +69,7 @@ interface OverviewResponse {
 }
 
 interface PaymentReviewTabProps {
-  initialTab?: 'problems' | 'reviews' | 'devices' | 'sources' | 'methods' | 'policy';
+  initialTab?: 'setup' | 'problems' | 'reviews' | 'devices' | 'sources' | 'methods' | 'policy';
 }
 
 async function adminRequest<T>(path: string, options: RequestInit = {}): Promise<T> {
@@ -119,9 +120,9 @@ function formatCairoDateTime(value?: string | null): string {
   return Number.isNaN(date.getTime()) ? '—' : cairoDateTime.format(date);
 }
 
-export const PaymentReviewTab: React.FC<PaymentReviewTabProps> = ({ initialTab = 'problems' }) => {
+export const PaymentReviewTab: React.FC<PaymentReviewTabProps> = ({ initialTab = 'setup' }) => {
   const [activeSubTab, setActiveSubTab] = useState<
-    'problems' | 'reviews' | 'devices' | 'sources' | 'methods' | 'policy'
+    'setup' | 'problems' | 'reviews' | 'devices' | 'sources' | 'methods' | 'policy'
   >(initialTab);
 
   const [overview, setOverview] = useState<OverviewResponse | null>(null);
@@ -251,6 +252,18 @@ export const PaymentReviewTab: React.FC<PaymentReviewTabProps> = ({ initialTab =
       {/* Primary Navigation Tabs */}
       <div className="flex items-center gap-1.5 overflow-x-auto p-1.5 bg-slate-100 dark:bg-slate-950/80 rounded-2xl border border-slate-200 dark:border-slate-800 text-xs font-bold">
         <button
+          onClick={() => setActiveSubTab('setup')}
+          className={`flex items-center gap-2 px-4 py-2.5 rounded-xl transition-all whitespace-nowrap ${
+            activeSubTab === 'setup'
+              ? 'bg-white dark:bg-slate-900 text-slate-900 dark:text-white shadow-sm font-black'
+              : 'text-slate-600 dark:text-slate-400 hover:text-slate-900 dark:hover:text-white'
+          }`}
+        >
+          <Settings className="w-4 h-4 text-cyan-500" />
+          <span>إعدادات الدفع</span>
+        </button>
+
+        <button
           onClick={() => setActiveSubTab('problems')}
           className={`flex items-center gap-2 px-4 py-2.5 rounded-xl transition-all whitespace-nowrap ${
             activeSubTab === 'problems'
@@ -343,6 +356,10 @@ export const PaymentReviewTab: React.FC<PaymentReviewTabProps> = ({ initialTab =
       </div>
 
       {/* Tab Contents */}
+      {activeSubTab === 'setup' && (
+        <SimplePaymentSettingsSection adminRequest={adminRequest} onRefresh={loadAllData} />
+      )}
+
       {activeSubTab === 'problems' && (
         <ProblemOrdersSection
           problemOrders={problemOrders}
