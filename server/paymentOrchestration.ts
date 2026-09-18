@@ -1282,17 +1282,25 @@ paymentRouter.get('/admin/payments/overview', requireAuth, async (_req: Authenti
     getAdminPaymentSettings(),
   ]);
 
-  const failed = [
+  const coreFailed = [
     devicesResult,
-    deviceSourcesResult,
-    sourcesResult,
-    customerMethodsResult,
-    customerMethodSourcesResult,
     reviewsResult,
     sessionsResult,
     problemOrdersRes,
   ].find((r) => r.error);
-  if (failed?.error) return res.status(503).json({ error: 'تعذر تحميل مركز مراجعة المدفوعات' });
+
+  const optionalV3Failures = [
+    { result: deviceSourcesResult, relation: 'payment_device_sources' },
+    { result: sourcesResult, relation: 'payment_sources' },
+    { result: customerMethodsResult, relation: 'customer_payment_methods' },
+    { result: customerMethodSourcesResult, relation: 'customer_payment_method_sources' },
+  ].filter(({ result, relation }) =>
+    result.error && !isMissingRelationError(result.error, relation)
+  );
+
+  if (coreFailed?.error || optionalV3Failures.length > 0) {
+    return res.status(503).json({ error: 'تعذر تحميل مركز مراجعة المدفوعات' });
+  }
 
   const now = Date.now();
 
