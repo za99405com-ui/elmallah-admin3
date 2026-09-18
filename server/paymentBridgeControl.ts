@@ -119,7 +119,9 @@ export async function fetchDeviceRules(deviceRowId: string, device: any) {
     name: s.display_name,
     enabled: Boolean(s.enabled),
     channel: s.channel,
-    packageNames: s.source_package ? [s.source_package] : [],
+    packageNames: Array.isArray(s.source_packages) && s.source_packages.length > 0
+      ? s.source_packages
+      : (s.source_package ? [s.source_package] : []),
     sourceSender: s.source_sender || undefined,
     titleContains: s.title_contains || undefined,
     bodyContains: s.body_contains || undefined,
@@ -138,6 +140,82 @@ paymentBridgeControlRouter.get('/payment-bridge/rules', verifyPaymentBridge, asy
   const device = (req as any).paymentDevice;
   const { rulesVersion, rules } = await fetchDeviceRules(device.id, device);
   return res.json({
+    rulesVersion,
+    rules,
+  });
+});
+
+// POST /payment-bridge/source-config - save a tested parser configuration for an
+// already-assigned source. The phone may configure parsing, but it cannot enable
+// a disabled source or assign itself to a new source.
+paymentBridgeControlRouter.post('/payment-bridge/source-config', verifyPaymentBridge, async (req: RawBridgeRequest, res: Response) => {
+  const device = (req as any).paymentDevice;
+  const sourceId = String(req.body?.sourceId || '').trim();
+  if (!sourceId) return res.status(400).json({ error: 'sourceId is required' });
+
+  const { data: assignment, error: assignmentError } = await supabaseServer
+    .from('payment_device_sources')
+    .select('payment_source_id,enabled,payment_sources(*)')
+    .eq('device_id', device.id)
+    .eq('payment_source_id', sourceId)
+    .eq('enabled', true)
+    .maybeSingle();
+
+  if (assignmentError) return res.status(503).json({ error: 'Payment source assignment service unavailable' });
+  const source = assignment?.payment_sources as any;
+  if (!assignment || !source) return res.status(403).json({ error: 'Source is not assigned to this device' });
+
+  const packageNames = Array.isArray(req.body?.packageNames)
+    ? req.body.packageNames.map((value: unknown) => String(value).trim()).filter(Boolean).slice(0, 10)
+    : [];
+  if (packageNames.length === 0) return res.status(400).json({ error: 'At least one application package is required' });
+
+  const parserType = String(req.body?.parserType || source.parser_type || 'regex').trim();
+  const allowedParserTypes = new Set(['regex', 'json', 'keyword', 'smart', 'generic_notification', 'generic_sms', 'vf_cash_v1', 'bank_alahly_v1']);
+  if (!allowedParserTypes.has(parserType)) return res.status(400).json({ error: 'Unsupported parser type' });
+
+  const optionalText = (value: unknown, max: number) => {
+    const text = String(value || '').trim();
+    return text ? text.slice(0, max) : null;
+  };
+  const amountRegex = optionalText(req.body?.amountRegex, 1000);
+  const payerPhoneRegex = optionalText(req.body?.payerPhoneRegex, 1000);
+  const accountIdentifierRegex = optionalText(req.body?.accountIdentifierRegex, 1000);
+
+  for (const pattern of [amountRegex, payerPhoneRegex, accountIdentifierRegex]) {
+    if (!pattern) continue;
+    try {
+      new RegExp(pattern);
+    } catch {
+      return res.status(400).json({ error: 'One of the parser regular expressions is invalid' });
+    }
+  }
+
+  const updates = {
+    source_package: packageNames[0],
+    source_packages: packageNames,
+    source_sender: optionalText(req.body?.sourceSender, 250),
+    title_contains: optionalText(req.body?.titleContains, 500),
+    body_contains: optionalText(req.body?.bodyContains, 500),
+    amount_regex: amountRegex,
+    payer_phone_regex: payerPhoneRegex,
+    account_identifier_regex: accountIdentifierRegex,
+    parser_type: parserType,
+    updated_at: new Date().toISOString(),
+  };
+
+  const { error: updateError } = await supabaseServer
+    .from('payment_sources')
+    .update(updates)
+    .eq('id', sourceId);
+
+  if (updateError) return res.status(503).json({ error: 'Could not save payment source parser configuration' });
+
+  const { rulesVersion, rules } = await fetchDeviceRules(device.id, device);
+  return res.json({
+    status: 'ok',
+    sourceId,
+    sourceEnabled: Boolean(source.enabled),
     rulesVersion,
     rules,
   });
