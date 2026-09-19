@@ -126,6 +126,14 @@ export function validateOrderTransition(
     };
   }
 
+  if (next === 'cancelled' && derivePaymentState(order) === 'paid') {
+    return {
+      ok: false,
+      code: 'paid_order_requires_refund_review',
+      message: 'الطلب مدفوع بالفعل. يجب معالجة الاسترداد أو مراجعة الدفع قبل الإلغاء.',
+    };
+  }
+
   return { ok: true };
 }
 
