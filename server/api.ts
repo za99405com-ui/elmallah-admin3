@@ -27,6 +27,10 @@ import {
   RawCustomerPolicy,
   EffectiveCustomerPolicy,
 } from './customerIdentity.js';
+import {
+  isTerminalOrderStatus,
+  validateOrderTransition,
+} from './orderLifecycle.js';
 
 // Safe numeric validation helper
 function parseAndValidateNumber(
@@ -1345,16 +1349,63 @@ router.post('/admin/orders', requireAuth, async (req: AuthenticatedRequest, res:
 });
 
 router.put('/admin/orders/:id/status', requireAuth, async (req: AuthenticatedRequest, res: Response) => {
-  const orderId = req.params.id; const { status } = req.body;
-  if (!['pending', 'preparing', 'delivering', 'completed', 'cancelled'].includes(status)) return res.status(400).json({ error: 'حالة الطلب غير صالحة' });
+  const orderId = req.params.id;
+  const { status } = req.body;
+
+  if (!['pending', 'preparing', 'delivering', 'completed', 'cancelled'].includes(status)) {
+    return res.status(400).json({ error: 'حالة الطلب غير صالحة' });
+  }
+
   const existing = await getOrderWithItems(orderId);
   if (!existing) return res.status(404).json({ error: 'الطلب غير موجود' });
 
-  const { error } = await supabaseServer.from('orders').update({ status, updated_at: new Date().toISOString() }).eq('id', orderId);
-  if (error) return res.status(503).json({ error: 'تعذر تحديث حالة الطلب' });
+  const transition = validateOrderTransition(existing.status, status, existing);
+  if (!transition.ok) {
+    return res.status(409).json({
+      error: transition.message,
+      code: transition.code,
+      currentStatus: existing.status,
+      requestedStatus: status,
+    });
+  }
+
+  const { error: rpcError } = await supabaseServer.rpc('transition_order_lifecycle', {
+    p_order_id: orderId,
+    p_new_status: status,
+  });
+
+  if (rpcError) {
+    const message = String(rpcError.message || '');
+    if (message.includes('PAYMENT_NOT_CONFIRMED')) {
+      return res.status(409).json({
+        error: 'لا يمكن قبول الطلب وبدء التحضير قبل تأكيد العربون أو اختيار الدفع عند الاستلام',
+        code: 'payment_not_confirmed',
+      });
+    }
+    if (message.includes('INVALID_ORDER_TRANSITION') || message.includes('TERMINAL_ORDER')) {
+      return res.status(409).json({
+        error: 'الانتقال المطلوب غير مسموح ضمن دورة تنفيذ الطلب',
+        code: 'invalid_order_transition',
+      });
+    }
+    if (message.includes('ORDER_NOT_FOUND')) {
+      return res.status(404).json({ error: 'الطلب غير موجود' });
+    }
+
+    console.error('Order lifecycle transition failed:', rpcError.message);
+    return res.status(503).json({ error: 'تعذر تحديث حالة الطلب' });
+  }
 
   const updated = await getOrderWithItems(orderId);
-  logAuditAction(req.admin, 'update_order_status', 'order', orderId, { oldStatus: existing.status }, { newStatus: status }, req.ip);
+  logAuditAction(
+    req.admin,
+    'update_order_status',
+    'order',
+    orderId,
+    { oldStatus: existing.status },
+    { newStatus: status },
+    req.ip
+  );
   broadcastRealtimeEvent('order_status_updated', updated);
   return res.json(updated);
 });
@@ -1364,6 +1415,20 @@ router.put('/admin/orders/:id/deposit', requireAuth, requireRole(['super_admin',
   const { depositStatus, depositAmount, depositMethod, depositReference, depositNotes } = req.body;
   const existing = await getOrderWithItems(orderId);
   if (!existing) return res.status(404).json({ error: 'الطلب غير موجود' });
+
+  if (isTerminalOrderStatus(existing.status)) {
+    return res.status(409).json({
+      error: 'لا يمكن تعديل الدفع بعد إغلاق الطلب',
+      code: 'terminal_order',
+    });
+  }
+
+  if (existing.status !== 'pending') {
+    return res.status(409).json({
+      error: 'لا يمكن تعديل العربون بعد بدء تنفيذ الطلب',
+      code: 'order_already_in_fulfillment',
+    });
+  }
 
   const allowed = ['confirmed', 'pending', 'not_required', 'rejected'];
   if (depositStatus !== undefined && (typeof depositStatus !== 'string' || !allowed.includes(depositStatus))) {
@@ -1385,8 +1450,22 @@ router.put('/admin/orders/:id/deposit', requireAuth, requireRole(['super_admin',
   }
 
   const now = new Date().toISOString();
-  const newRemaining = Math.max(0, Math.round((existing.totalAmount - newDepositAmount) * 100) / 100);
   const effectiveStatus = depositStatus !== undefined ? depositStatus : existing.depositStatus;
+
+  if (effectiveStatus === 'not_required') {
+    newDepositAmount = 0;
+  }
+
+  if (effectiveStatus === 'confirmed' && newDepositAmount <= 0) {
+    return res.status(400).json({ error: 'قيمة العربون المؤكد يجب أن تكون أكبر من صفر' });
+  }
+
+  const newDepositPaid = effectiveStatus === 'confirmed' ? newDepositAmount : 0;
+  const newRemaining = Math.max(
+    0,
+    Math.round((existing.totalAmount - newDepositPaid) * 100) / 100
+  );
+
   let finalConfirmedAt: string | null = existing.depositConfirmedAt || null;
   let finalConfirmedBy: string | null = existing.depositConfirmedBy || null;
 
@@ -1399,13 +1478,24 @@ router.put('/admin/orders/:id/deposit', requireAuth, requireRole(['super_admin',
   }
 
   const updates: Record<string, unknown> = {
-    deposit_amount: newDepositAmount, remaining_amount: newRemaining,
-    deposit_confirmed_at: finalConfirmedAt, deposit_confirmed_by: finalConfirmedBy, updated_at: now,
+    deposit_amount: newDepositAmount,
+    deposit_paid: newDepositPaid,
+    remaining_amount: newRemaining,
+    deposit_confirmed_at: finalConfirmedAt,
+    deposit_confirmed_by: finalConfirmedBy,
+    updated_at: now,
   };
+
   if (depositStatus !== undefined) updates.deposit_status = depositStatus;
   if (depositMethod !== undefined) updates.deposit_method = depositMethod;
   if (depositReference !== undefined) updates.deposit_reference = depositReference;
   if (depositNotes !== undefined) updates.deposit_notes = depositNotes;
+
+  if (effectiveStatus === 'not_required') {
+    updates.payment_mode = 'cash_on_delivery';
+    updates.deposit_method = 'cash_on_delivery';
+    updates.deposit_reference = null;
+  }
 
   const { error } = await supabaseServer.from('orders').update(updates).eq('id', orderId);
   if (error) return res.status(503).json({ error: 'تعذر تحديث بيانات العربون' });
