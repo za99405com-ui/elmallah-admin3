@@ -28,6 +28,7 @@ import {
   EffectiveCustomerPolicy,
 } from './customerIdentity.js';
 import {
+  derivePaymentState,
   isTerminalOrderStatus,
   validateOrderTransition,
 } from './orderLifecycle.js';
@@ -2997,7 +2998,11 @@ function normalizeIntegrationPhone(value: unknown): string {
   if (typeof value !== 'string') return ''; return value.trim().replace(/[^0-9+]/g, '');
 }
 
-function mapIntegrationOrder(order: Record<string, unknown>, items: Record<string, unknown>[]) {
+function mapIntegrationOrder(
+  order: Record<string, unknown>,
+  items: Record<string, unknown>[],
+  activeSession?: Record<string, unknown> | null
+) {
   const depositStatus = String(order.deposit_status || 'not_required');
   const depositMethod = order.deposit_method as string | undefined;
   const paymentMode: 'deposit_online' | 'cash_on_delivery' =
@@ -3016,6 +3021,26 @@ function mapIntegrationOrder(order: Record<string, unknown>, items: Record<strin
     depositMethod, depositReference: order.deposit_reference || undefined,
     remainingAmount: Number(order.remaining_amount || 0),
     paymentMode,
+    paymentState: derivePaymentState(order),
+    activeSession: activeSession
+      ? {
+          id: activeSession.id,
+          clientToken: activeSession.client_token,
+          orderId: activeSession.order_id,
+          provider: activeSession.provider,
+          paymentSourceId: activeSession.payment_source_id || undefined,
+          customerPaymentMethodId: activeSession.customer_payment_method_id || undefined,
+          paymentIntent: activeSession.payment_intent || undefined,
+          expectedAmount: Number(activeSession.expected_amount || 0),
+          currency: activeSession.currency || 'EGP',
+          paymentDestination: activeSession.payment_destination || undefined,
+          devicePublicId: activeSession.device_public_id || undefined,
+          status: activeSession.status,
+          expiresAt: activeSession.expires_at,
+          expectedPayerPhone: activeSession.expected_payer_phone || undefined,
+          createdAt: activeSession.created_at,
+        }
+      : null,
     status: order.status, notes: order.notes || '',
     createdAt: order.created_at, updatedAt: order.updated_at,
     items: items.map((item) => ({
@@ -3057,37 +3082,127 @@ router.post('/integration/coupons/validate', requireIntegrationKey, async (req: 
 
 router.post('/integration/customer/orders', requireIntegrationKey, async (req: Request, res: Response) => {
   const phone = normalizeIntegrationPhone(req.body?.phone);
-  if (phone.length < 8 || phone.length > 20) return res.status(400).json({ error: 'Invalid phone' });
+  if (phone.length < 8 || phone.length > 20) {
+    return res.status(400).json({ error: 'Invalid phone' });
+  }
 
-  const { data: orders, error } = await supabaseServer.from('orders').select('*').eq('customer_phone', phone).order('created_at', { ascending: false }).limit(100);
+  const { data: orders, error } = await supabaseServer
+    .from('orders')
+    .select('*')
+    .eq('customer_phone', phone)
+    .order('created_at', { ascending: false })
+    .limit(100);
+
   if (error) return res.status(503).json({ error: 'Order service unavailable' });
   if (!orders || orders.length === 0) return res.json({ orders: [] });
 
-  const { data: items, error: itemsError } = await supabaseServer.from('order_items').select('*').in('order_id', orders.map((o) => String(o.id))).order('created_at', { ascending: true });
-  if (itemsError) return res.status(503).json({ error: 'Order service unavailable' });
+  const orderIds = orders.map((o) => String(o.id));
+  const [itemsResult, sessionsResult] = await Promise.all([
+    supabaseServer
+      .from('order_items')
+      .select('*')
+      .in('order_id', orderIds)
+      .order('created_at', { ascending: true }),
+    supabaseServer
+      .from('payment_sessions')
+      .select('*')
+      .in('order_id', orderIds)
+      .eq('status', 'waiting')
+      .order('created_at', { ascending: false }),
+  ]);
+
+  if (itemsResult.error || sessionsResult.error) {
+    return res.status(503).json({ error: 'Order service unavailable' });
+  }
 
   const byOrder = new Map<string, Record<string, unknown>[]>();
-  for (const item of items || []) { const id = String(item.order_id); const list = byOrder.get(id) || []; list.push(item as Record<string, unknown>); byOrder.set(id, list); }
-  return res.json({ orders: orders.map((o) => mapIntegrationOrder(o, byOrder.get(String(o.id)) || [])) });
+  for (const item of itemsResult.data || []) {
+    const id = String(item.order_id);
+    const list = byOrder.get(id) || [];
+    list.push(item as Record<string, unknown>);
+    byOrder.set(id, list);
+  }
+
+  const activeSessionByOrder = new Map<string, Record<string, unknown>>();
+  for (const session of sessionsResult.data || []) {
+    const orderId = String(session.order_id);
+    if (!activeSessionByOrder.has(orderId)) {
+      activeSessionByOrder.set(orderId, session as Record<string, unknown>);
+    }
+  }
+
+  return res.json({
+    orders: orders.map((order) =>
+      mapIntegrationOrder(
+        order,
+        byOrder.get(String(order.id)) || [],
+        activeSessionByOrder.get(String(order.id)) || null
+      )
+    ),
+  });
 });
 
 router.post('/integration/orders/lookup', requireIntegrationKey, async (req: Request, res: Response) => {
-  const raw = req.body?.orderIdOrNumber; const phone = normalizeIntegrationPhone(req.body?.phone);
-  if (typeof raw !== 'string' || !raw.trim()) return res.status(400).json({ error: 'Order id or number is required' });
-  if (phone.length < 8 || phone.length > 20) return res.status(400).json({ error: 'Invalid phone' });
-  const key = raw.trim();
+  const raw = req.body?.orderIdOrNumber;
+  const phone = normalizeIntegrationPhone(req.body?.phone);
 
-  let result = await supabaseServer.from('orders').select('*').eq('id', key).eq('customer_phone', phone).maybeSingle();
+  if (typeof raw !== 'string' || !raw.trim()) {
+    return res.status(400).json({ error: 'Order id or number is required' });
+  }
+  if (phone.length < 8 || phone.length > 20) {
+    return res.status(400).json({ error: 'Invalid phone' });
+  }
+
+  const key = raw.trim();
+  let result = await supabaseServer
+    .from('orders')
+    .select('*')
+    .eq('id', key)
+    .eq('customer_phone', phone)
+    .maybeSingle();
+
   if (result.error) return res.status(503).json({ error: 'Order service unavailable' });
+
   if (!result.data) {
-    result = await supabaseServer.from('orders').select('*').eq('order_number', key).eq('customer_phone', phone).maybeSingle();
+    result = await supabaseServer
+      .from('orders')
+      .select('*')
+      .eq('order_number', key)
+      .eq('customer_phone', phone)
+      .maybeSingle();
+
     if (result.error) return res.status(503).json({ error: 'Order service unavailable' });
   }
+
   if (!result.data) return res.status(404).json({ error: 'Order not found' });
 
-  const { data: items, error } = await supabaseServer.from('order_items').select('*').eq('order_id', result.data.id).order('created_at', { ascending: true });
-  if (error) return res.status(503).json({ error: 'Order service unavailable' });
-  return res.json({ order: mapIntegrationOrder(result.data, (items || []) as Record<string, unknown>[]) });
+  const [itemsResult, sessionResult] = await Promise.all([
+    supabaseServer
+      .from('order_items')
+      .select('*')
+      .eq('order_id', result.data.id)
+      .order('created_at', { ascending: true }),
+    supabaseServer
+      .from('payment_sessions')
+      .select('*')
+      .eq('order_id', result.data.id)
+      .eq('status', 'waiting')
+      .order('created_at', { ascending: false })
+      .limit(1)
+      .maybeSingle(),
+  ]);
+
+  if (itemsResult.error || sessionResult.error) {
+    return res.status(503).json({ error: 'Order service unavailable' });
+  }
+
+  return res.json({
+    order: mapIntegrationOrder(
+      result.data,
+      (itemsResult.data || []) as Record<string, unknown>[],
+      (sessionResult.data as Record<string, unknown> | null) || null
+    ),
+  });
 });
 
 // ==========================================
