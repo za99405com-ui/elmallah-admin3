@@ -3152,6 +3152,89 @@ router.post('/integration/customer/orders', requireIntegrationKey, async (req: R
   });
 });
 
+router.post('/integration/orders/cancel', requireIntegrationKey, async (req: Request, res: Response) => {
+  const raw = req.body?.orderIdOrNumber;
+  const phone = normalizeIntegrationPhone(req.body?.phone);
+
+  if (typeof raw !== 'string' || !raw.trim()) {
+    return res.status(400).json({ error: 'Order id or number is required' });
+  }
+  if (phone.length < 8 || phone.length > 20) {
+    return res.status(400).json({ error: 'Invalid phone' });
+  }
+
+  const key = raw.trim();
+  let result = await supabaseServer
+    .from('orders')
+    .select('*')
+    .eq('id', key)
+    .eq('customer_phone', phone)
+    .maybeSingle();
+
+  if (result.error) return res.status(503).json({ error: 'Order service unavailable' });
+
+  if (!result.data) {
+    result = await supabaseServer
+      .from('orders')
+      .select('*')
+      .eq('order_number', key)
+      .eq('customer_phone', phone)
+      .maybeSingle();
+
+    if (result.error) return res.status(503).json({ error: 'Order service unavailable' });
+  }
+
+  const order = result.data;
+  if (!order) return res.status(404).json({ error: 'Order not found' });
+
+  if (String(order.status) !== 'pending') {
+    return res.status(409).json({
+      error: 'لا يمكن إلغاء الطلب بعد بدء التحضير',
+      code: 'order_already_in_fulfillment',
+    });
+  }
+
+  const paidAmount = Number(order.deposit_paid || 0);
+  if (paidAmount > 0 || String(order.deposit_status) === 'confirmed') {
+    return res.status(409).json({
+      error: 'لا يمكن إلغاء الطلب بعد تأكيد الدفع. تواصل مع المتجر للمراجعة.',
+      code: 'paid_order_requires_review',
+    });
+  }
+
+  const { error: transitionError } = await supabaseServer.rpc('transition_order_lifecycle', {
+    p_order_id: String(order.id),
+    p_new_status: 'cancelled',
+  });
+
+  if (transitionError) {
+    console.error('Customer order cancellation failed:', transitionError.message);
+    return res.status(503).json({ error: 'تعذر إلغاء الطلب حالياً' });
+  }
+
+  const [updatedResult, itemsResult] = await Promise.all([
+    supabaseServer.from('orders').select('*').eq('id', order.id).single(),
+    supabaseServer
+      .from('order_items')
+      .select('*')
+      .eq('order_id', order.id)
+      .order('created_at', { ascending: true }),
+  ]);
+
+  if (updatedResult.error || itemsResult.error || !updatedResult.data) {
+    return res.status(503).json({ error: 'تم الإلغاء لكن تعذر تحميل حالة الطلب المحدثة' });
+  }
+
+  const mapped = mapIntegrationOrder(
+    updatedResult.data,
+    (itemsResult.data || []) as Record<string, unknown>[],
+    null
+  );
+
+  broadcastRealtimeEvent('order_status_updated', mapped);
+  return res.json({ success: true, order: mapped });
+});
+
 router.post('/integration/orders/lookup', requireIntegrationKey, async (req: Request, res: Response) => {
   const raw = req.body?.orderIdOrNumber;
   const phone = normalizeIntegrationPhone(req.body?.phone);
