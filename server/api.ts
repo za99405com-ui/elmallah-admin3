@@ -27,6 +27,11 @@ import {
   RawCustomerPolicy,
   EffectiveCustomerPolicy,
 } from './customerIdentity.js';
+import {
+  derivePaymentState,
+  isTerminalOrderStatus,
+  validateOrderTransition,
+} from './orderLifecycle.js';
 
 // Safe numeric validation helper
 function parseAndValidateNumber(
@@ -1075,7 +1080,9 @@ function mapOrderRow(order: Record<string, unknown>, items: Record<string, unkno
     customerAddress: String(order.customer_address), city: String(order.city || ''), district: String(order.district || ''),
     subtotal: Number(order.subtotal || 0), discountAmount: Number(order.discount_amount || 0),
     couponCode: order.coupon_code as string | null, deliveryFee: Number(order.delivery_fee || 0),
-    totalAmount: Number(order.total_amount || 0), depositAmount: Number(order.deposit_amount || 0),
+    totalAmount: Number(order.total_amount || 0),
+    depositAmount: Number(order.deposit_amount || 0),
+    depositPaid: Number(order.deposit_paid || 0),
     depositStatus, depositMethod,
     depositReference: order.deposit_reference as string | null, depositNotes: order.deposit_notes as string | null,
     depositConfirmedAt: order.deposit_confirmed_at as string | null, depositConfirmedBy: order.deposit_confirmed_by as string | null,
@@ -1345,16 +1352,69 @@ router.post('/admin/orders', requireAuth, async (req: AuthenticatedRequest, res:
 });
 
 router.put('/admin/orders/:id/status', requireAuth, async (req: AuthenticatedRequest, res: Response) => {
-  const orderId = req.params.id; const { status } = req.body;
-  if (!['pending', 'preparing', 'delivering', 'completed', 'cancelled'].includes(status)) return res.status(400).json({ error: 'حالة الطلب غير صالحة' });
+  const orderId = req.params.id;
+  const { status } = req.body;
+
+  if (!['pending', 'preparing', 'delivering', 'completed', 'cancelled'].includes(status)) {
+    return res.status(400).json({ error: 'حالة الطلب غير صالحة' });
+  }
+
   const existing = await getOrderWithItems(orderId);
   if (!existing) return res.status(404).json({ error: 'الطلب غير موجود' });
 
-  const { error } = await supabaseServer.from('orders').update({ status, updated_at: new Date().toISOString() }).eq('id', orderId);
-  if (error) return res.status(503).json({ error: 'تعذر تحديث حالة الطلب' });
+  const transition = validateOrderTransition(existing.status, status, existing);
+  if (transition.ok === false) {
+    return res.status(409).json({
+      error: transition.message,
+      code: transition.code,
+      currentStatus: existing.status,
+      requestedStatus: status,
+    });
+  }
+
+  const { error: rpcError } = await supabaseServer.rpc('transition_order_lifecycle', {
+    p_order_id: orderId,
+    p_new_status: status,
+  });
+
+  if (rpcError) {
+    const message = String(rpcError.message || '');
+    if (message.includes('PAYMENT_NOT_CONFIRMED')) {
+      return res.status(409).json({
+        error: 'لا يمكن قبول الطلب وبدء التحضير قبل تأكيد العربون أو اختيار الدفع عند الاستلام',
+        code: 'payment_not_confirmed',
+      });
+    }
+    if (message.includes('PAID_ORDER_REQUIRES_REFUND_REVIEW')) {
+      return res.status(409).json({
+        error: 'الطلب مدفوع بالفعل. عالج الاسترداد أو مراجعة الدفع قبل الإلغاء.',
+        code: 'paid_order_requires_refund_review',
+      });
+    }
+    if (message.includes('INVALID_ORDER_TRANSITION') || message.includes('TERMINAL_ORDER')) {
+      return res.status(409).json({
+        error: 'الانتقال المطلوب غير مسموح ضمن دورة تنفيذ الطلب',
+        code: 'invalid_order_transition',
+      });
+    }
+    if (message.includes('ORDER_NOT_FOUND')) {
+      return res.status(404).json({ error: 'الطلب غير موجود' });
+    }
+
+    console.error('Order lifecycle transition failed:', rpcError.message);
+    return res.status(503).json({ error: 'تعذر تحديث حالة الطلب' });
+  }
 
   const updated = await getOrderWithItems(orderId);
-  logAuditAction(req.admin, 'update_order_status', 'order', orderId, { oldStatus: existing.status }, { newStatus: status }, req.ip);
+  logAuditAction(
+    req.admin,
+    'update_order_status',
+    'order',
+    orderId,
+    { oldStatus: existing.status },
+    { newStatus: status },
+    req.ip
+  );
   broadcastRealtimeEvent('order_status_updated', updated);
   return res.json(updated);
 });
@@ -1364,6 +1424,20 @@ router.put('/admin/orders/:id/deposit', requireAuth, requireRole(['super_admin',
   const { depositStatus, depositAmount, depositMethod, depositReference, depositNotes } = req.body;
   const existing = await getOrderWithItems(orderId);
   if (!existing) return res.status(404).json({ error: 'الطلب غير موجود' });
+
+  if (isTerminalOrderStatus(existing.status)) {
+    return res.status(409).json({
+      error: 'لا يمكن تعديل الدفع بعد إغلاق الطلب',
+      code: 'terminal_order',
+    });
+  }
+
+  if (existing.status !== 'pending') {
+    return res.status(409).json({
+      error: 'لا يمكن تعديل العربون بعد بدء تنفيذ الطلب',
+      code: 'order_already_in_fulfillment',
+    });
+  }
 
   const allowed = ['confirmed', 'pending', 'not_required', 'rejected'];
   if (depositStatus !== undefined && (typeof depositStatus !== 'string' || !allowed.includes(depositStatus))) {
@@ -1385,8 +1459,22 @@ router.put('/admin/orders/:id/deposit', requireAuth, requireRole(['super_admin',
   }
 
   const now = new Date().toISOString();
-  const newRemaining = Math.max(0, Math.round((existing.totalAmount - newDepositAmount) * 100) / 100);
   const effectiveStatus = depositStatus !== undefined ? depositStatus : existing.depositStatus;
+
+  if (effectiveStatus === 'not_required') {
+    newDepositAmount = 0;
+  }
+
+  if (effectiveStatus === 'confirmed' && newDepositAmount <= 0) {
+    return res.status(400).json({ error: 'قيمة العربون المؤكد يجب أن تكون أكبر من صفر' });
+  }
+
+  const newDepositPaid = effectiveStatus === 'confirmed' ? newDepositAmount : 0;
+  const newRemaining = Math.max(
+    0,
+    Math.round((existing.totalAmount - newDepositPaid) * 100) / 100
+  );
+
   let finalConfirmedAt: string | null = existing.depositConfirmedAt || null;
   let finalConfirmedBy: string | null = existing.depositConfirmedBy || null;
 
@@ -1399,13 +1487,24 @@ router.put('/admin/orders/:id/deposit', requireAuth, requireRole(['super_admin',
   }
 
   const updates: Record<string, unknown> = {
-    deposit_amount: newDepositAmount, remaining_amount: newRemaining,
-    deposit_confirmed_at: finalConfirmedAt, deposit_confirmed_by: finalConfirmedBy, updated_at: now,
+    deposit_amount: newDepositAmount,
+    deposit_paid: newDepositPaid,
+    remaining_amount: newRemaining,
+    deposit_confirmed_at: finalConfirmedAt,
+    deposit_confirmed_by: finalConfirmedBy,
+    updated_at: now,
   };
+
   if (depositStatus !== undefined) updates.deposit_status = depositStatus;
   if (depositMethod !== undefined) updates.deposit_method = depositMethod;
   if (depositReference !== undefined) updates.deposit_reference = depositReference;
   if (depositNotes !== undefined) updates.deposit_notes = depositNotes;
+
+  if (effectiveStatus === 'not_required') {
+    updates.payment_mode = 'cash_on_delivery';
+    updates.deposit_method = 'cash_on_delivery';
+    updates.deposit_reference = null;
+  }
 
   const { error } = await supabaseServer.from('orders').update(updates).eq('id', orderId);
   if (error) return res.status(503).json({ error: 'تعذر تحديث بيانات العربون' });
@@ -2907,7 +3006,11 @@ function normalizeIntegrationPhone(value: unknown): string {
   if (typeof value !== 'string') return ''; return value.trim().replace(/[^0-9+]/g, '');
 }
 
-function mapIntegrationOrder(order: Record<string, unknown>, items: Record<string, unknown>[]) {
+function mapIntegrationOrder(
+  order: Record<string, unknown>,
+  items: Record<string, unknown>[],
+  activeSession?: Record<string, unknown> | null
+) {
   const depositStatus = String(order.deposit_status || 'not_required');
   const depositMethod = order.deposit_method as string | undefined;
   const paymentMode: 'deposit_online' | 'cash_on_delivery' =
@@ -2922,10 +3025,32 @@ function mapIntegrationOrder(order: Record<string, unknown>, items: Record<strin
     city: order.city || '', district: order.district || '', subtotal: Number(order.subtotal || 0),
     discountAmount: Number(order.discount_amount || 0), couponCode: order.coupon_code || undefined,
     deliveryFee: Number(order.delivery_fee || 0), totalAmount: Number(order.total_amount || 0),
-    depositAmount: Number(order.deposit_amount || 0), depositStatus,
+    depositAmount: Number(order.deposit_amount || 0),
+    depositPaid: Number(order.deposit_paid || 0),
+    depositStatus,
     depositMethod, depositReference: order.deposit_reference || undefined,
     remainingAmount: Number(order.remaining_amount || 0),
     paymentMode,
+    paymentState: derivePaymentState(order),
+    activeSession: activeSession
+      ? {
+          id: activeSession.id,
+          clientToken: activeSession.client_token,
+          orderId: activeSession.order_id,
+          provider: activeSession.provider,
+          paymentSourceId: activeSession.payment_source_id || undefined,
+          customerPaymentMethodId: activeSession.customer_payment_method_id || undefined,
+          paymentIntent: activeSession.payment_intent || undefined,
+          expectedAmount: Number(activeSession.expected_amount || 0),
+          currency: activeSession.currency || 'EGP',
+          paymentDestination: activeSession.payment_destination || undefined,
+          devicePublicId: activeSession.device_public_id || undefined,
+          status: activeSession.status,
+          expiresAt: activeSession.expires_at,
+          expectedPayerPhone: activeSession.expected_payer_phone || undefined,
+          createdAt: activeSession.created_at,
+        }
+      : null,
     status: order.status, notes: order.notes || '',
     createdAt: order.created_at, updatedAt: order.updated_at,
     items: items.map((item) => ({
@@ -2967,37 +3092,127 @@ router.post('/integration/coupons/validate', requireIntegrationKey, async (req: 
 
 router.post('/integration/customer/orders', requireIntegrationKey, async (req: Request, res: Response) => {
   const phone = normalizeIntegrationPhone(req.body?.phone);
-  if (phone.length < 8 || phone.length > 20) return res.status(400).json({ error: 'Invalid phone' });
+  if (phone.length < 8 || phone.length > 20) {
+    return res.status(400).json({ error: 'Invalid phone' });
+  }
 
-  const { data: orders, error } = await supabaseServer.from('orders').select('*').eq('customer_phone', phone).order('created_at', { ascending: false }).limit(100);
+  const { data: orders, error } = await supabaseServer
+    .from('orders')
+    .select('*')
+    .eq('customer_phone', phone)
+    .order('created_at', { ascending: false })
+    .limit(100);
+
   if (error) return res.status(503).json({ error: 'Order service unavailable' });
   if (!orders || orders.length === 0) return res.json({ orders: [] });
 
-  const { data: items, error: itemsError } = await supabaseServer.from('order_items').select('*').in('order_id', orders.map((o) => String(o.id))).order('created_at', { ascending: true });
-  if (itemsError) return res.status(503).json({ error: 'Order service unavailable' });
+  const orderIds = orders.map((o) => String(o.id));
+  const [itemsResult, sessionsResult] = await Promise.all([
+    supabaseServer
+      .from('order_items')
+      .select('*')
+      .in('order_id', orderIds)
+      .order('created_at', { ascending: true }),
+    supabaseServer
+      .from('payment_sessions')
+      .select('*')
+      .in('order_id', orderIds)
+      .eq('status', 'waiting')
+      .order('created_at', { ascending: false }),
+  ]);
+
+  if (itemsResult.error || sessionsResult.error) {
+    return res.status(503).json({ error: 'Order service unavailable' });
+  }
 
   const byOrder = new Map<string, Record<string, unknown>[]>();
-  for (const item of items || []) { const id = String(item.order_id); const list = byOrder.get(id) || []; list.push(item as Record<string, unknown>); byOrder.set(id, list); }
-  return res.json({ orders: orders.map((o) => mapIntegrationOrder(o, byOrder.get(String(o.id)) || [])) });
+  for (const item of itemsResult.data || []) {
+    const id = String(item.order_id);
+    const list = byOrder.get(id) || [];
+    list.push(item as Record<string, unknown>);
+    byOrder.set(id, list);
+  }
+
+  const activeSessionByOrder = new Map<string, Record<string, unknown>>();
+  for (const session of sessionsResult.data || []) {
+    const orderId = String(session.order_id);
+    if (!activeSessionByOrder.has(orderId)) {
+      activeSessionByOrder.set(orderId, session as Record<string, unknown>);
+    }
+  }
+
+  return res.json({
+    orders: orders.map((order) =>
+      mapIntegrationOrder(
+        order,
+        byOrder.get(String(order.id)) || [],
+        activeSessionByOrder.get(String(order.id)) || null
+      )
+    ),
+  });
 });
 
 router.post('/integration/orders/lookup', requireIntegrationKey, async (req: Request, res: Response) => {
-  const raw = req.body?.orderIdOrNumber; const phone = normalizeIntegrationPhone(req.body?.phone);
-  if (typeof raw !== 'string' || !raw.trim()) return res.status(400).json({ error: 'Order id or number is required' });
-  if (phone.length < 8 || phone.length > 20) return res.status(400).json({ error: 'Invalid phone' });
-  const key = raw.trim();
+  const raw = req.body?.orderIdOrNumber;
+  const phone = normalizeIntegrationPhone(req.body?.phone);
 
-  let result = await supabaseServer.from('orders').select('*').eq('id', key).eq('customer_phone', phone).maybeSingle();
+  if (typeof raw !== 'string' || !raw.trim()) {
+    return res.status(400).json({ error: 'Order id or number is required' });
+  }
+  if (phone.length < 8 || phone.length > 20) {
+    return res.status(400).json({ error: 'Invalid phone' });
+  }
+
+  const key = raw.trim();
+  let result = await supabaseServer
+    .from('orders')
+    .select('*')
+    .eq('id', key)
+    .eq('customer_phone', phone)
+    .maybeSingle();
+
   if (result.error) return res.status(503).json({ error: 'Order service unavailable' });
+
   if (!result.data) {
-    result = await supabaseServer.from('orders').select('*').eq('order_number', key).eq('customer_phone', phone).maybeSingle();
+    result = await supabaseServer
+      .from('orders')
+      .select('*')
+      .eq('order_number', key)
+      .eq('customer_phone', phone)
+      .maybeSingle();
+
     if (result.error) return res.status(503).json({ error: 'Order service unavailable' });
   }
+
   if (!result.data) return res.status(404).json({ error: 'Order not found' });
 
-  const { data: items, error } = await supabaseServer.from('order_items').select('*').eq('order_id', result.data.id).order('created_at', { ascending: true });
-  if (error) return res.status(503).json({ error: 'Order service unavailable' });
-  return res.json({ order: mapIntegrationOrder(result.data, (items || []) as Record<string, unknown>[]) });
+  const [itemsResult, sessionResult] = await Promise.all([
+    supabaseServer
+      .from('order_items')
+      .select('*')
+      .eq('order_id', result.data.id)
+      .order('created_at', { ascending: true }),
+    supabaseServer
+      .from('payment_sessions')
+      .select('*')
+      .eq('order_id', result.data.id)
+      .eq('status', 'waiting')
+      .order('created_at', { ascending: false })
+      .limit(1)
+      .maybeSingle(),
+  ]);
+
+  if (itemsResult.error || sessionResult.error) {
+    return res.status(503).json({ error: 'Order service unavailable' });
+  }
+
+  return res.json({
+    order: mapIntegrationOrder(
+      result.data,
+      (itemsResult.data || []) as Record<string, unknown>[],
+      (sessionResult.data as Record<string, unknown> | null) || null
+    ),
+  });
 });
 
 // ==========================================

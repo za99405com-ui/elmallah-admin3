@@ -86,7 +86,7 @@ interface AppContextType {
   orders: Order[];
   isLoadingOrders: boolean;
   addOrder: (order: Omit<Order, 'id' | 'orderNumber' | 'createdAt' | 'updatedAt'>) => Promise<void>;
-  updateOrderStatus: (orderId: string, newStatus: OrderStatus) => Promise<void>;
+  updateOrderStatus: (orderId: string, newStatus: OrderStatus) => Promise<Order | null>;
   confirmDeposit: (
     orderId: string,
     details?: {
@@ -96,8 +96,8 @@ interface AppContextType {
       depositNotes?: string;
       depositStatus?: DepositStatus;
     }
-  ) => Promise<void>;
-  updateOrder: (orderId: string, updates: Partial<Order>) => Promise<void>;
+  ) => Promise<Order | null>;
+  updateOrder: (orderId: string, updates: Partial<Order>) => Promise<Order | null>;
   deleteOrder: (orderId: string) => Promise<void>;
 
   // Coupons
@@ -619,6 +619,34 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
         return;
       }
 
+      if (eventType === 'order_payment_confirmed') {
+        try {
+          const paymentEvent = JSON.parse(dataStr) as {
+            orderId: string;
+            receivedAmount: number;
+          };
+
+          // The orchestration event intentionally contains only payment facts.
+          // Reload canonical orders instead of reconstructing a partial Order locally.
+          api.getOrders().then((freshOrders) => {
+            setOrders(freshOrders);
+            const paidOrder = freshOrders.find((order) => order.id === paymentEvent.orderId);
+            if (paidOrder) {
+              addToast({
+                type: 'success',
+                title: `تم تأكيد الدفع - الطلب #${paidOrder.orderNumber}`,
+                description: `تم استلام ${paymentEvent.receivedAmount} ج.م. الطلب بانتظار قبول المتجر.`,
+              });
+            }
+          }).catch((err) => {
+            console.error('Failed to refresh order after automatic payment:', err);
+          });
+        } catch (err) {
+          console.error('Failed to parse order_payment_confirmed event:', err);
+        }
+        return;
+      }
+
       if (eventType === 'product_created') {
         try {
           const prod = JSON.parse(dataStr) as Product;
@@ -1080,12 +1108,14 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
         title: 'تم تحديث حالة الطلب',
         description: `الطلب #${updated.orderNumber} أصبح بحالة: ${newStatus}`,
       });
+      return updated;
     } catch (err) {
       addToast({
         type: 'error',
         title: 'خطأ في تحديث الحالة',
         description: err instanceof Error ? err.message : 'فشل التحديث',
       });
+      return null;
     }
   };
 
@@ -1111,24 +1141,44 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
       setOrders((prev) => prev.map((o) => (o.id === orderId ? updated : o)));
       addToast({
         type: 'success',
-        title: 'تم تحديث العربون بنجاح',
-        description: `الطلب #${updated.orderNumber} - العربون: ${updated.depositAmount} ج.م (${updated.depositStatus})`,
+        title: 'تم تحديث الدفع بنجاح',
+        description: `الطلب #${updated.orderNumber} - حالة الدفع: ${updated.depositStatus}`,
       });
+      return updated;
     } catch (err) {
       addToast({
         type: 'error',
-        title: 'خطأ في تحديث العربون',
+        title: 'خطأ في تحديث الدفع',
         description: err instanceof Error ? err.message : 'فشل التحديث',
       });
+      return null;
     }
   };
 
-  const updateOrder = async (orderId: string, updates: Partial<Order>) => {
-    if (updates.status) {
-      await updateOrderStatus(orderId, updates.status);
+  const updateOrder = async (orderId: string, updates: Partial<Order>): Promise<Order | null> => {
+    const hasStatusUpdate = Boolean(updates.status);
+    const hasPaymentUpdate =
+      Boolean(updates.depositStatus) ||
+      updates.depositAmount !== undefined ||
+      updates.depositMethod !== undefined ||
+      updates.depositReference !== undefined ||
+      updates.depositNotes !== undefined;
+
+    if (hasStatusUpdate && hasPaymentUpdate) {
+      addToast({
+        type: 'error',
+        title: 'تحديث غير صالح',
+        description: 'حالة تنفيذ الطلب وحالة الدفع يجب تحديثهما كعمليتين منفصلتين وواضحتين.',
+      });
+      return null;
     }
-    if (updates.depositStatus || updates.depositAmount !== undefined) {
-      await confirmDeposit(orderId, {
+
+    if (updates.status) {
+      return updateOrderStatus(orderId, updates.status);
+    }
+
+    if (hasPaymentUpdate) {
+      return confirmDeposit(orderId, {
         depositStatus: updates.depositStatus,
         depositAmount: updates.depositAmount,
         depositMethod: updates.depositMethod,
@@ -1136,6 +1186,8 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
         depositNotes: updates.depositNotes,
       });
     }
+
+    return null;
   };
 
   const deleteOrder = async (orderId: string) => {

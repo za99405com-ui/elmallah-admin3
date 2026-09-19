@@ -33,7 +33,6 @@ export const OrdersTab: React.FC<OrdersTabProps> = ({ defaultFilter }) => {
     orders,
     updateOrderStatus,
     confirmDeposit,
-    updateOrder,
     deleteOrder,
     adminUser,
     settings,
@@ -68,7 +67,9 @@ export const OrdersTab: React.FC<OrdersTabProps> = ({ defaultFilter }) => {
   };
 
   // Status definitions with deposit pending count
-  const pendingDepositCount = orders.filter((o) => o.depositStatus === 'pending').length;
+  const pendingDepositCount = orders.filter(
+    (o) => o.status === 'pending' && o.depositStatus === 'pending'
+  ).length;
 
   const statusTabs: { id: string; label: string; count: number; isHighlight?: boolean }[] = [
     { id: 'all', label: 'الكل', count: orders.length },
@@ -78,7 +79,7 @@ export const OrdersTab: React.FC<OrdersTabProps> = ({ defaultFilter }) => {
       count: pendingDepositCount,
       isHighlight: pendingDepositCount > 0,
     },
-    { id: 'pending', label: 'قيد الانتظار', count: orders.filter((o) => o.status === 'pending').length },
+    { id: 'pending', label: 'طلبات جديدة', count: orders.filter((o) => o.status === 'pending').length },
     { id: 'preparing', label: 'التحضير', count: orders.filter((o) => o.status === 'preparing').length },
     { id: 'delivering', label: 'التوصيل', count: orders.filter((o) => o.status === 'delivering').length },
     { id: 'completed', label: 'مكتمل', count: orders.filter((o) => o.status === 'completed').length },
@@ -108,7 +109,7 @@ export const OrdersTab: React.FC<OrdersTabProps> = ({ defaultFilter }) => {
         return (
           <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[11px] font-bold bg-amber-500/15 text-amber-500 border border-amber-500/20">
             <Clock className="w-3 h-3" />
-            انتظار
+            جديد
           </span>
         );
       case 'preparing':
@@ -184,7 +185,7 @@ export const OrdersTab: React.FC<OrdersTabProps> = ({ defaultFilter }) => {
       return (
         <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-md text-[10px] font-bold bg-emerald-500/15 text-emerald-600 dark:text-emerald-400 border border-emerald-500/20">
           <Check className="w-3 h-3" />
-          عربون مؤكد ({order.depositAmount} ج.م)
+          تم الدفع ({order.depositPaid ?? order.depositAmount} ج.م)
         </span>
       );
     }
@@ -192,7 +193,7 @@ export const OrdersTab: React.FC<OrdersTabProps> = ({ defaultFilter }) => {
       return (
         <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-md text-[10px] font-bold bg-amber-500/15 text-amber-600 dark:text-amber-400 border border-amber-500/30">
           <Clock className="w-3 h-3 animate-spin" style={{ animationDuration: '4s' }} />
-          بانتظار العربون ({order.depositAmount} ج.م)
+          بانتظار الدفع ({order.depositAmount} ج.م)
         </span>
       );
     }
@@ -205,6 +206,26 @@ export const OrdersTab: React.FC<OrdersTabProps> = ({ defaultFilter }) => {
       );
     }
     return <span className="text-[10px] text-slate-400">-</span>;
+  };
+
+  const isPaymentSatisfied = (order: Order) =>
+    order.paymentMode === 'cash_on_delivery' ||
+    order.depositStatus === 'not_required' ||
+    order.depositStatus === 'confirmed';
+
+  const getNextOrderAction = (order: Order): { label: string; status: OrderStatus } | null => {
+    if (order.status === 'pending') {
+      return isPaymentSatisfied(order)
+        ? { label: 'قبول الطلب', status: 'preparing' }
+        : null;
+    }
+    if (order.status === 'preparing') {
+      return { label: 'خرج للتوصيل', status: 'delivering' };
+    }
+    if (order.status === 'delivering') {
+      return { label: 'تم التسليم', status: 'completed' };
+    }
+    return null;
   };
 
   const handlePrint = (order: Order) => {
@@ -220,52 +241,26 @@ export const OrdersTab: React.FC<OrdersTabProps> = ({ defaultFilter }) => {
     confirmDeposit(order.id);
   };
 
-  const handleModalConfirmDeposit = () => {
+  const handleModalConfirmDeposit = async () => {
     if (!selectedOrder) return;
-    confirmDeposit(selectedOrder.id, {
+    const updated = await confirmDeposit(selectedOrder.id, {
       depositAmount: customDepositAmount,
       depositMethod: customDepositMethod,
       depositReference: customDepositRef,
       depositNotes: customDepositNotes,
     });
-    setSelectedOrder((prev) =>
-      prev
-        ? {
-            ...prev,
-            depositStatus: 'confirmed',
-            depositAmount: customDepositAmount,
-            remainingAmount: Math.max(0, prev.totalAmount - customDepositAmount),
-            depositMethod: customDepositMethod,
-            depositReference: customDepositRef,
-            depositNotes: customDepositNotes,
-            depositConfirmedAt: new Date().toISOString(),
-            status: prev.status === 'pending' ? 'preparing' : prev.status,
-          }
-        : null
-    );
+    if (updated) setSelectedOrder(updated);
   };
 
-  const handleModalSetCashOnDelivery = () => {
+  const handleModalSetCashOnDelivery = async () => {
     if (!selectedOrder) return;
-    confirmDeposit(selectedOrder.id, {
+    const updated = await confirmDeposit(selectedOrder.id, {
       depositAmount: 0,
       depositMethod: 'cash_on_delivery',
       depositStatus: 'not_required',
       depositNotes: customDepositNotes ? `${customDepositNotes} (تحويل للدفع عند الاستلام)` : 'تم تحويل الطلب للدفع عند الاستلام بدون عربون',
     });
-    setSelectedOrder((prev) =>
-      prev
-        ? {
-            ...prev,
-            depositStatus: 'not_required',
-            paymentMode: 'cash_on_delivery',
-            depositAmount: 0,
-            remainingAmount: prev.totalAmount,
-            depositMethod: 'cash_on_delivery',
-            depositNotes: customDepositNotes ? `${customDepositNotes} (تحويل للدفع عند الاستلام)` : 'تم تحويل الطلب للدفع عند الاستلام بدون عربون',
-          }
-        : null
-    );
+    if (updated) setSelectedOrder(updated);
   };
 
   const [showDeleteOrderConfirm, setShowDeleteOrderConfirm] = useState(false);
@@ -277,21 +272,13 @@ export const OrdersTab: React.FC<OrdersTabProps> = ({ defaultFilter }) => {
     setShowDeleteOrderConfirm(false);
   };
 
-  const handleModalRejectDeposit = () => {
+  const handleModalRejectDeposit = async () => {
     if (!selectedOrder) return;
-    updateOrder(selectedOrder.id, {
+    const updated = await confirmDeposit(selectedOrder.id, {
       depositStatus: 'rejected',
       depositNotes: customDepositNotes ? `${customDepositNotes} (تم الرفض)` : 'تم رفض العربون',
     });
-    setSelectedOrder((prev) =>
-      prev
-        ? {
-            ...prev,
-            depositStatus: 'rejected',
-            depositNotes: customDepositNotes ? `${customDepositNotes} (تم الرفض)` : 'تم رفض العربون',
-          }
-        : null
-    );
+    if (updated) setSelectedOrder(updated);
   };
 
   return (
@@ -305,13 +292,13 @@ export const OrdersTab: React.FC<OrdersTabProps> = ({ defaultFilter }) => {
             </div>
             <div>
               <h3 className="font-bold text-xs sm:text-sm text-amber-600 dark:text-amber-300 flex items-center gap-2">
-                <span>يوجد {pendingDepositCount} طلبات جديدة بانتظار تأكيد العربون</span>
+                <span>يوجد {pendingDepositCount} طلبات جديدة بانتظار الدفع</span>
                 <span className="px-1.5 py-0.5 rounded-full text-[10px] font-black bg-amber-400 text-slate-950">
                   إجراء مطلوب
                 </span>
               </h3>
               <p className="text-[11px] text-amber-600/80 dark:text-amber-300/80 mt-0.5">
-                تأكد من استلام تحويل العربون (إنستاباي / كاش) لبدء التحضير.
+                سيتم فتح زر «قبول الطلب» فور تأكيد الدفع، أو عند اختيار الدفع عند الاستلام.
               </p>
             </div>
           </div>
@@ -491,21 +478,48 @@ export const OrdersTab: React.FC<OrdersTabProps> = ({ defaultFilter }) => {
                       )}
                     </td>
 
-                    {/* Status selection */}
+                    {/* Fulfillment status + only the valid next action */}
                     <td className="p-2.5 sm:p-3 whitespace-nowrap">
-                      <div className="space-y-1">
+                      <div className="space-y-1.5">
                         {getStatusBadge(order.status)}
-                        <select
-                          value={order.status}
-                          onChange={(e) => updateOrderStatus(order.id, e.target.value as OrderStatus)}
-                          className="block text-[10px] font-bold rounded-lg border border-slate-300 dark:border-slate-700 bg-slate-50 dark:bg-slate-800 text-slate-700 dark:text-slate-200 py-0.5 px-1.5 focus:outline-none focus:border-cyan-500 cursor-pointer"
-                        >
-                          <option value="pending">انتظار</option>
-                          <option value="preparing">تحضير</option>
-                          <option value="delivering">توصيل</option>
-                          <option value="completed">مكتمل</option>
-                          <option value="cancelled">ملغي</option>
-                        </select>
+                        {(() => {
+                          const nextAction = getNextOrderAction(order);
+                          if (nextAction) {
+                            return (
+                              <button
+                                onClick={() => updateOrderStatus(order.id, nextAction.status)}
+                                className="block px-2.5 py-1 rounded-lg bg-cyan-500 text-slate-950 text-[10px] font-black hover:bg-cyan-400 transition-colors"
+                              >
+                                {nextAction.label}
+                              </button>
+                            );
+                          }
+
+                          if (order.status === 'pending' && !isPaymentSatisfied(order)) {
+                            return (
+                              <span className="block text-[10px] font-bold text-amber-600 dark:text-amber-400">
+                                بانتظار تأكيد الدفع
+                              </span>
+                            );
+                          }
+
+                          return null;
+                        })()}
+                        {(order.status === 'pending' || order.status === 'preparing') &&
+                          order.depositStatus !== 'confirmed' && (
+                            <button
+                              onClick={() => updateOrderStatus(order.id, 'cancelled')}
+                              className="block text-[10px] font-bold text-rose-500 hover:text-rose-400"
+                            >
+                              إلغاء الطلب
+                            </button>
+                          )}
+                        {(order.status === 'pending' || order.status === 'preparing') &&
+                          order.depositStatus === 'confirmed' && (
+                            <span className="block text-[9px] text-slate-400">
+                              الإلغاء بعد الدفع يتطلب مراجعة مالية
+                            </span>
+                          )}
                       </div>
                     </td>
 

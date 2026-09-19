@@ -3,6 +3,9 @@ import crypto from 'node:crypto';
 import { requireAuth, requireRole, AuthenticatedRequest, logAuditAction } from './auth.js';
 import { broadcastRealtimeEvent } from './realtime.js';
 import { supabaseServer } from './supabase.js';
+import {
+  validatePaymentSessionStart,
+} from './orderLifecycle.js';
 
 export const paymentRouter = Router();
 
@@ -305,7 +308,7 @@ async function confirmOrderPayment(
 ) {
   const { data: order, error: orderError } = await supabaseServer
     .from('orders')
-    .select('id,total_amount,deposit_notes')
+    .select('id,total_amount,deposit_notes,status,payment_mode,deposit_status,deposit_amount,deposit_paid')
     .eq('id', session.order_id)
     .maybeSingle();
 
@@ -343,6 +346,7 @@ async function confirmOrderPayment(
     .update({
       deposit_status: 'confirmed',
       deposit_amount: receivedAmount,
+      deposit_paid: receivedAmount,
       deposit_method: depositMethod,
       deposit_confirmed_at: new Date().toISOString(),
       deposit_confirmed_by: confirmedBy,
@@ -2499,12 +2503,20 @@ paymentRouter.post('/payments/sessions', requireIntegrationKey, async (req: Requ
 
   const { data: order, error: orderError } = await supabaseServer
     .from('orders')
-    .select('id,status,customer_id,customer_phone')
+    .select('id,status,customer_id,customer_phone,payment_mode,deposit_status,deposit_amount,deposit_paid,total_amount')
     .eq('id', orderId)
     .maybeSingle();
   if (orderError) return res.status(503).json({ error: 'Order service unavailable' });
   if (!order) return res.status(404).json({ error: 'Order not found' });
-  if (order.status === 'cancelled') return res.status(409).json({ error: 'Cancelled order cannot start payment' });
+
+  const paymentStart = validatePaymentSessionStart(order);
+  if (paymentStart.ok === false) {
+    return res.status(409).json({
+      error: paymentStart.code,
+      message: paymentStart.message,
+      orderId,
+    });
+  }
 
   // Resolve eligible payment source and online non-busy device (FIX 3, FIX 4, FIX 10, FIX 18)
   const resolved: any = await findEligibleSourceForMethod(customerPaymentMethodId, paymentMethodCode, sourceId, rawProvider);
@@ -2533,24 +2545,38 @@ paymentRouter.post('/payments/sessions', requireIntegrationKey, async (req: Requ
 
   const { source: resolvedSource, provider, customerPaymentMethodId: resolvedMethodId } = resolved;
 
-  // Reuse only a waiting session that matches the same method/amount/intent.
-  const { data: existingRows } = await supabaseServer
+  // A single customer order may have historical attempts, but only one live waiting session.
+  const { data: existingRows, error: existingRowsError } = await supabaseServer
     .from('payment_sessions')
     .select('*')
     .eq('order_id', orderId)
-    .eq('provider', provider)
     .eq('status', 'waiting')
     .order('created_at', { ascending: false })
-    .limit(10);
+    .limit(2);
 
-  const existing = (existingRows || []).find((row: any) => {
-    const sameAmount = Math.abs(Number(row.expected_amount) - expectedAmount) < 0.005;
-    const sameIntent = !paymentIntent || !row.payment_intent || row.payment_intent === paymentIntent;
-    const sameMethod = !resolvedMethodId || !row.customer_payment_method_id || row.customer_payment_method_id === resolvedMethodId;
-    return sameAmount && sameIntent && sameMethod;
-  });
+  if (existingRowsError) {
+    return res.status(503).json({ error: 'Payment session service unavailable' });
+  }
+
+  const existing = (existingRows || [])[0];
   if (existing) {
-    return res.json({ ...mapSession(existing), clientToken: existing.client_token });
+    const sameAmount = Math.abs(Number(existing.expected_amount) - expectedAmount) < 0.005;
+    const sameIntent = !paymentIntent || !existing.payment_intent || existing.payment_intent === paymentIntent;
+    const sameMethod =
+      !resolvedMethodId ||
+      !existing.customer_payment_method_id ||
+      existing.customer_payment_method_id === resolvedMethodId;
+
+    if (sameAmount && sameIntent && sameMethod) {
+      return res.json({ ...mapSession(existing), clientToken: existing.client_token });
+    }
+
+    return res.status(409).json({
+      error: 'active_payment_session_exists',
+      orderId,
+      sessionId: existing.id,
+      message: 'يوجد بالفعل دفع نشط لهذا الطلب. أكمل أو ألغِ العملية الحالية أولاً.',
+    });
   }
 
   const { data: settings, error: settingsError } = await supabaseServer

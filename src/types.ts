@@ -103,7 +103,8 @@ export interface Order {
 
   // Deposit confirmation fields (تأكيد العربون)
   depositStatus: DepositStatus; // 'confirmed' | 'pending' | 'not_required' | 'rejected'
-  depositAmount: number; // مبلغ العربون بالجنيه المصري
+  depositAmount: number; // مبلغ العربون المطلوب بالجنيه المصري
+  depositPaid?: number; // المبلغ المؤكد استلامه فعلياً
   depositMethod?: DepositMethod; // طريقة تحويل العربون (إنستاباي، فودافون كاش، etc)
   depositReference?: string; // رقم عملية التحويل أو رقم المحفظة
   depositConfirmedAt?: string; // تاريخ ووقت تأكيد استلام العربون

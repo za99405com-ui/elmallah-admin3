@@ -17,12 +17,7 @@ import {
   Clock,
 } from 'lucide-react';
 import { getStoredToken } from '../../lib/api';
-import { PaymentSource, CustomerPaymentMethod } from '../../types';
-import { PaymentSourcesSection } from './PaymentSourcesSection';
-import { PaymentDevicesSection, PaymentDevice } from './PaymentDevicesSection';
-import { CustomerMethodsSection } from './CustomerMethodsSection';
 import { ProblemOrdersSection, ProblemOrder } from './ProblemOrdersSection';
-import { DepositPolicySection, DepositPolicySettings } from './DepositPolicySection';
 import { SimplePaymentSettingsSection } from './SimplePaymentSettingsSection';
 
 type ReviewReason =
@@ -58,18 +53,13 @@ interface PaymentSession {
 }
 
 interface OverviewResponse {
-  devices: PaymentDevice[];
   reviews: PaymentReviewItem[];
   sessions: PaymentSession[];
-  settings: DepositPolicySettings;
-  sources?: PaymentSource[];
-  customerMethods?: CustomerPaymentMethod[];
-  methods?: CustomerPaymentMethod[]; // legacy fallback
   problemOrders?: ProblemOrder[];
 }
 
 interface PaymentReviewTabProps {
-  initialTab?: 'setup' | 'problems' | 'reviews' | 'devices' | 'sources' | 'methods' | 'policy';
+  initialTab?: 'setup' | 'problems' | 'reviews';
 }
 
 async function adminRequest<T>(path: string, options: RequestInit = {}): Promise<T> {
@@ -121,13 +111,9 @@ function formatCairoDateTime(value?: string | null): string {
 }
 
 export const PaymentReviewTab: React.FC<PaymentReviewTabProps> = ({ initialTab = 'setup' }) => {
-  const [activeSubTab, setActiveSubTab] = useState<
-    'setup' | 'problems' | 'reviews' | 'devices' | 'sources' | 'methods' | 'policy'
-  >(initialTab);
+  const [activeSubTab, setActiveSubTab] = useState<'setup' | 'problems' | 'reviews'>(initialTab);
 
   const [overview, setOverview] = useState<OverviewResponse | null>(null);
-  const [sources, setSources] = useState<PaymentSource[]>([]);
-  const [customerMethods, setCustomerMethods] = useState<CustomerPaymentMethod[]>([]);
   const [problemOrders, setProblemOrders] = useState<ProblemOrder[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -139,13 +125,7 @@ export const PaymentReviewTab: React.FC<PaymentReviewTabProps> = ({ initialTab =
       const overviewData = await adminRequest<OverviewResponse>('/api/admin/payments/overview');
       setOverview(overviewData);
 
-      const resolvedSources = overviewData.sources ?? [];
-      const resolvedMethods = overviewData.customerMethods ?? overviewData.methods ?? [];
-      const resolvedProblemOrders = overviewData.problemOrders ?? [];
-
-      setSources(resolvedSources);
-      setCustomerMethods(resolvedMethods);
-      setProblemOrders(resolvedProblemOrders);
+      setProblemOrders(overviewData.problemOrders ?? []);
     } catch (err) {
       console.error('[PaymentReviewTab] Load failed:', err);
       setError(err instanceof Error ? err.message : 'تعذر تحميل بيانات منظومة الدفع');
@@ -199,16 +179,9 @@ export const PaymentReviewTab: React.FC<PaymentReviewTabProps> = ({ initialTab =
   }
 
   const reviews = overview?.reviews || [];
-  const devices = overview?.devices || [];
   const sessions = overview?.sessions || [];
-  const depositSettings: DepositPolicySettings = overview?.settings || {
-    defaultPaymentPolicy: 'cod_allowed',
-    sessionTimeoutSeconds: 120,
-    amountTolerance: 10,
-  };
 
   const openReviewsCount = reviews.filter((r) => r.status === 'open').length;
-  const onlineDevicesCount = devices.filter((d) => d.online).length;
   const problemCount = problemOrders.length;
 
   return (
@@ -307,40 +280,6 @@ export const PaymentReviewTab: React.FC<PaymentReviewTabProps> = ({ initialTab =
       {activeSubTab === 'problems' && (
         <ProblemOrdersSection
           problemOrders={problemOrders}
-          onRefresh={loadAllData}
-          adminRequest={adminRequest}
-        />
-      )}
-
-      {activeSubTab === 'devices' && (
-        <PaymentDevicesSection
-          devices={devices}
-          sources={sources}
-          onRefresh={loadAllData}
-          adminRequest={adminRequest}
-        />
-      )}
-
-      {activeSubTab === 'sources' && (
-        <PaymentSourcesSection
-          sources={sources}
-          onRefresh={loadAllData}
-          adminRequest={adminRequest}
-        />
-      )}
-
-      {activeSubTab === 'methods' && (
-        <CustomerMethodsSection
-          methods={customerMethods}
-          sources={sources}
-          onRefresh={loadAllData}
-          adminRequest={adminRequest}
-        />
-      )}
-
-      {activeSubTab === 'policy' && (
-        <DepositPolicySection
-          settings={depositSettings}
           onRefresh={loadAllData}
           adminRequest={adminRequest}
         />
