@@ -341,19 +341,32 @@ async function confirmOrderPayment(
     if (src) depositMethod = src.code || src.channel || depositMethod;
   }
 
+  const autoPrepare =
+    confirmedBy === 'payment-orchestration' &&
+    String(order.status || '') === 'pending';
+
+  const orderUpdate: Record<string, unknown> = {
+    deposit_status: 'confirmed',
+    deposit_amount: receivedAmount,
+    deposit_paid: receivedAmount,
+    deposit_method: depositMethod,
+    deposit_confirmed_at: new Date().toISOString(),
+    deposit_confirmed_by: confirmedBy,
+    deposit_notes: previousNotes ? `${previousNotes}\n${auditNote}` : auditNote,
+    remaining_amount: remaining,
+    updated_at: new Date().toISOString(),
+  };
+
+  // Exact/accepted automatic payment is already the store's acceptance gate.
+  // Move directly to preparation so staff do not need to press "Accept order" again.
+  // Manual confirmations remain pending because they originated from a review flow.
+  if (autoPrepare) {
+    orderUpdate.status = 'preparing';
+  }
+
   const { error } = await supabaseServer
     .from('orders')
-    .update({
-      deposit_status: 'confirmed',
-      deposit_amount: receivedAmount,
-      deposit_paid: receivedAmount,
-      deposit_method: depositMethod,
-      deposit_confirmed_at: new Date().toISOString(),
-      deposit_confirmed_by: confirmedBy,
-      deposit_notes: previousNotes ? `${previousNotes}\n${auditNote}` : auditNote,
-      remaining_amount: remaining,
-      updated_at: new Date().toISOString(),
-    })
+    .update(orderUpdate)
     .eq('id', session.order_id);
 
   if (error) throw error;
@@ -363,6 +376,8 @@ async function confirmOrderPayment(
     receivedAmount,
     provider,
     confirmedBy,
+    orderStatus: autoPrepare ? 'preparing' : String(order.status || 'pending'),
+    autoPrepared: autoPrepare,
   });
 }
 
