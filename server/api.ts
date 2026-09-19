@@ -1385,6 +1385,12 @@ router.put('/admin/orders/:id/status', requireAuth, async (req: AuthenticatedReq
         code: 'payment_not_confirmed',
       });
     }
+    if (message.includes('PAID_ORDER_REQUIRES_REFUND_REVIEW')) {
+      return res.status(409).json({
+        error: 'الطلب مدفوع بالفعل. عالج الاسترداد أو مراجعة الدفع قبل الإلغاء.',
+        code: 'paid_order_requires_refund_review',
+      });
+    }
     if (message.includes('INVALID_ORDER_TRANSITION') || message.includes('TERMINAL_ORDER')) {
       return res.status(409).json({
         error: 'الانتقال المطلوب غير مسموح ضمن دورة تنفيذ الطلب',
