@@ -3111,6 +3111,21 @@ paymentRouter.post('/payment-bridge/events', verifyBridgeRequest, async (req: Ra
   if (Number.isNaN(capturedAt.getTime())) return res.status(400).json({ error: 'Invalid capturedAt timestamp' });
   const notificationPostedAtMs = numberOrNull(req.body?.notificationPostedAt);
   const notificationPostedAt = notificationPostedAtMs ? new Date(notificationPostedAtMs) : null;
+
+  const validNotificationPostedAtMs =
+    notificationPostedAtMs != null &&
+    !Number.isNaN(notificationPostedAt?.getTime()) &&
+    notificationPostedAtMs <= capturedAtMs + 15_000 &&
+    notificationPostedAtMs >= capturedAtMs - LATE_MATCH_WINDOW_MS
+      ? notificationPostedAtMs
+      : null;
+
+  // Match against the time the bank/SMS notification actually arrived.
+  // This lets a recently rejected notification be re-parsed after an
+  // authoritative rule refresh without incorrectly becoming a "late" payment.
+  const eventOccurredAtMs = validNotificationPostedAtMs ?? capturedAtMs;
+  const eventOccurredAt = new Date(eventOccurredAtMs);
+
   const receivedAmount = Math.round((amountMinor / 100) * 100) / 100;
   const payerPhone = normalizePhone(req.body?.payerPhone);
 
@@ -3178,8 +3193,8 @@ paymentRouter.post('/payment-bridge/events', verifyBridgeRequest, async (req: Ra
 
   // FIX 7 & FIX 8: Robust candidate selection with timing window and scoring
   let candidates: Record<string, any>[] = [];
-  const lowerBound = new Date(capturedAt.getTime() - LATE_MATCH_WINDOW_MS).toISOString();
-  const upperBound = new Date(capturedAt.getTime() + 15_000).toISOString();
+  const lowerBound = new Date(eventOccurredAtMs - LATE_MATCH_WINDOW_MS).toISOString();
+  const upperBound = new Date(eventOccurredAtMs + 15_000).toISOString();
 
   const { data: recentSessions, error: sessionErr } = await supabaseServer
     .from('payment_sessions')
@@ -3200,8 +3215,8 @@ paymentRouter.post('/payment-bridge/events', verifyBridgeRequest, async (req: Ra
     if (!providerMatches) return false;
     const created = new Date(session.created_at).getTime();
     const expires = new Date(session.expires_at).getTime();
-    // FIX 7: Ensure capturedAt was not before creation (with 15s leeway) and within late window
-    return capturedAtMs >= created - 15_000 && capturedAtMs <= expires + LATE_MATCH_WINDOW_MS;
+    // Use the actual bank/SMS notification time when available.
+    return eventOccurredAtMs >= created - 15_000 && eventOccurredAtMs <= expires + LATE_MATCH_WINDOW_MS;
   });
 
   if (payerPhone && candidates.length > 0) {
@@ -3282,7 +3297,7 @@ paymentRouter.post('/payment-bridge/events', verifyBridgeRequest, async (req: Ra
           payerPhone && expectedPayerPhone && payerPhone === expectedPayerPhone ? 20_000 : 0;
         const weakOrderPhoneBoost =
           !expectedPayerPhone && payerPhone && orderPhone && payerPhone === orderPhone ? 250 : 0;
-        const timeDistance = Math.abs(capturedAtMs - new Date(session.created_at).getTime());
+        const timeDistance = Math.abs(eventOccurredAtMs - new Date(session.created_at).getTime());
         const amountScore = absDiff <= tolerance || diff < 0 ? Math.max(0, 5_000 - absDiff * 100) : 0;
         return {
           session,
@@ -3315,7 +3330,7 @@ paymentRouter.post('/payment-bridge/events', verifyBridgeRequest, async (req: Ra
   const expected = Number(chosen.expected_amount);
   const tolerance = Number(chosen.amount_tolerance || 0);
   const difference = Math.round((receivedAmount - expected) * 100) / 100;
-  const late = capturedAtMs > new Date(chosen.expires_at).getTime();
+  const late = eventOccurredAtMs > new Date(chosen.expires_at).getTime();
 
   await supabaseServer
     .from('payment_bridge_events')
@@ -3340,7 +3355,11 @@ paymentRouter.post('/payment-bridge/events', verifyBridgeRequest, async (req: Ra
       expectedAmount: expected,
       receivedAmount,
       amountDifference: difference,
-      details: { expiresAt: chosen.expires_at, capturedAt: capturedAt.toISOString() },
+      details: {
+        expiresAt: chosen.expires_at,
+        capturedAt: capturedAt.toISOString(),
+        notificationPostedAt: validNotificationPostedAtMs ? eventOccurredAt.toISOString() : null,
+      },
     });
     return res.json({ status: 'accepted', eventId, matchStatus: 'PENDING_REVIEW', orderId: chosen.order_id, message: 'Late payment requires review', serverTimestamp: Date.now() });
   }
@@ -3355,7 +3374,11 @@ paymentRouter.post('/payment-bridge/events', verifyBridgeRequest, async (req: Ra
       expectedAmount: expected,
       receivedAmount,
       amountDifference: difference,
-      details: { provider, capturedAt: capturedAt.toISOString() },
+      details: {
+        provider,
+        capturedAt: capturedAt.toISOString(),
+        notificationPostedAt: validNotificationPostedAtMs ? eventOccurredAt.toISOString() : null,
+      },
     });
     return res.json({ status: 'accepted', eventId, matchStatus: 'PENDING_REVIEW', orderId: chosen.order_id, message: 'Underpayment requires review', serverTimestamp: Date.now() });
   }
