@@ -1363,7 +1363,7 @@ router.put('/admin/orders/:id/status', requireAuth, async (req: AuthenticatedReq
   if (!existing) return res.status(404).json({ error: 'الطلب غير موجود' });
 
   const transition = validateOrderTransition(existing.status, status, existing);
-  if (!transition.ok) {
+  if (transition.ok === false) {
     return res.status(409).json({
       error: transition.message,
       code: transition.code,
