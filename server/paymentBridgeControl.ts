@@ -41,31 +41,73 @@ export async function verifyPaymentBridge(req: RawBridgeRequest, res: Response, 
   const nonceKey = `${deviceId}:${nonce}`;
   if (nonceCache.has(nonceKey)) return res.status(409).json({ error: 'Replay detected' });
 
-  const { data: device, error } = await supabaseServer
-    .from('payment_devices')
-    .select('*')
-    .eq('device_id', deviceId)
-    .maybeSingle();
-
-  if (error) return res.status(503).json({ error: 'Payment device service unavailable' });
-  if (!device || !device.is_enabled) return res.status(401).json({ error: 'Unknown or disabled payment device' });
-
-  // Standard Bridge HMAC contract: For GET requests (and requests without body),
-  // rawBody is defined as "" (empty string). Body hash is sha256("").
   const rawBody =
     req.method === 'GET'
       ? ''
       : (typeof req.rawBody === 'string'
           ? req.rawBody
           : (req.body && Object.keys(req.body).length > 0 ? JSON.stringify(req.body) : ''));
-  const expectedHash = crypto.createHash('sha256').update(rawBody, 'utf8').digest('hex');
-  if (!safeCompare(expectedHash, bodyHash)) return res.status(401).json({ error: 'Invalid bridge body hash' });
 
-  const expectedSignature = crypto
-    .createHmac('sha256', String(device.hmac_secret))
-    .update(`${timestamp}.${nonce}.${rawBody}`, 'utf8')
-    .digest('hex');
-  if (!safeCompare(expectedSignature, signature)) return res.status(401).json({ error: 'Invalid bridge signature' });
+  const expectedHash = crypto.createHash('sha256').update(rawBody, 'utf8').digest('hex');
+  if (!safeCompare(expectedHash, bodyHash)) {
+    return res.status(401).json({ error: 'Invalid bridge body hash' });
+  }
+
+  const expectedSignatureFor = (secret: unknown) =>
+    crypto
+      .createHmac('sha256', String(secret || ''))
+      .update(`${timestamp}.${nonce}.${rawBody}`, 'utf8')
+      .digest('hex');
+
+  let { data: device, error } = await supabaseServer
+    .from('payment_devices')
+    .select('*')
+    .eq('device_id', deviceId)
+    .maybeSingle();
+
+  if (error) return res.status(503).json({ error: 'Payment device service unavailable' });
+
+  if (device && device.is_enabled) {
+    const expectedSignature = expectedSignatureFor(device.hmac_secret);
+    if (!safeCompare(expectedSignature, signature)) {
+      return res.status(401).json({ error: 'Invalid bridge signature' });
+    }
+  } else {
+    const { data: enabledDevices, error: enabledDevicesError } = await supabaseServer
+      .from('payment_devices')
+      .select('*')
+      .eq('is_enabled', true);
+
+    if (enabledDevicesError) {
+      return res.status(503).json({ error: 'Payment device service unavailable' });
+    }
+
+    const matches = (enabledDevices || []).filter((candidate: any) =>
+      safeCompare(expectedSignatureFor(candidate.hmac_secret), signature)
+    );
+
+    if (matches.length !== 1) {
+      return res.status(401).json({ error: 'Unknown or disabled payment device' });
+    }
+
+    const matchedDevice = matches[0] as any;
+    const { data: reboundDevice, error: rebindError } = await supabaseServer
+      .from('payment_devices')
+      .update({
+        device_id: deviceId,
+        online: false,
+        updated_at: new Date().toISOString(),
+      })
+      .eq('id', matchedDevice.id)
+      .select('*')
+      .single();
+
+    if (rebindError || !reboundDevice) {
+      return res.status(503).json({ error: 'Payment device could not be rebound' });
+    }
+
+    device = reboundDevice;
+  }
 
   nonceCache.set(nonceKey, Date.now());
   (req as any).paymentDevice = device;
