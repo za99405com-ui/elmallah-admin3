@@ -264,6 +264,32 @@ paymentBridgeControlRouter.post('/payment-bridge/source-config', verifyPaymentBr
   const amountRegex = optionalText(req.body?.amountRegex, 1000);
   const payerPhoneRegex = optionalText(req.body?.payerPhoneRegex, 1000);
   const accountIdentifierRegex = optionalText(req.body?.accountIdentifierRegex, 1000);
+  const sampleMessage = optionalText(req.body?.sampleMessage, 5000);
+
+  const looksLikeOutgoingPayment = (value: string) => {
+    const text = value.replace(/\s+/g, ' ').trim().toLowerCase();
+    if (
+      text.includes('تم تنفيذ تحويل') ||
+      text.includes('تم الخصم') ||
+      text.includes('خصم') ||
+      text.includes('تم سحب') ||
+      text.includes('سحب') ||
+      text.includes('شراء') ||
+      text.includes('مشتريات')
+    ) {
+      return true;
+    }
+
+    const fromMerchantAccount = text.includes('من حسابكم') || text.includes('من حسابك');
+    const toOtherParty = text.includes(' إلى ') || text.includes(' الى ');
+    return fromMerchantAccount && toOtherParty;
+  };
+
+  if (source.code === 'instapay' && sampleMessage && looksLikeOutgoingPayment(sampleMessage)) {
+    return res.status(400).json({
+      error: 'رسالة التحويل الصادر لا يمكن استخدامها كنموذج دفع وارد',
+    });
+  }
 
   for (const pattern of [amountRegex, payerPhoneRegex, accountIdentifierRegex]) {
     if (!pattern) continue;
@@ -286,7 +312,7 @@ paymentBridgeControlRouter.post('/payment-bridge/source-config', verifyPaymentBr
     parser_type: parserType,
     app_name: optionalText(req.body?.appName, 250),
     sample_sender_title: optionalText(req.body?.sampleSenderTitle, 250),
-    sample_message: optionalText(req.body?.sampleMessage, 5000),
+    sample_message: sampleMessage,
     updated_at: now,
   };
 
