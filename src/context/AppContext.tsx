@@ -619,6 +619,34 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
         return;
       }
 
+      if (eventType === 'order_payment_confirmed') {
+        try {
+          const paymentEvent = JSON.parse(dataStr) as {
+            orderId: string;
+            receivedAmount: number;
+          };
+
+          // The orchestration event intentionally contains only payment facts.
+          // Reload canonical orders instead of reconstructing a partial Order locally.
+          api.getOrders().then((freshOrders) => {
+            setOrders(freshOrders);
+            const paidOrder = freshOrders.find((order) => order.id === paymentEvent.orderId);
+            if (paidOrder) {
+              addToast({
+                type: 'success',
+                title: `تم تأكيد الدفع - الطلب #${paidOrder.orderNumber}`,
+                description: `تم استلام ${paymentEvent.receivedAmount} ج.م. الطلب بانتظار قبول المتجر.`,
+              });
+            }
+          }).catch((err) => {
+            console.error('Failed to refresh order after automatic payment:', err);
+          });
+        } catch (err) {
+          console.error('Failed to parse order_payment_confirmed event:', err);
+        }
+        return;
+      }
+
       if (eventType === 'product_created') {
         try {
           const prod = JSON.parse(dataStr) as Product;
