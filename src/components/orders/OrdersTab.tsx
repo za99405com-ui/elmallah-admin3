@@ -505,14 +505,21 @@ export const OrdersTab: React.FC<OrdersTabProps> = ({ defaultFilter }) => {
 
                           return null;
                         })()}
-                        {(order.status === 'pending' || order.status === 'preparing') && (
-                          <button
-                            onClick={() => updateOrderStatus(order.id, 'cancelled')}
-                            className="block text-[10px] font-bold text-rose-500 hover:text-rose-400"
-                          >
-                            إلغاء الطلب
-                          </button>
-                        )}
+                        {(order.status === 'pending' || order.status === 'preparing') &&
+                          order.depositStatus !== 'confirmed' && (
+                            <button
+                              onClick={() => updateOrderStatus(order.id, 'cancelled')}
+                              className="block text-[10px] font-bold text-rose-500 hover:text-rose-400"
+                            >
+                              إلغاء الطلب
+                            </button>
+                          )}
+                        {(order.status === 'pending' || order.status === 'preparing') &&
+                          order.depositStatus === 'confirmed' && (
+                            <span className="block text-[9px] text-slate-400">
+                              الإلغاء بعد الدفع يتطلب مراجعة مالية
+                            </span>
+                          )}
                       </div>
                     </td>
 
