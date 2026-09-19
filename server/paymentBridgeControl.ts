@@ -2,6 +2,7 @@ import crypto from 'node:crypto';
 import { NextFunction, Request, Response, Router } from 'express';
 import { broadcastRealtimeEvent } from './realtime.js';
 import { supabaseServer } from './supabase.js';
+import { derivePaymentState } from './orderLifecycle.js';
 
 export const paymentBridgeControlRouter = Router();
 
@@ -409,16 +410,56 @@ paymentBridgeControlRouter.post('/payment-bridge/heartbeat', verifyPaymentBridge
 
   const { data: activeSessionRows, error: activeSessionError } = await supabaseServer
     .from('payment_sessions')
-    .select('id')
+    .select('id,order_id,status,provider,payment_intent,expected_amount,currency,expires_at,customer_phone,payment_destination')
     .eq('device_id', device.id)
     .eq('status', 'waiting')
-    .gt('expires_at', now);
+    .gt('expires_at', now)
+    .order('created_at', { ascending: false });
 
   if (activeSessionError) {
     return res.status(503).json({ error: 'Device capacity could not be read' });
   }
 
   const activeSessions = activeSessionRows?.length || 0;
+
+  const activeOrderIds = Array.from(
+    new Set((activeSessionRows || []).map((session: any) => String(session.order_id)).filter(Boolean))
+  );
+
+  const activeOrdersById = new Map<string, any>();
+  if (activeOrderIds.length > 0) {
+    const { data: orderRows, error: orderRowsError } = await supabaseServer
+      .from('orders')
+      .select('id,order_number,status,payment_mode,deposit_status,deposit_amount,deposit_paid,total_amount,customer_name,customer_phone')
+      .in('id', activeOrderIds);
+
+    if (orderRowsError) {
+      return res.status(503).json({ error: 'Active order status could not be read' });
+    }
+
+    for (const order of orderRows || []) {
+      activeOrdersById.set(String(order.id), order);
+    }
+  }
+
+  const activeOrders = (activeSessionRows || []).map((session: any) => {
+    const order = activeOrdersById.get(String(session.order_id));
+    return {
+      sessionId: String(session.id),
+      orderId: String(session.order_id),
+      orderNumber: order?.order_number || String(session.order_id),
+      orderStatus: order?.status || 'pending',
+      paymentState: order ? derivePaymentState(order) : 'waiting',
+      expectedAmount: Number(session.expected_amount || 0),
+      currency: session.currency || 'EGP',
+      provider: session.provider,
+      paymentIntent: session.payment_intent || 'deposit',
+      expiresAt: session.expires_at,
+      customerName: order?.customer_name || undefined,
+      customerPhone: order?.customer_phone || session.customer_phone || undefined,
+    };
+  });
+
   const maxConcurrentSessions = Math.max(1, Number(data.max_concurrent_sessions || 3));
   const availableSlots = Math.max(0, maxConcurrentSessions - activeSessions);
   const isFull = availableSlots === 0;
@@ -435,6 +476,7 @@ paymentBridgeControlRouter.post('/payment-bridge/heartbeat', verifyPaymentBridge
     busy: isFull,
     busySessionId: isFull ? data.busy_session_id || null : null,
     activeSessions,
+    activeOrders,
     maxConcurrentSessions,
     availableSlots,
     vfCashEnabled: Boolean(data.vf_cash_enabled),
