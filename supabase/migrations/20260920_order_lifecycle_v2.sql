@@ -80,6 +80,10 @@ BEGIN
     RAISE EXCEPTION 'PAYMENT_NOT_CONFIRMED';
   END IF;
 
+  IF p_new_status = 'cancelled' AND v_order.deposit_status = 'confirmed' THEN
+    RAISE EXCEPTION 'PAID_ORDER_REQUIRES_REFUND_REVIEW';
+  END IF;
+
   UPDATE public.orders
      SET status = p_new_status,
          updated_at = now()
