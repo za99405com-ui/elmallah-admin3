@@ -33,7 +33,6 @@ export const OrdersTab: React.FC<OrdersTabProps> = ({ defaultFilter }) => {
     orders,
     updateOrderStatus,
     confirmDeposit,
-    updateOrder,
     deleteOrder,
     adminUser,
     settings,
@@ -242,51 +241,26 @@ export const OrdersTab: React.FC<OrdersTabProps> = ({ defaultFilter }) => {
     confirmDeposit(order.id);
   };
 
-  const handleModalConfirmDeposit = () => {
+  const handleModalConfirmDeposit = async () => {
     if (!selectedOrder) return;
-    confirmDeposit(selectedOrder.id, {
+    const updated = await confirmDeposit(selectedOrder.id, {
       depositAmount: customDepositAmount,
       depositMethod: customDepositMethod,
       depositReference: customDepositRef,
       depositNotes: customDepositNotes,
     });
-    setSelectedOrder((prev) =>
-      prev
-        ? {
-            ...prev,
-            depositStatus: 'confirmed',
-            depositAmount: customDepositAmount,
-            remainingAmount: Math.max(0, prev.totalAmount - customDepositAmount),
-            depositMethod: customDepositMethod,
-            depositReference: customDepositRef,
-            depositNotes: customDepositNotes,
-            depositConfirmedAt: new Date().toISOString(),
-          }
-        : null
-    );
+    if (updated) setSelectedOrder(updated);
   };
 
-  const handleModalSetCashOnDelivery = () => {
+  const handleModalSetCashOnDelivery = async () => {
     if (!selectedOrder) return;
-    confirmDeposit(selectedOrder.id, {
+    const updated = await confirmDeposit(selectedOrder.id, {
       depositAmount: 0,
       depositMethod: 'cash_on_delivery',
       depositStatus: 'not_required',
       depositNotes: customDepositNotes ? `${customDepositNotes} (تحويل للدفع عند الاستلام)` : 'تم تحويل الطلب للدفع عند الاستلام بدون عربون',
     });
-    setSelectedOrder((prev) =>
-      prev
-        ? {
-            ...prev,
-            depositStatus: 'not_required',
-            paymentMode: 'cash_on_delivery',
-            depositAmount: 0,
-            remainingAmount: prev.totalAmount,
-            depositMethod: 'cash_on_delivery',
-            depositNotes: customDepositNotes ? `${customDepositNotes} (تحويل للدفع عند الاستلام)` : 'تم تحويل الطلب للدفع عند الاستلام بدون عربون',
-          }
-        : null
-    );
+    if (updated) setSelectedOrder(updated);
   };
 
   const [showDeleteOrderConfirm, setShowDeleteOrderConfirm] = useState(false);
@@ -298,21 +272,13 @@ export const OrdersTab: React.FC<OrdersTabProps> = ({ defaultFilter }) => {
     setShowDeleteOrderConfirm(false);
   };
 
-  const handleModalRejectDeposit = () => {
+  const handleModalRejectDeposit = async () => {
     if (!selectedOrder) return;
-    updateOrder(selectedOrder.id, {
+    const updated = await confirmDeposit(selectedOrder.id, {
       depositStatus: 'rejected',
       depositNotes: customDepositNotes ? `${customDepositNotes} (تم الرفض)` : 'تم رفض العربون',
     });
-    setSelectedOrder((prev) =>
-      prev
-        ? {
-            ...prev,
-            depositStatus: 'rejected',
-            depositNotes: customDepositNotes ? `${customDepositNotes} (تم الرفض)` : 'تم رفض العربون',
-          }
-        : null
-    );
+    if (updated) setSelectedOrder(updated);
   };
 
   return (
