@@ -2510,7 +2510,7 @@ paymentRouter.post('/payments/sessions', requireIntegrationKey, async (req: Requ
   if (!order) return res.status(404).json({ error: 'Order not found' });
 
   const paymentStart = validatePaymentSessionStart(order);
-  if (!paymentStart.ok) {
+  if (paymentStart.ok === false) {
     return res.status(409).json({
       error: paymentStart.code,
       message: paymentStart.message,
